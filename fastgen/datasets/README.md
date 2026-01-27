@@ -165,8 +165,9 @@ from fastgen.configs.data import VideoLatentLoaderConfig
 MyVideoLatentLoader = VideoLatentLoaderConfig.clone()
 MyVideoLatentLoader.datatags = ["WDS:/path/to/my_video_latents"]
 MyVideoLatentLoader.files_map = {"neg_condition": "/path/to/neg_prompt_emb.npy"}
+
 # For v2v tasks, add condition latent (e.g., depth):
-# MyVideoLatentLoader.key_map["depth_latent"] = "depth_latent.pth"
+MyVideoLatentLoader.key_map["depth_latent"] = "depth_latent.pth"
 ```
 
 Expected shard contents:
