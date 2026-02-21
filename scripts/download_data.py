@@ -8,18 +8,29 @@ This script:
    - CIFAR-10: Downloads raw data and converts to cifar10-32x32.zip
    - ImageNet-64 (EDM): Converts from Kaggle download to imagenet-64x64.zip
    - ImageNet-64 (EDM2): Converts from Kaggle download to imagenet-64x64-edmv2.zip
-   - ImageNet-256 (EDM2): Converts from Kaggle download to imagenet_256_sd.zip (VAE-encoded latents)
+   - ImageNet-256: Converts with SD VAE encoding ([-1,1] input normalization)
 
 2. Downloads pretrained models and converts them from .pkl to .pth format:
    - EDM models: CIFAR-10 and ImageNet-64 models
    - EDM2 models: ImageNet-64 models (S/M/L/XL variants)
+
+3. Optionally computes FID reference statistics for datasets:
+   - Saves to $DATA_ROOT_DIR/fid-refs/
+   - FID is computed in pixel space
+   - Use --compute-fid-refs to enable this step
 
 Output locations (defaults: $DATA_ROOT_DIR and $CKPT_ROOT_DIR):
 - Data:
   - $DATA_ROOT_DIR/cifar10/cifar10-32x32.zip
   - $DATA_ROOT_DIR/imagenet-64/imagenet-64x64.zip (EDM format)
   - $DATA_ROOT_DIR/imagenet-64/imagenet-64x64-edmv2.zip (EDM2 format)
-  - $DATA_ROOT_DIR/imagenet-256/imagenet_256_sd.zip (EDM2 VAE-encoded)
+  - $DATA_ROOT_DIR/imagenet-256/imagenet_256_rgb.zip (RGB pixels)
+  - $DATA_ROOT_DIR/imagenet-256/imagenet_256_sd.zip (VAE latents)
+- FID References:
+  - $DATA_ROOT_DIR/fid-refs/cifar10-32x32.npz (EDM format)
+  - $DATA_ROOT_DIR/fid-refs/imagenet-64x64.npz (EDM format)
+  - $DATA_ROOT_DIR/fid-refs/imagenet-64x64-edmv2.pkl (EDM2 format)
+  - $DATA_ROOT_DIR/fid-refs/imagenet_256.pkl (EDM2 format)
 - Models:
   - $CKPT_ROOT_DIR/cifar10/edm-cifar10-32x32-{uncond,cond}-vp.pth
   - $CKPT_ROOT_DIR/imagenet-64/edm-imagenet-64x64-cond-adm.pth
@@ -36,8 +47,11 @@ Usage:
     # Download ImageNet-64 (requires Kaggle ImageNet download):
     python scripts/download_data.py --dataset imagenet-64 --imagenet-source /path/to/imagenet
 
-    # Download ImageNet-256 with VAE encoding (for latent diffusion):
+    # Download ImageNet-256 with VAE encoding:
     python scripts/download_data.py --dataset imagenet-256 --imagenet-source /path/to/imagenet
+
+    # Compute FID reference statistics:
+    python scripts/download_data.py --dataset cifar10 --compute-fid-refs
 
     # Download only data or only models:
     python scripts/download_data.py --only-data
@@ -49,13 +63,18 @@ Usage:
 
 import argparse
 import hashlib
+import io
+import json
 import pickle
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
+import PIL.Image
 from tqdm import tqdm
 
 import fastgen.utils.logging_utils as logger
@@ -64,14 +83,23 @@ from fastgen.configs.data import DATA_ROOT_DIR
 from fastgen.configs.net import CKPT_ROOT_DIR
 
 
-# URLs for downloads
+# =============================================================================
+# URLs and external resources
+# =============================================================================
 CIFAR10_URL = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
 CIFAR10_MD5 = "c58f30108f718f92721af3b95e74349a"
 
+EDM_REPO_URL = "https://github.com/NVlabs/edm.git"
+EDM2_REPO_URL = "https://github.com/NVlabs/edm2.git"
 EDM_BASE_URL = "https://nvlabs-fi-cdn.nvidia.com/edm/pretrained"
 EDM2_BASE_URL = "https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions"
 
-# EDM models (CIFAR-10 and ImageNet-64)
+# ImageNet data paths (relative to the Kaggle download root)
+IMAGENET_TRAIN_SUBPATH = "ILSVRC/Data/CLS-LOC/train"
+
+# =============================================================================
+# Model definitions
+# =============================================================================
 EDM_CIFAR10_MODELS = {
     "edm-cifar10-32x32-uncond-vp": {
         "url": f"{EDM_BASE_URL}/edm-cifar10-32x32-uncond-vp.pkl",
@@ -90,7 +118,6 @@ EDM_IMAGENET64_MODELS = {
     },
 }
 
-# EDM2 models (ImageNet-64, posthoc-reconstruction versions for best FID)
 EDM2_IMAGENET64_MODELS = {
     "edm2-img64-s-fid": {
         "url": f"{EDM2_BASE_URL}/edm2-img64-s-1073741-0.075.pkl",
@@ -109,12 +136,6 @@ EDM2_IMAGENET64_MODELS = {
         "output": "edm2-img64-xl-fid.pth",
     },
 }
-
-EDM_REPO_URL = "https://github.com/NVlabs/edm.git"
-EDM2_REPO_URL = "https://github.com/NVlabs/edm2.git"
-
-# ImageNet data paths (relative to the Kaggle download root)
-IMAGENET_TRAIN_SUBPATH = "ILSVRC/Data/CLS-LOC/train"
 
 
 def compute_md5(filepath: Path, chunk_size: int = 8192) -> str:
@@ -189,8 +210,17 @@ def run_dataset_tool(
     transform: Optional[str] = None,
     use_subcommand: bool = False,
     subcommand: str = "convert",
-) -> None:
-    """Run dataset_tool.py with common error handling."""
+    force: bool = False,
+) -> bool:
+    """
+    Run dataset_tool.py with common error handling.
+
+    Returns True if the dataset was created, False if it already existed.
+    """
+    if dest.exists() and not force:
+        logger.info(f"Dataset already exists: {dest}")
+        return False
+
     dataset_tool = repo_dir / "dataset_tool.py"
     if not dataset_tool.exists():
         raise FileNotFoundError(f"dataset_tool.py not found at {dataset_tool}")
@@ -206,6 +236,7 @@ def run_dataset_tool(
     if transform:
         cmd.append(f"--transform={transform}")
 
+    logger.info(f"Creating dataset: {dest.name}")
     logger.debug(f"Running: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, cwd=str(repo_dir), capture_output=True, text=True)
@@ -223,6 +254,9 @@ def run_dataset_tool(
         logger.error(f"stdout: {result.stdout}")
         logger.error(f"stderr: {result.stderr}")
         raise RuntimeError(f"dataset_tool.py did not create output file at {dest}")
+
+    logger.success(f"Dataset created: {dest}")
+    return True
 
 
 def convert_pickle_to_pth(pkl_path: Path, pth_path: Path, repo_dir: Path):
@@ -331,27 +365,79 @@ def prepare_models(
     logger.success(f"{description} models prepared successfully!")
 
 
-def prepare_cifar10_data(output_dir: Path, edm_dir: Path, force: bool = False):
-    """Download and prepare CIFAR-10 data in EDM format."""
-    output_path = output_dir / "cifar10" / "cifar10-32x32.zip"
+# ============================================================================
+# FID Reference Statistics Computation (using EDM/EDM2 scripts)
+# ============================================================================
 
+
+def compute_fid_refs(
+    dataset_path: Path,
+    output_path: Path,
+    repo_dir: Path,
+    use_edm2: bool = False,
+    force: bool = False,
+) -> None:
+    """
+    Compute FID reference statistics using EDM/EDM2 scripts.
+
+    This uses the native EDM/EDM2 FID computation scripts to ensure exact
+    compatibility with the original papers.
+
+    IMPORTANT: FID is computed in pixel space. For latent datasets (ImageNet-256),
+    the original pixel images must be used for computing reference statistics.
+
+    Args:
+        dataset_path: Path to the dataset (zip file or directory) containing pixel images
+        output_path: Full output path for the reference statistics file
+        repo_dir: Path to the cloned EDM or EDM2 repository
+        use_edm2: If True, use EDM2's calculate_metrics.py (outputs .pkl with FID+FD_DINOv2)
+        force: Force re-computation even if file exists
+    """
     if output_path.exists() and not force:
-        logger.info(f"CIFAR-10 data already exists at {output_path}")
-        logger.info("Use --force to re-download and recreate")
+        logger.info(f"FID reference already exists: {output_path}")
         return
 
-    logger.info("Preparing CIFAR-10 data")
+    if not dataset_path.exists():
+        logger.warning(f"Dataset not found at {dataset_path}, skipping FID computation")
+        return
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        tar_path = tmpdir / "cifar-10-python.tar.gz"
-        logger.info(f"Downloading CIFAR-10 from {CIFAR10_URL}")
-        download_file(CIFAR10_URL, tar_path, "Downloading CIFAR-10", CIFAR10_MD5)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info("Converting to EDM format using dataset_tool.py...")
-        run_dataset_tool(edm_dir, tar_path, output_path)
+    # Select script based on repo type
+    script = repo_dir / ("calculate_metrics.py" if use_edm2 else "fid.py")
+    if not script.exists():
+        raise FileNotFoundError(f"FID script not found at {script}")
 
-    logger.success(f"CIFAR-10 data prepared: {output_path} ({output_path.stat().st_size / 1024 / 1024:.1f} MB)")
+    cmd = [
+        sys.executable,
+        str(script.absolute()),
+        "ref",
+        f"--data={dataset_path.absolute()}",
+        f"--dest={output_path.absolute()}",
+        "--batch=64",
+    ]
+
+    logger.info(f"Computing FID reference: {output_path.name}")
+    logger.info(f"Dataset: {dataset_path}")
+    logger.debug(f"Running: {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, cwd=str(repo_dir), capture_output=True, text=True)
+
+    if result.returncode != 0:
+        logger.error(f"stdout: {result.stdout}")
+        logger.error(f"stderr: {result.stderr}")
+        raise RuntimeError(f"FID computation failed with return code {result.returncode}")
+
+    if result.stdout:
+        for line in result.stdout.strip().split("\n"):
+            logger.debug(line)
+
+    if not output_path.exists():
+        logger.error(f"stdout: {result.stdout}")
+        logger.error(f"stderr: {result.stderr}")
+        raise RuntimeError(f"FID script did not create output file at {output_path}")
+
+    logger.success(f"FID reference saved: {output_path}")
 
 
 def validate_imagenet_source(imagenet_source: Path) -> Path:
@@ -366,75 +452,72 @@ def validate_imagenet_source(imagenet_source: Path) -> Path:
     return train_path
 
 
-def prepare_imagenet_data(
-    output_dir: Path,
-    repo_dir: Path,
-    imagenet_source: Path,
-    output_subdir: str,
-    output_filename: str,
-    resolution: str,
-    transform: str,
-    description: str,
-    use_edm2_format: bool = False,
-    vae_encode: bool = False,
-    force: bool = False,
-):
-    """Generic function to prepare ImageNet data in EDM/EDM2 format.
-
-    Args:
-        vae_encode: If True, first convert to RGB then encode through VAE (for latent diffusion).
+def encode_dit_style(rgb_path: Path, output_path: Path, force: bool = False) -> bool:
     """
-    output_path = output_dir / output_subdir / output_filename
+    Encode RGB dataset to VAE latents using DiT/SiT style ([-1,1] normalization).
 
+    Returns True if the dataset was created, False if it already existed.
+    """
     if output_path.exists() and not force:
-        logger.info(f"{description} data already exists at {output_path}")
-        logger.info("Use --force to recreate")
-        return
+        logger.info(f"Dataset already exists: {output_path}")
+        return False
 
-    train_path = validate_imagenet_source(imagenet_source)
-    logger.info(f"Preparing {description} data")
-    logger.info(f"Source: {train_path}")
-    logger.info("This may take a while...")
+    import torch
+    from diffusers.models import AutoencoderKL
 
-    if vae_encode:
-        # Two-step process: convert to RGB, then encode through VAE
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Creating dataset: {output_path.name}")
+    logger.info("Loading Stability VAE encoder...")
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+    vae = vae.eval().requires_grad_(False).cuda()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            rgb_path = Path(tmpdir) / "rgb_dataset.zip"
+    with zipfile.ZipFile(rgb_path, "r") as src_zip:
+        image_files = sorted([f for f in src_zip.namelist() if f.endswith(".png")])
 
-            logger.info("Step 1/2: Converting to RGB format...")
-            run_dataset_tool(
-                repo_dir,
-                train_path,
-                rgb_path,
-                resolution=resolution,
-                transform=transform,
-                use_subcommand=True,
-                subcommand="convert",
-            )
-            logger.info(f"RGB dataset created: {rgb_path} ({rgb_path.stat().st_size / 1024 / 1024:.1f} MB)")
+        # Load labels from source
+        labels = {}
+        if "dataset.json" in src_zip.namelist():
+            with src_zip.open("dataset.json") as f:
+                data = json.load(f).get("labels")
+                if data is not None:
+                    labels = {x[0]: x[1] for x in data}
 
-            logger.info("Step 2/2: Encoding through VAE (this may take a long time)...")
-            run_dataset_tool(
-                repo_dir,
-                rgb_path,
-                output_path,
-                use_subcommand=True,
-                subcommand="encode",
-            )
-    else:
-        run_dataset_tool(
-            repo_dir,
-            train_path,
-            output_path,
-            resolution=resolution,
-            transform=transform,
-            use_subcommand=use_edm2_format,
-            subcommand="convert",
-        )
+        logger.info(f"Encoding {len(image_files)} images...")
 
-    logger.success(f"{description} data prepared: {output_path} ({output_path.stat().st_size / 1024 / 1024:.1f} MB)")
+        with zipfile.ZipFile(output_path, mode="w", compression=zipfile.ZIP_STORED) as dst_zip:
+            all_labels = []
+
+            for idx, img_fname in enumerate(tqdm(image_files, desc="Encoding images")):
+                with src_zip.open(img_fname) as f:
+                    img = np.array(PIL.Image.open(f).convert("RGB"))
+
+                # Convert to tensor and normalize to [-1, 1] (DiT/SiT style)
+                img_tensor = torch.tensor(img).cuda().permute(2, 0, 1).unsqueeze(0).float()
+                img_tensor = img_tensor / 127.5 - 1  # [-1, 1] normalization
+
+                # Encode through VAE
+                with torch.no_grad():
+                    dist = vae.encode(img_tensor)["latent_dist"]
+                    mean_std = torch.cat([dist.mean, dist.std], dim=1)[0].cpu().numpy()
+
+                # Save latent with same naming scheme as EDM2
+                idx_str = f"{idx:08d}"
+                archive_fname = f"{idx_str[:5]}/img-mean-std-{idx_str}.npy"
+
+                f = io.BytesIO()
+                np.save(f, mean_std)
+                dst_zip.writestr(archive_fname, f.getvalue())
+
+                label = labels.get(img_fname)
+                if label is not None:
+                    all_labels.append([archive_fname, label])
+
+            # Save metadata
+            metadata = {"labels": all_labels if all_labels else None}
+            dst_zip.writestr("dataset.json", json.dumps(metadata))
+
+    logger.success(f"Dataset created: {output_path}")
+    return True
 
 
 def main():
@@ -472,7 +555,11 @@ Examples:
         type=str,
         default="all",
         choices=["cifar10", "imagenet-64", "imagenet-256", "all"],
-        help="Dataset to prepare (default: cifar10). 'imagenet-64' prepares both EDM and EDM2 formats.",
+        help=(
+            "Dataset to prepare (default: all). "
+            "'imagenet-64' prepares both EDM and EDM2 formats. "
+            "'imagenet-256' uses SD VAE encoding ([-1,1] input normalization)."
+        ),
     )
     parser.add_argument(
         "--imagenet-source",
@@ -508,6 +595,11 @@ Examples:
         help="Force re-download even if files exist",
     )
     parser.add_argument(
+        "--compute-fid-refs",
+        action="store_true",
+        help="Compute FID reference statistics for datasets",
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -519,7 +611,8 @@ Examples:
     set_log_level(args.log_level)
 
     # Validate ImageNet source requirement
-    if args.dataset in ["imagenet-64", "imagenet-256", "all"] and args.imagenet_source is None:
+    imagenet_datasets = ["imagenet-64", "imagenet-256", "all"]
+    if args.dataset in imagenet_datasets and args.imagenet_source is None:
         if not args.only_models:
             parser.error(f"--imagenet-source is required for dataset '{args.dataset}' (unless --only-models is set)")
 
@@ -533,14 +626,17 @@ Examples:
     if args.imagenet_source:
         logger.info(f"ImageNet source:      {args.imagenet_source.absolute()}")
 
-    # Determine which repos we need
-    need_edm = args.dataset in ["cifar10", "imagenet-64", "all"]
-    need_edm2 = args.dataset in ["imagenet-64", "imagenet-256", "all"]
-
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        edm_dir = clone_repo(EDM_REPO_URL, tmpdir, "edm") if need_edm else None
-        edm2_dir = clone_repo(EDM2_REPO_URL, tmpdir, "edm2") if need_edm2 else None
+        fid_refs_dir = output_dir / "fid-refs"
+
+        # Determine which repos we need to clone
+        edm_dir = None
+        edm2_dir = None
+        if args.dataset in ["cifar10", "imagenet-64", "all"]:
+            edm_dir = clone_repo(EDM_REPO_URL, tmpdir, "edm")
+        if args.dataset in ["imagenet-64", "imagenet-256", "all"]:
+            edm2_dir = clone_repo(EDM2_REPO_URL, tmpdir, "edm2")
 
         # ============ CIFAR-10 ============
         if args.dataset in ["cifar10", "all"]:
@@ -548,8 +644,18 @@ Examples:
             logger.info("Processing CIFAR-10")
             logger.info("=" * 50)
 
+            cifar_path = output_dir / "cifar10" / "cifar10-32x32.zip"
+            tar_path = tmpdir / "cifar-10-python.tar.gz"
+
             if not args.only_models:
-                prepare_cifar10_data(output_dir, edm_dir, force=args.force)
+                if not cifar_path.exists() or args.force:
+                    download_file(CIFAR10_URL, tar_path, "Downloading CIFAR-10", CIFAR10_MD5)
+                run_dataset_tool(edm_dir, tar_path, cifar_path, force=args.force)
+
+                if args.compute_fid_refs:
+                    compute_fid_refs(
+                        cifar_path, fid_refs_dir / "cifar10-32x32.npz", edm_dir, use_edm2=False, force=args.force
+                    )
 
             if not args.only_data:
                 prepare_models(
@@ -562,33 +668,31 @@ Examples:
             logger.info("Processing ImageNet-64")
             logger.info("=" * 50)
 
+            train_path = validate_imagenet_source(args.imagenet_source)
+            edm_path = output_dir / "imagenet-64" / "imagenet-64x64.zip"
+            edm2_path = output_dir / "imagenet-64" / "imagenet-64x64-edmv2.zip"
+
             if not args.only_models:
-                # EDM format
-                prepare_imagenet_data(
-                    output_dir,
-                    edm_dir,
-                    args.imagenet_source,
-                    output_subdir="imagenet-64",
-                    output_filename="imagenet-64x64.zip",
-                    resolution="64x64",
-                    transform="center-crop",
-                    description="ImageNet-64 (EDM)",
-                    use_edm2_format=False,
-                    force=args.force,
+                run_dataset_tool(
+                    edm_dir, train_path, edm_path, resolution="64x64", transform="center-crop", force=args.force
                 )
-                # EDM2 format
-                prepare_imagenet_data(
-                    output_dir,
+                run_dataset_tool(
                     edm2_dir,
-                    args.imagenet_source,
-                    output_subdir="imagenet-64",
-                    output_filename="imagenet-64x64-edmv2.zip",
+                    train_path,
+                    edm2_path,
                     resolution="64x64",
                     transform="center-crop-dhariwal",
-                    description="ImageNet-64 (EDM2)",
-                    use_edm2_format=True,
+                    use_subcommand=True,
                     force=args.force,
                 )
+
+                if args.compute_fid_refs:
+                    compute_fid_refs(
+                        edm_path, fid_refs_dir / "imagenet-64x64.npz", edm_dir, use_edm2=False, force=args.force
+                    )
+                    compute_fid_refs(
+                        edm2_path, fid_refs_dir / "imagenet-64x64-edmv2.pkl", edm2_dir, use_edm2=True, force=args.force
+                    )
 
             if not args.only_data:
                 prepare_models(
@@ -605,25 +709,32 @@ Examples:
                 )
 
         # ============ ImageNet-256 ============
-        if args.dataset in ["imagenet-256", "all"]:
+        if args.dataset in ["imagenet-256", "all"] and not args.only_models and args.imagenet_source:
             logger.info("=" * 50)
             logger.info("Processing ImageNet-256")
             logger.info("=" * 50)
 
-            if not args.only_models:
-                prepare_imagenet_data(
-                    output_dir,
-                    edm2_dir,
-                    args.imagenet_source,
-                    output_subdir="imagenet-256",
-                    output_filename="imagenet_256_sd.zip",
-                    resolution="256x256",
-                    transform="center-crop-dhariwal",
-                    description="ImageNet-256 (EDM2 latent)",
-                    use_edm2_format=True,
-                    vae_encode=True,
-                    force=args.force,
-                )
+            train_path = validate_imagenet_source(args.imagenet_source)
+            rgb_path = output_dir / "imagenet-256" / "imagenet_256_rgb.zip"
+            latent_path = output_dir / "imagenet-256" / "imagenet_256_sd.zip"
+
+            # Create RGB dataset (used for VAE encoding and FID)
+            run_dataset_tool(
+                edm2_dir,
+                train_path,
+                rgb_path,
+                resolution="256x256",
+                transform="center-crop-dhariwal",
+                use_subcommand=True,
+                subcommand="convert",
+                force=args.force,
+            )
+
+            # Encode through VAE
+            encode_dit_style(rgb_path, latent_path, force=args.force)
+
+            if args.compute_fid_refs:
+                compute_fid_refs(rgb_path, fid_refs_dir / "imagenet_256.pkl", edm2_dir, use_edm2=True, force=args.force)
 
     logger.success("Setup complete!")
 
@@ -653,7 +764,13 @@ Examples:
 
     if args.dataset in ["imagenet-256", "all"]:
         if not args.only_models:
-            logger.info(f"  ImageNet-256 data (latent): {output_dir / 'imagenet-256' / 'imagenet_256_sd.zip'}")
+            logger.info(f"  ImageNet-256 RGB: {output_dir / 'imagenet-256' / 'imagenet_256_rgb.zip'}")
+            logger.info(f"  ImageNet-256 latents: {output_dir / 'imagenet-256' / 'imagenet_256_sd.zip'}")
+
+    if args.compute_fid_refs:
+        logger.info("")
+        logger.info("FID reference statistics:")
+        logger.info(f"  Directory: {output_dir / 'fid-refs'}")
 
     logger.info("")
     logger.info("Example training commands:")
@@ -665,6 +782,10 @@ Examples:
         logger.info("  # ImageNet-64:")
         logger.info(f"  DATA_ROOT_DIR={output_dir} CKPT_ROOT_DIR={ckpt_dir} python train.py \\")
         logger.info("    --config=fastgen/configs/experiments/EDM/config_dmd2_in64.py")
+    if args.dataset in ["imagenet-256", "all"]:
+        logger.info("  # ImageNet-256 (SD/DiT/SiT):")
+        logger.info(f"  DATA_ROOT_DIR={output_dir} CKPT_ROOT_DIR={ckpt_dir} python train.py \\")
+        logger.info("    --config=fastgen/configs/experiments/DiT/config_sft_dit_xl.py")
 
 
 if __name__ == "__main__":

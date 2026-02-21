@@ -28,6 +28,7 @@ class EMACallback(Callback):
         # params for type=halflife
         ema_halflife_kimg: float = 500,
         ema_rampup_ratio: Optional[float] = 0.05,
+        start_iter: int = 0,
         ema_name: str = "ema",
         batch_size: int = 1,  # overwritten by self.config if it exists
         fsdp: bool = False,  # overwritten by self.config if it exists
@@ -37,6 +38,7 @@ class EMACallback(Callback):
         self.gamma = gamma
         self.ema_halflife_kimg = ema_halflife_kimg
         self.ema_rampup_ratio = ema_rampup_ratio
+        self.start_iter = start_iter
         self.ema_name = ema_name
         self.batch_size = batch_size
         self._is_fsdp = fsdp
@@ -102,12 +104,19 @@ class EMACallback(Callback):
         if not self._enabled:
             return
 
+        # Get total iteration and skip if before start_iter
+        total_iteration = self._total_iteration(model, iteration)
+        if total_iteration < self.start_iter:
+            return
+        elif total_iteration == self.start_iter:
+            logger.info(f"Starting to update {self.ema_name} at iteration {total_iteration}.")
+
         if self.type == "constant":
             beta = self.beta
         elif self.type == "power":
-            beta = self._power_function_beta(self._total_iteration(model, iteration))
+            beta = self._power_function_beta(total_iteration)
         elif self.type == "halflife":
-            beta = self._halflife_beta(self._total_iteration(model, iteration))
+            beta = self._halflife_beta(total_iteration)
         else:
             raise ValueError(f"Invalid {self.ema_name} type: {self.type}")
 
@@ -130,10 +139,15 @@ class EMACallback(Callback):
                     full_tensor = p_net
                 # Strip checkpoint wrapper prefix if present (EMA doesn't have checkpointing)
                 ema_name = name.replace("_checkpoint_wrapped_module.", "")
-                # Cast to EMA dtype and device (typically float32 on CPU) for lerp_ compatibility
+                # Cast to EMA dtype and device for lerp_ compatibility
                 if ema_name in ema_state_dict:
                     ema_param = ema_state_dict[ema_name]
-                    ema_param.lerp_(full_tensor.to(device=ema_param.device, dtype=ema_param.dtype), 1.0 - beta)
+                    if total_iteration == self.start_iter:
+                        # re-initialize EMA parameter
+                        ema_param.copy_(full_tensor.to(device=ema_param.device, dtype=ema_param.dtype))
+                    else:
+                        # interpolate EMA parameter
+                        ema_param.lerp_(full_tensor.to(device=ema_param.device, dtype=ema_param.dtype), 1.0 - beta)
                 elif iteration == 1:
                     # only warn on first iteration if parameter is not found
                     logger.warning(f"EMA parameter {ema_name} not found in EMA state dict, skipping update.")

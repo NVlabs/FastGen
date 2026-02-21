@@ -59,19 +59,7 @@ def _get_meta_init_context(fsdp_meta_init: bool):
     return contextlib.nullcontext()
 
 
-def apply_fsdp_to_network(network, device_mesh, mp_policy=None):
-    """Apply FSDP sharding to a FastGenNetwork."""
-    if mp_policy is None:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            output_dtype=torch.bfloat16,
-            cast_forward_inputs=True,
-        )
-    network.fully_shard(mesh=device_mesh, mp_policy=mp_policy)
-
-
-def broadcast_state_dict_and_sync(network, device_mesh, broadcast_state_dict):
+def broadcast_state_dict_and_sync(network, broadcast_state_dict):
     """Materialize meta tensors and broadcast state dict from rank 0."""
     network.to_empty(device=torch.cuda.current_device())
     network.reset_parameters()
@@ -110,7 +98,9 @@ def create_network_with_fsdp(
     device_mesh,
     fsdp_meta_init: bool = True,
     apply_checkpointing: bool = False,
-    mp_policy=None,
+    param_dtype: torch.dtype = torch.bfloat16,
+    reduce_dtype: torch.dtype = torch.float32,
+    sharded_dtype: torch.dtype = torch.float32,
 ):
     """Create a network and apply FSDP sharding.
 
@@ -119,7 +109,9 @@ def create_network_with_fsdp(
         device_mesh: FSDP device mesh
         fsdp_meta_init: Whether to use meta device initialization
         apply_checkpointing: Whether to enable gradient checkpointing
-        mp_policy: Optional MixedPrecisionPolicy override
+        param_dtype: Dtype for parameters during computation (default bfloat16).
+        reduce_dtype: Dtype for gradient reduction (default float32).
+        sharded_dtype: Dtype of sharded weights (default float32).
 
     Returns:
         The FSDP-wrapped network.
@@ -140,6 +132,9 @@ def create_network_with_fsdp(
     # Ensure all ranks have finished loading before continuing
     dist.barrier()
 
+    # Set dtype of sharded weights before FSDP wrapping
+    network.to(dtype=sharded_dtype)
+
     # Extract state dict from rank 0 BEFORE FSDP sharding
     if rank == 0:
         broadcast_state_dict = copy.deepcopy(network.state_dict())
@@ -148,11 +143,16 @@ def create_network_with_fsdp(
 
     dist.barrier()
 
-    # Apply FSDP sharding
-    apply_fsdp_to_network(network, device_mesh, mp_policy=mp_policy)
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        output_dtype=param_dtype,
+        cast_forward_inputs=True,
+    )
+    network.fully_shard(mesh=device_mesh, mp_policy=mp_policy)
 
     # Materialize and sync
-    broadcast_state_dict_and_sync(network, device_mesh, broadcast_state_dict)
+    broadcast_state_dict_and_sync(network, broadcast_state_dict)
 
     # Final sync before returning
     dist.barrier()
@@ -166,52 +166,44 @@ def create_network_with_fsdp(
 
 
 def _generic_fsdp_test_impl(
-    rank: int,
     world_size: int,
     config,
     generate_inputs_fn,
     apply_checkpointing: bool = True,
-    use_fp32: bool = False,
+    param_dtype: torch.dtype = torch.bfloat16,
+    reduce_dtype: torch.dtype = torch.float32,
+    sharded_dtype: torch.dtype = torch.float32,
 ) -> Dict:
     """Generic implementation for FSDP forward + backward pass test.
 
     Args:
-        rank: Current process rank
         world_size: Total number of processes
         config: Network configuration
         generate_inputs_fn: Function that takes (network, device, dtype) and returns inputs dict
         apply_checkpointing: Whether to enable gradient checkpointing
-        use_fp32: If True, use fp32 instead of bf16 (for models with bf16 numerical issues)
+        param_dtype: Dtype for parameters during computation (default bfloat16).
+        reduce_dtype: Dtype for gradient reduction (default float32).
+        sharded_dtype: Dtype of sharded weights (default float32).
 
     Returns:
         Dict with test results
     """
     device_mesh = init_device_mesh("cuda", (world_size,))
     device = torch.device("cuda", torch.cuda.current_device())
-    dtype = torch.float32 if use_fp32 else torch.bfloat16
-
-    # Create network with FSDP (use fp32 policy if requested)
-    mp_policy = None
-    if use_fp32:
-        mp_policy = MixedPrecisionPolicy(
-            param_dtype=torch.float32,
-            reduce_dtype=torch.float32,
-            output_dtype=None,
-            cast_forward_inputs=False,
-        )
 
     network = create_network_with_fsdp(
         config,
         device_mesh,
         fsdp_meta_init=True,
         apply_checkpointing=apply_checkpointing,
-        mp_policy=mp_policy,
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        sharded_dtype=sharded_dtype,
     )
-
     network.train()
 
     # Generate inputs
-    inputs = generate_inputs_fn(network, device, dtype)
+    inputs = generate_inputs_fn(network, device, param_dtype)
 
     # Forward pass (with gradients)
     output = network(**inputs)
@@ -227,7 +219,7 @@ def _generic_fsdp_test_impl(
     # Check that gradients exist and are finite
     grad_info = {"has_grads": False, "all_finite": True, "num_params_with_grad": 0}
 
-    for name, param in network.named_parameters():
+    for _, param in network.named_parameters():
         if param.grad is not None:
             grad_info["has_grads"] = True
             grad_info["num_params_with_grad"] += 1
@@ -508,7 +500,6 @@ def _test_edm_cifar10_impl(rank: int, world_size: int) -> Dict:
     from fastgen.configs.net import EDM_CIFAR10_Config
 
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         EDM_CIFAR10_Config,
         generate_edm_cifar10_inputs,
@@ -520,16 +511,14 @@ def _test_edm_imagenet64_impl(rank: int, world_size: int) -> Dict:
     from fastgen.configs.net import EDM_ImageNet64_Config
 
     return _generic_fsdp_test_impl(
-        rank, world_size, EDM_ImageNet64_Config, generate_edm_imagenet64_inputs, apply_checkpointing=False
+        world_size, EDM_ImageNet64_Config, generate_edm_imagenet64_inputs, apply_checkpointing=False
     )
 
 
 def _test_edm2_impl(rank: int, world_size: int) -> Dict:
     from fastgen.configs.net import EDM2_IN64_S_Config
 
-    return _generic_fsdp_test_impl(
-        rank, world_size, EDM2_IN64_S_Config, generate_edm2_inputs, apply_checkpointing=False
-    )
+    return _generic_fsdp_test_impl(world_size, EDM2_IN64_S_Config, generate_edm2_inputs, apply_checkpointing=False)
 
 
 def _test_dit_impl(rank: int, world_size: int) -> Dict:
@@ -537,30 +526,40 @@ def _test_dit_impl(rank: int, world_size: int) -> Dict:
 
     with patch("diffusers.AutoencoderKL.from_pretrained") as mock_vae:
         mock_vae.return_value = MagicMock()
-        return _generic_fsdp_test_impl(
-            rank, world_size, DiT_IN256_S_Config, generate_dit_inputs, apply_checkpointing=False
-        )
+        return _generic_fsdp_test_impl(world_size, DiT_IN256_S_Config, generate_dit_inputs, apply_checkpointing=False)
 
 
 def _test_sd15_impl(rank: int, world_size: int) -> Dict:
     from fastgen.configs.net import SD15Config
 
-    return _generic_fsdp_test_impl(rank, world_size, SD15Config, generate_sd15_inputs, apply_checkpointing=False)
+    return _generic_fsdp_test_impl(world_size, SD15Config, generate_sd15_inputs, apply_checkpointing=False)
 
 
 def _test_cogvideox_impl(rank: int, world_size: int) -> Dict:
     from fastgen.configs.net import CogVideoXConfig
 
     set_env_vars()
-    # CogVideoX has bf16 numerical issues in backward pass with deep networks (30 blocks)
-    # Use fp32 for stability until the issue is resolved
+    # CogVideoX 2B was trained in fp16 and has numerical issues in backward pass
+    # Use float32 for stability until the issue is resolved
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         CogVideoXConfig,
         generate_cogvideox_inputs,
         apply_checkpointing=True,
-        use_fp32=True,
+        param_dtype=torch.float32,
+    )
+
+
+def _test_cogvideox_5b_impl(rank: int, world_size: int) -> Dict:
+    from fastgen.configs.net import CogVideoX5BConfig
+
+    set_env_vars()
+    # CogVideoX 5B was trained in bf16 and does not require fp32 for numerical stability
+    return _generic_fsdp_test_impl(
+        world_size,
+        CogVideoX5BConfig,
+        generate_cogvideox_inputs,
+        apply_checkpointing=True,
     )
 
 
@@ -568,9 +567,7 @@ def _test_wan_1_3b_impl(rank: int, world_size: int) -> Dict:
     from fastgen.configs.net import Wan_1_3B_Config
 
     set_env_vars()
-    return _generic_fsdp_test_impl(
-        rank, world_size, Wan_1_3B_Config, generate_wan_1_3b_inputs, apply_checkpointing=True
-    )
+    return _generic_fsdp_test_impl(world_size, Wan_1_3B_Config, generate_wan_1_3b_inputs, apply_checkpointing=True)
 
 
 def _test_causal_wan_1_3b_impl(rank: int, world_size: int) -> Dict:
@@ -578,7 +575,6 @@ def _test_causal_wan_1_3b_impl(rank: int, world_size: int) -> Dict:
 
     set_env_vars()
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         CausalWan_1_3B_Config,
         generate_causal_wan_1_3b_inputs,
@@ -591,7 +587,6 @@ def _test_wan22_5b_impl(rank: int, world_size: int) -> Dict:
 
     set_env_vars()
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         Wan22_T2V_5B_Config,
         generate_wan22_5b_inputs,
@@ -604,7 +599,6 @@ def _test_vace_wan_1_3b_impl(rank: int, world_size: int) -> Dict:
 
     set_env_vars()
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         VACE_Wan_1_3B_Config,
         generate_vace_wan_1_3b_inputs,
@@ -617,7 +611,6 @@ def _test_wan21_14b_impl(rank: int, world_size: int) -> Dict:
 
     set_env_vars()
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         Wan21_T2V_14B_Config,
         generate_wan21_14b_inputs,
@@ -630,7 +623,6 @@ def _test_wan22_i2v_5b_impl(rank: int, world_size: int) -> Dict:
 
     set_env_vars()
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         Wan22_I2V_5B_Config,
         generate_wan22_i2v_5b_inputs,
@@ -643,7 +635,6 @@ def _test_causal_wan22_i2v_5b_impl(rank: int, world_size: int) -> Dict:
 
     set_env_vars()
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         CausalWan22_I2V_5B_Config,
         generate_causal_wan22_i2v_5b_inputs,
@@ -656,7 +647,6 @@ def _test_wan21_i2v_14b_impl(rank: int, world_size: int) -> Dict:
 
     set_env_vars()
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         Wan21_I2V_14B_480P_Config,
         generate_wan21_i2v_14b_inputs,
@@ -669,7 +659,6 @@ def _test_causal_wan21_i2v_14b_impl(rank: int, world_size: int) -> Dict:
 
     set_env_vars()
     return _generic_fsdp_test_impl(
-        rank,
         world_size,
         CausalWan21_I2V_14B_480P_Config,
         generate_causal_wan21_i2v_14b_inputs,
@@ -681,7 +670,7 @@ def _test_flux_impl(rank: int, world_size: int) -> Dict:
     from fastgen.configs.net import FluxConfig
 
     set_env_vars()
-    return _generic_fsdp_test_impl(rank, world_size, FluxConfig, generate_flux_inputs, apply_checkpointing=True)
+    return _generic_fsdp_test_impl(world_size, FluxConfig, generate_flux_inputs, apply_checkpointing=True)
 
 
 # =============================================================================
@@ -837,6 +826,25 @@ def test_fsdp_cogvideox():
     clear_gpu_memory()
     result = run_distributed_test(
         test_fn=_test_cogvideox_impl,
+        world_size=2,
+        timeout=300,
+        setup_fn=set_env_vars,
+    )
+    assert result is not None, "Test did not return a result"
+    assert result["rank_consistent"], f"Ranks not consistent: diff={result['rank_consistency_diff']}"
+    assert result[
+        "backward_success"
+    ], f"Backward failed: has_grads={result['has_grads']}, finite={result['all_grads_finite']}"
+    clear_gpu_memory()
+
+
+@RunIf(min_gpus=2)
+@pytest.mark.large_model
+def test_fsdp_cogvideox_5b():
+    """Test FSDP forward+backward pass for CogVideoX-5B with gradient checkpointing."""
+    clear_gpu_memory()
+    result = run_distributed_test(
+        test_fn=_test_cogvideox_5b_impl,
         world_size=2,
         timeout=300,
         setup_fn=set_env_vars,

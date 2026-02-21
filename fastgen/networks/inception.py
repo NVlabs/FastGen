@@ -40,12 +40,17 @@ class InceptionV3(nn.Module):
         self.layers = self.base.layers
         self.resize_inside = resize_inside
 
-    """
-    Get the inception features without resizing
-    x: Image with values in range [0,255]
-    """
-
     def forward(self, x):
+        """
+        Get the inception features.
+
+        Args:
+            x: Image tensor with values in range [-1, 1] (NCHW format).
+               Internally converted to [0, 255] before passing to base model.
+
+        Returns:
+            Inception features of shape (N, 2048).
+        """
         with disable_gpu_fuser_on_pt19():
             bs = x.shape[0]
             if self.resize_inside:

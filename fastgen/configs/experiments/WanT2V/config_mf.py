@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-
 import copy
 
 import fastgen.configs.methods.config_mean_flow as config_mf_default
@@ -16,7 +15,7 @@ from fastgen.callbacks.ema import EMACallback
 
 def create_config():
     config = config_mf_default.create_config()
-    # trainer
+
     # ema
     config.model.use_ema = ["ema_1"]
     config.trainer.callbacks.pop("ema")

@@ -11,18 +11,29 @@ from fastgen.configs.net import Wan_1_3B_Config
 
 def create_config():
     config = config_ladd_default.create_config()
-    config.model.net_optimizer.lr = 5e-7
-    config.model.discriminator_optimizer.lr = 5e-7
+    config.model.net_optimizer.lr = 2e-6
+    config.model.discriminator_optimizer.lr = 4e-6
 
     config.model.precision = "bfloat16"
     # VAE compress ratio: (1+T/4) * H / 8 * W / 8
     config.model.input_shape = [16, 21, 60, 104]
     config.model.discriminator = Discriminator_Wan_1_3B_Config
+    config.model.discriminator.feature_indices = [15, 22, 29]
+    config.model.discriminator.disc_type = "multiscale_down_mlp_large"
     config.model.net = Wan_1_3B_Config
 
-    config.model.sample_t_cfg.time_dist_type = "uniform"
+    config.model.gan_r1_reg_weight = 0.1
+    config.model.gan_r1_reg_alpha = 0.1
+    config.model.gan_use_same_t_noise = True
+    config.model.student_update_freq = 2
+
+    config.model.sample_t_cfg.time_dist_type = "shifted"
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
+
+    # setting for 4-step training
+    config.model.student_sample_steps = 4
+    config.model.sample_t_cfg.t_list = [0.999, 0.937, 0.833, 0.624, 0.0]
 
     config.dataloader_train = VideoLoaderConfig
 

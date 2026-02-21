@@ -249,7 +249,15 @@ class CausVidModel(DMD2Model):
                 t_list = torch.tensor(t_list, device=device, dtype=torch.float32)
             assert t_list[-1].item() == 0, "t_list[-1] must be zero"
 
-            def _prefill_caches(segment_latents: torch.Tensor, frames: int) -> None:
+            def _prefill_caches(segment_latents: torch.Tensor, frames: int, frame_offset: int = 0) -> None:
+                """Prefill KV caches with overlapping frames from the previous segment.
+
+                Args:
+                    segment_latents: Latents to prefill caches with [B, C, T, H, W]
+                    frames: Number of frames to prefill
+                    frame_offset: Segment-level offset for extrapolation.
+                        For segment N, this is N * (segment_frames - overlap_frames).
+                """
                 if frames == 0:
                     return
                 start_frame = 0
@@ -264,13 +272,23 @@ class CausVidModel(DMD2Model):
                         fwd_pred_type="x0",
                         cache_tag="pos",
                         cur_start_frame=start_frame,
+                        frame_offset=frame_offset,
                         store_kv=True,
                         is_ar=True,
                         **kwargs,
                     )
                     start_frame = end_frame
 
-            def _run_segment(segment_latents: torch.Tensor, prefill_frames: int) -> torch.Tensor:
+            def _run_segment(segment_latents: torch.Tensor, prefill_frames: int, frame_offset: int = 0) -> torch.Tensor:
+                """Run a single segment of autoregressive generation.
+
+                Args:
+                    segment_latents: Input latents for this segment [B, C, T, H, W]
+                    prefill_frames: Number of frames to prefill from previous segment (for overlap)
+                    frame_offset: Segment-level offset for extrapolation.
+                        The network computes global frame index as: frame_offset + cur_start_frame.
+                        For segment N, this is N * (segment_frames - overlap_frames).
+                """
                 # Clone to avoid in-place modifications on the input tensor
                 x = segment_latents.clone()
 
@@ -278,8 +296,10 @@ class CausVidModel(DMD2Model):
                 net.clear_caches()
 
                 # If we have overlapping frames from the previous segment, prefill caches for them
+                # The prefill frames use the same frame_offset since they are the OVERLAP
+                # from the previous segment (their global indices are frame_offset + 0, 1, ...)
                 if prefill_frames > 0:
-                    _prefill_caches(x, prefill_frames)
+                    _prefill_caches(x, prefill_frames, frame_offset)
 
                 # Initialize only the frames we are about to generate using the first timestep sigma
                 if prefill_frames == 0:
@@ -305,6 +325,7 @@ class CausVidModel(DMD2Model):
                             fwd_pred_type="x0",
                             cache_tag="pos",
                             cur_start_frame=start_frame,
+                            frame_offset=frame_offset,
                             store_kv=False,
                             is_ar=True,
                             **kwargs,
@@ -341,6 +362,7 @@ class CausVidModel(DMD2Model):
                         fwd_pred_type="x0",
                         cache_tag="pos",
                         cur_start_frame=start_frame,
+                        frame_offset=frame_offset,
                         store_kv=True,
                         is_ar=True,
                         **kwargs,
@@ -357,7 +379,16 @@ class CausVidModel(DMD2Model):
             prefill_frames = 0
 
             for segment_idx in range(num_segments):
-                segment_latents = _run_segment(current_latents, prefill_frames)
+                # Compute the global frame offset for depth/control conditioning
+                # For segment N, the depth conditioning starts at frame N * (segment_frames - overlap_frames)
+                # This ensures:
+                # - Segment 0: local frame i → depth frame i
+                # - Segment 1 with overlap: local frame 0 (overlap from seg 0's tail) → depth frame (seg_frames - overlap)
+                #                           local frame overlap → depth frame seg_frames
+                # - And so on...
+                frame_offset = segment_idx * (segment_frames - overlap_frames)
+
+                segment_latents = _run_segment(current_latents, prefill_frames, frame_offset)
 
                 if segment_idx == 0:
                     segments.append(segment_latents)

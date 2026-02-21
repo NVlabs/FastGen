@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-from fastgen.configs.discriminator import Discriminator_CogVideoX2B_Config
+from fastgen.configs.discriminator import Discriminator_CogVideoX5B_Config
 import fastgen.configs.methods.config_dmd2 as config_dmd2_default
 from fastgen.configs.data import VideoLatentLoaderConfig
-from fastgen.configs.net import CogVideoXConfig
+from fastgen.configs.net import CogVideoX5BConfig
 
-""" Configs for the DMD2 model on CogVideoX model. """
+""" Configs for the DMD2 model on CogVideoX-5B model. """
 
 
 def create_config():
@@ -18,12 +18,13 @@ def create_config():
     config.model.fake_score_optimizer.lr = 1e-5
 
     config.model.input_shape = [16, 13, 60, 90]
-    config.model.discriminator = Discriminator_CogVideoX2B_Config
-    config.model.discriminator.feature_indices = [15, 22, 29]
+    config.model.discriminator = Discriminator_CogVideoX5B_Config
+    config.model.discriminator.feature_indices = [21, 31, 41]  # 42-layer 5B: ~50%, ~74%, 100%
     config.model.gan_loss_weight_gen = 0.03
-    config.model.net = CogVideoXConfig
+    config.model.net = CogVideoX5BConfig
     config.model.guidance_scale = 6.0
     config.model.enable_preprocessors = False
+    config.model.precision = "bfloat16"
 
     config.model.sample_t_cfg.time_dist_type = "uniform"
     config.model.sample_t_cfg.min_t = 0.001
@@ -44,5 +45,5 @@ def create_config():
     config.trainer.logging_iter = 100
     config.trainer.save_ckpt_iter = 500
 
-    config.log_config.group = "CogVideoX_dmd2"
+    config.log_config.group = "CogVideoX5B_dmd2"
     return config

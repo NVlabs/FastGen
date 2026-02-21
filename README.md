@@ -9,8 +9,13 @@
 </p>
 
 <p align="center">
-  <img src="assets/teaser.png" alt="FastGen header" width=100%/>
+  <a href="https://youtu.be/xEKcP-SwBBY" target="_blank">
+    <img src="assets/teaser.png" alt="Watch the video" width=100%/>
+    <br/>
+    <b>Click here for a demo video</b>
+  </a>
 </p>
+
 
 FastGen is a PyTorch-based framework for building fast generative models using various distillation and acceleration techniques. It supports:
 - large-scale training with ≥10B parameters.
@@ -102,7 +107,7 @@ For large models, use FSDP2 for model sharding by replacing `trainer.ddp=True` w
 
 ```bash
 python scripts/inference/image_model_inference.py --config fastgen/configs/experiments/EDM/config_dmd2_test.py \
-  --classes=10 --prompt_file=scripts/inference/prompts/classes.txt --ckpt=FASTGEN_OUTPUT/fastgen/cifar10/debug/checkpoints/0002000.pth - log_config.name=test_inference
+  --classes=10 --prompt_file=scripts/inference/prompts/classes.txt --ckpt_path=FASTGEN_OUTPUT/fastgen/cifar10/debug/checkpoints/0002000.pth - log_config.name=test_inference
 ```
 
 For other inferences modes and FID evaluations, see [scripts/README.md](scripts/README.md).
@@ -163,7 +168,7 @@ We thank everyone who has helped design, build, and test FastGen!
 
 - **Core contributors:** Weili Nie, Julius Berner, Chao Liu
 - **Other contributors:** James Lucas, David Pankratz, Sihyun Yu, Willis Ma, Yilun Xu, Shengqu Cai, Xinyin Ma, Yanke Song
-- **Collaborators:** Sophia Zalewski, Wei Xiong, Christian Laforte, Sajad Norouzi, Kaiwen Zheng, Miloš Hašan, Saeed Hadadan, Gene Liu, David Dynerman, Grace Lam, Pooya Jannaty, Jan Kautz, and many more.
+- **Collaborators:** Sophia Zalewski, Wei Xiong, Christian Laforte, Sajad Norouzi, Kaiwen Zheng, Miloš Hašan, Saeed Hadadan, Gene Liu, David Dynerman, Alicia Sui, Grace Lam, Pooya Jannaty, Jan Kautz, and many more.
 - **Project lead:** Arash Vahdat
 
 ## License
@@ -173,7 +178,7 @@ This project is licensed under the Apache License 2.0 - see [LICENSE](LICENSE) f
 ## Reference
 
 ```
-@article{fastgen2026,
+@misc{fastgen2026,
   title={NVIDIA FastGen: Fast Generation from Diffusion Models},
   author={Nie, Weili and Berner, Julius and Liu, Chao and Vahdat, Arash},
   url={https://github.com/NVlabs/FastGen},

@@ -10,7 +10,6 @@ from fastgen.configs.net import Wan_1_3B_Config
 
 def create_config():
     config = config_kd_default.create_config()
-
     config.trainer.max_iter = 10000
 
     config.model.net_optimizer.lr = 7e-5

@@ -44,7 +44,6 @@ class WanImageEncoder:
         model_id_or_local_path: str,
     ):
         # image encoder
-        # sihyuny: separate this to WanImageEncoder class?
         logger.info("Loading CLIP image encoder")
         self.image_encoder = CLIPVisionModel.from_pretrained(
             model_id_or_local_path,

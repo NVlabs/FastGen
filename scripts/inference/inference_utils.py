@@ -87,21 +87,6 @@ def init_model(config: BaseConfig) -> Any:
     return model
 
 
-def init_checkpointer(config: BaseConfig) -> Checkpointer | FSDPCheckpointer:
-    """Initialize the appropriate checkpointer based on config.
-
-    Args:
-        config: Base configuration object
-
-    Returns:
-        Checkpointer or FSDPCheckpointer instance
-    """
-    if config.trainer.fsdp:
-        return FSDPCheckpointer(config.trainer.checkpointer)
-    else:
-        return Checkpointer(config.trainer.checkpointer)
-
-
 def load_checkpoint(
     checkpointer: Checkpointer | FSDPCheckpointer,
     model: Any,

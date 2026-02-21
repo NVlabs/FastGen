@@ -74,13 +74,13 @@ import fastgen.utils.logging_utils as logger
 from fastgen.utils.distributed import clean_up, is_rank0, world_size
 from fastgen.utils import basic_utils
 from fastgen.utils.scripts import parse_args, setup
+from fastgen.utils.checkpointer import FSDPCheckpointer
 from fastgen.third_party.wan_prompt_expand.prompt_expand import QwenPromptExpander
 from fastgen.datasets.wds_dataloaders import transform_video
 from scripts.inference.inference_utils import (
     expand_path,
     load_prompts,
     init_model,
-    init_checkpointer,
     load_checkpoint,
     cleanup_unused_modules,
     setup_inference_modules,
@@ -301,6 +301,8 @@ def prepare_vacewan_condition(
     condition: torch.Tensor,
     neg_condition: Optional[torch.Tensor],
     ctx: dict,
+    num_segments: int = 1,
+    overlap_frames: int = 0,
 ) -> tuple:
     """Prepare condition dicts for VACE Wan models (depth-to-video).
 
@@ -312,12 +314,25 @@ def prepare_vacewan_condition(
         condition: Text embeddings for positive prompt
         neg_condition: Text embeddings for negative prompt
         ctx: Device/dtype context dict
+        num_segments: Number of segments for extrapolation (default 1)
+        overlap_frames: Number of overlapping latent frames between segments (default 0)
 
     Returns:
         Tuple of (condition_dict, neg_condition_dict)
     """
     t_latent = latent_shape[1]
-    target_frames = (t_latent - 1) * 4 + 1
+
+    # For extrapolation with multiple segments, compute total latent frames needed
+    # Total = segment_frames + (num_segments - 1) * (segment_frames - overlap_frames)
+    #       = num_segments * segment_frames - (num_segments - 1) * overlap_frames
+    if num_segments > 1:
+        total_latent_frames = num_segments * t_latent - (num_segments - 1) * overlap_frames
+    else:
+        total_latent_frames = t_latent
+
+    # Convert latent frames to pixel frames (VAE has 4x temporal compression)
+    target_frames = (total_latent_frames - 1) * 4 + 1
+
     # VAE spatial compression factor: 16 for Wan 2.2 (48ch latents), 8 for others
     vae_spatial_factor = 16 if latent_shape[0] == 48 else 8
     height = latent_shape[2] * vae_spatial_factor
@@ -330,7 +345,7 @@ def prepare_vacewan_condition(
         depth_latent = model.net.prepare_vid_conditioning(video=video, condition_latents=None)
     else:
         depth_latent = torch.load(depth_latent_path)
-        depth_latent = depth_latent[:, :t_latent]
+        depth_latent = depth_latent[:, :total_latent_frames]
         depth_latent = depth_latent.unsqueeze(0)
         depth_latent = depth_latent.to(**ctx)
         depth_latent = model.net.prepare_vid_conditioning(video=video, condition_latents=depth_latent)
@@ -530,7 +545,8 @@ def main(args, config: BaseConfig):
 
     # Initialize model and checkpointer
     model = init_model(config)
-    checkpointer = init_checkpointer(config)
+    # FSDP checkpointer falls back to basic checkpointer if the checkpoint ends with .pth
+    checkpointer = FSDPCheckpointer(config.trainer.checkpointer)
 
     # Load checkpoint
     ckpt_iter, save_dir = load_checkpoint(checkpointer, model, args.ckpt_path, config)
@@ -618,6 +634,8 @@ def main(args, config: BaseConfig):
                 condition=condition,
                 neg_condition=neg_condition,
                 ctx=ctx,
+                num_segments=args.num_segments,
+                overlap_frames=args.overlap_frames,
             )
         else:
             neg_condition_sample = neg_condition
@@ -704,7 +722,7 @@ if __name__ == "__main__":
     # Video-specific args
     parser.add_argument(
         "--save_as_gif",
-        default=True,
+        default=False,
         type=basic_utils.str2bool,
         help="Whether to save videos as GIF (True) or MP4 (False)",
     )

@@ -432,7 +432,7 @@ class BaseWDSLoader:
             if deterministic:
                 self.num_workers = 1
             else:
-                self.num_workers = min(os.cpu_count() // world_size(), 16)
+                self.num_workers = min(os.cpu_count() // world_size(), 8)
             logger.info(f"Automatically setting num_workers to {self.num_workers}")
 
         # Log deterministic warnings

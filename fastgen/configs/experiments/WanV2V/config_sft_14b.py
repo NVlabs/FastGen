@@ -25,6 +25,7 @@ def create_config():
     config.model.student_sample_steps = 50
 
     config.model.precision = "bfloat16"
+    config.model.precision_fsdp = "float32"
 
     # VAE compress ratio for WAN: (1+T/4) * H / 8 * W / 8
     config.model.input_shape = [16, 21, 60, 104]  # cthw

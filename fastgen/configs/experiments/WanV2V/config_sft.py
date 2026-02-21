@@ -3,10 +3,9 @@
 
 import fastgen.configs.methods.config_sft as config_sft_default
 from fastgen.configs.data import VideoLatentLoaderConfig
-from fastgen.configs.net import VACE_Wan_1_3B_Config
+from fastgen.configs.net import VACE_Wan_1_3B_Config, CKPT_ROOT_DIR
 from fastgen.utils import LazyCall as L
 from fastgen.methods import SFTModel
-from fastgen.configs.net import CKPT_ROOT_DIR
 
 """ Configs for SFT on WAN V2V model. """
 
@@ -14,7 +13,6 @@ from fastgen.configs.net import CKPT_ROOT_DIR
 def create_config():
     config = config_sft_default.create_config()
     config.model_class = L(SFTModel)(config=None)
-
     config.trainer.logging_iter = 100
     config.trainer.save_ckpt_iter = 100
     config.trainer.validation_iter = 1000

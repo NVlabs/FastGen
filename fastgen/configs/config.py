@@ -171,6 +171,9 @@ class BaseModelConfig:
     precision_amp_infer: str | None = None
     # AMP during en-/decoding (e.g., for VAEs or text encoders) - if None or equal to precision, AMP is disabled during en-/decoding.
     precision_amp_enc: str | None = None
+    # FSDP2 precision for parameter storage and gradient reduction.
+    # If None, defaults to `precision`. Useful for storing params/grads in float32 while computing in bfloat16.
+    precision_fsdp: str | None = None
 
 
 @attrs.define(slots=False)

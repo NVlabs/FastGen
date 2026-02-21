@@ -44,6 +44,7 @@ class FastGenModel(torch.nn.Module):
             precision_amp=self.config.precision_amp,
             precision_amp_infer=self.config.precision_amp_infer,
             precision_amp_enc=self.config.precision_amp_enc,
+            precision_fsdp=self.config.precision_fsdp,
         )
 
         # input shape
@@ -112,6 +113,7 @@ class FastGenModel(torch.nn.Module):
         precision_amp: str | None = None,
         precision_amp_infer: str | None = None,
         precision_amp_enc: str | None = None,
+        precision_fsdp: str | None = None,
     ):
         """Set the model/data precision and automatic mixed precision (AMP) precision for training and inference.
 
@@ -129,10 +131,17 @@ class FastGenModel(torch.nn.Module):
             precision_amp_infer: Precision for AMP during inference. If None or equal to precision, AMP is disabled during inference.
             precision_amp_enc: Precision for AMP en-/decoder (e.g., for VAEs or text encoders).
                 If None or equal to precision, AMP is disabled during en-/decoding.
+            precision_fsdp: Precision for FSDP2 parameter storage and gradient reduction.
+                If None, defaults to `precision`.
         """
 
         # precision for model/optimizer states and data
         self.precision = basic_utils.PRECISION_MAP[precision]
+
+        # precision for FSDP2 parameter storage and gradient reduction (defaults to model precision)
+        self.precision_fsdp = (
+            basic_utils.PRECISION_MAP[precision_fsdp] if precision_fsdp is not None else self.precision
+        )
 
         # precision for AMP training
         if precision_amp is None or precision_amp == precision:
@@ -162,7 +171,8 @@ class FastGenModel(torch.nn.Module):
 
         logger.critical(
             f"Model and data precision: {self.precision}. AMP training precision: {self.precision_amp}. "
-            f"AMP en-/decoder precision: {self.precision_amp_enc}. AMP inference precision: {self.precision_amp_infer}."
+            f"AMP en-/decoder precision: {self.precision_amp_enc}. AMP inference precision: {self.precision_amp_infer}. "
+            f"FSDP precision: {self.precision_fsdp}."
         )
 
     @property
@@ -259,8 +269,14 @@ class FastGenModel(torch.nn.Module):
         ctx = dict(dtype=self.precision, device=self.device)
 
         if is_fsdp:
-            # FSDP takes care of casting and device management
-            # We only move EMA networks as they aren't handled by FSDP
+            # Cast fsdp_dict modules to precision_fsdp before FSDP wrapping (when AMP is disabled).
+            # This sets the parameter storage dtype that FSDP will preserve for shards and gradient reduction.
+            for net_name, net in self.fsdp_dict.items():
+                logger.debug(f"Casting {net_name} to dtype={self.precision_fsdp} (pre-FSDP).")
+                net.to(dtype=self.precision_fsdp)
+                synchronize()
+
+            # Move EMA networks as they aren't handled by FSDP
             for net_name, net in self.ema_dict.items():
                 logger.debug(f"Starting moving EMA {net_name} to device: {self.device}.")
                 net.to(device=self.device)

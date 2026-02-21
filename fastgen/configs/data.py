@@ -44,6 +44,7 @@ VideoLoaderConfig = L(VideoWDSLoader)(
     presets_map={"neg_condition": "neg_prompt_wan"},
     sequence_length=81,
     img_size=(832, 480),
+    num_workers=2,
 )
 
 VideoLatentLoaderConfig = L(WDSLoader)(
@@ -52,6 +53,7 @@ VideoLatentLoaderConfig = L(WDSLoader)(
     key_map={"real": "latent.pth", "condition": "txt_emb.pth"},
     # Negative condition embedding loaded from a shared file (same for all samples)
     files_map={"neg_condition": "/path/to/neg_prompt_emb.npy"},
+    num_workers=2,
     # NOTE: For v2v tasks, add condition latent (e.g., depth) to key_map:
     #   key_map={"real": "latent.pth", "condition": "txt_emb.pth", "depth_latent": "depth_latent.pth"}
 )
@@ -67,6 +69,7 @@ PairLoaderConfig = L(WDSLoader)(
     datatags=["WDS:/path/to/pairs"],
     batch_size=2,
     key_map={"real": "latent.pth", "noise": "noise.pth", "condition": "txt_emb.pth"},
+    shuffle_size=100,
 )
 
 # For multi-step KD: provides (real, path, condition) with denoising trajectory
@@ -76,6 +79,7 @@ PathLoaderConfig = L(WDSLoader)(
     datatags=["WDS:/path/to/paths"],
     batch_size=2,
     key_map={"real": "latent.pth", "path": "path.pth", "condition": "txt_emb.pth"},
+    shuffle_size=100,
 )
 
 # ################################################################################

@@ -49,10 +49,10 @@ import fastgen.utils.logging_utils as logger
 from fastgen.utils import basic_utils
 from fastgen.utils.distributed import clean_up
 from fastgen.utils.scripts import parse_args, setup
+from fastgen.utils.checkpointer import FSDPCheckpointer
 from scripts.inference.inference_utils import (
     load_prompts,
     init_model,
-    init_checkpointer,
     load_checkpoint,
     cleanup_unused_modules,
     setup_inference_modules,
@@ -109,7 +109,8 @@ def main(args, config: BaseConfig):
 
     # Initialize model and checkpointer
     model = init_model(config)
-    checkpointer = init_checkpointer(config)
+    # FSDP checkpointer falls back to basic checkpointer if the checkpoint ends with .pth
+    checkpointer = FSDPCheckpointer(config.trainer.checkpointer)
 
     # Load checkpoint
     ckpt_iter, save_dir = load_checkpoint(checkpointer, model, args.ckpt_path, config)

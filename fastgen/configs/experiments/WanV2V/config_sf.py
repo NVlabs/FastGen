@@ -11,11 +11,16 @@ from fastgen.configs.net import VACE_Wan_1_3B_Config, CausalVACE_Wan_1_3B_Config
 
 def create_config():
     config = config_self_forcing_default.create_config()
+    # Pretrain the causal model using SFT or KD and start from the checkpoint
+    # config.trainer.checkpointer.pretrained_ckpt_path = /path/to/pretrained/ckpt.pth
+
     config.model.net_optimizer.lr = 5e-6
     config.model.discriminator_optimizer.lr = 5e-6
     config.model.fake_score_optimizer.lr = 5e-6
 
     config.model.precision = "bfloat16"
+    config.model.precision_fsdp = "float32"
+
     # VAE compress ratio: (1+T/4) * H / 8 * W / 8
     config.model.input_shape = [16, 21, 60, 104]
     config.model.fake_score_pred_type = "x0"
@@ -23,7 +28,6 @@ def create_config():
     config.model.net = CausalVACE_Wan_1_3B_Config
     config.model.net.depth_model_path = f"{CKPT_ROOT_DIR}/annotators/depth_anything_v2_vitl.pth"
     config.model.net.total_num_frames = config.model.input_shape[1]
-    config.model.net.use_fsdp_checkpoint = True
     config.model.teacher = VACE_Wan_1_3B_Config
 
     # GAN settings
@@ -33,10 +37,6 @@ def create_config():
     config.model.discriminator.feature_indices = [15, 22, 29]
     config.model.gan_use_same_t_noise = True
 
-    # Pretrained Self-Forcing checkpoint for causal WAN 1.3B student (see networks/README.md for download)
-    config.model.pretrained_student_net_path = f"{CKPT_ROOT_DIR}/Self-Forcing/checkpoints/ode_init.pt"
-    config.model.net.use_wan_official_sinusoidal = True
-
     config.model.sample_t_cfg.time_dist_type = "shifted"
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
@@ -44,6 +44,8 @@ def create_config():
 
     # EMA can lead to better performance when running longer
     # config.model.use_ema = True
+    # config.trainer.callbacks.ema.start_iter = 200
+    # config.trainer.callbacks.ema.beta = 0.99
 
     config.dataloader_train = VideoLoaderConfig
     config.dataloader_train.batch_size = 1

@@ -262,9 +262,10 @@ class LADDModel(FastGenModel):
         if self.config.gan_r1_reg_weight > 0:
             gan_loss_ar1 = self._compute_r1_regularization(real_feat_logit, real_data, t_real, condition=condition)
 
+        total_loss = gan_loss_disc + self.config.gan_r1_reg_weight * gan_loss_ar1
         loss_map = {
             "gan_loss_disc": gan_loss_disc,
-            "total_loss": gan_loss_disc,
+            "total_loss": total_loss,
         }
         if self.config.gan_r1_reg_weight > 0:
             loss_map.update({"gan_loss_ar1": gan_loss_ar1})

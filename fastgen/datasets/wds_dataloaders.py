@@ -204,7 +204,7 @@ class WDSLoader(BaseWDSLoader):
         batch_size: Batch size for the dataloader.
 
         key_map: Dict mapping output keys to item keys (file extensions in the shard).
-            Values are strings, example: {"real": "latents.npy", "condition": "text_emb.npy"}
+            Example: {"real": "latent.pth", "condition": "txt_emb.pth"}
 
         files_map: Optional dict mapping output keys to file paths. These files are
             loaded once at initialization and added as constants to every output.
@@ -251,9 +251,9 @@ class WDSLoader(BaseWDSLoader):
         # Common options passed to BaseWDSLoader
         **kwargs,
     ):
-        # Initialize key maps from file extensions to output dictionary keys (default if not provided)
+        # key_map: output keys -> item keys (file extensions in the shard)
         if key_map is None:
-            key_map = {"real": "latents.npy", "condition": "text_embedding.npy"}
+            key_map = {"real": "latent.pth", "condition": "txt_emb.pth"}
         self._key_map = key_map
 
         # Store text extensions
@@ -566,7 +566,6 @@ class VideoWDSLoader(WDSLoader):
         result = transform_video(video, self.sequence_length, self.img_size)
         return result["real"], result["cropping_params"]
 
-    # Process pipeline using Vchitect-style preprocessing
     def _preprocess(self, item: dict) -> Dict[str, Any]:
         output = super()._preprocess(item)
         for video_key in self.video_keys:

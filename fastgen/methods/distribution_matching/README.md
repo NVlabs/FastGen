@@ -99,3 +99,10 @@ DMD2 extended for causal video generation with gradients through autoregressive 
 
 
 **Configs:** [`WanT2V/config_sf.py`](../../configs/experiments/WanT2V/config_sf.py), [`WanV2V/config_sf.py`](../../configs/experiments/WanV2V/config_sf.py)
+
+**Expected results:**
+
+
+| Config | Dataset | Task | Steps | VBench (Total) | VBench (Quality) | VBench (Semantic) |
+|--------|---------|------|-------|----------------------|-------------------------|------------------------|
+| [`WanT2V/config_sf.py`](../../configs/experiments/WanT2V/config_sf.py) | Generated from Wan2.1 14B with [VidProM prompts](https://vidprom.github.io/) | T2V | 4 | 84.27 | 85.31 | 80.14 |

@@ -19,7 +19,9 @@ CTSchedule_CALLBACK = dict(
 )
 
 EMA_CALLBACK = dict(
-    ema=L(EMACallback)(type="constant", beta=0.9999, gamma=16.97, ema_halflife_kimg=500, ema_rampup_ratio=0.05),
+    ema=L(EMACallback)(
+        type="constant", beta=0.9999, gamma=16.97, ema_halflife_kimg=500, ema_rampup_ratio=0.05, start_iter=0
+    ),
 )
 
 EMA_CONST_CALLBACKS = dict(

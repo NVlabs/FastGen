@@ -306,6 +306,11 @@ def vace_causal_classify_forward_prepare(
     cache_tag = attention_kwargs.get("cache_tag", "pos")
     cur_start_frame = attention_kwargs.get("cur_start_frame", 0)
     total_num_frames = attention_kwargs.get("total_num_frames", num_frames)
+    # frame_offset is the segment-level offset for extrapolation.
+    # global_start_frame = frame_offset + cur_start_frame gives the global frame index
+    # (e.g., for depth conditioning), which may differ from cur_start_frame during extrapolation
+    frame_offset = attention_kwargs.get("frame_offset", 0)
+    global_start_frame = frame_offset + cur_start_frame
     attention_kwargs["frame_seqlen"] = frame_seqlen
 
     if control_hidden_states is not None and control_hidden_states_scale is None:
@@ -340,8 +345,10 @@ def vace_causal_classify_forward_prepare(
     processed_control_scales: Optional[List[torch.Tensor]] = None
     if control_hidden_states is not None:
         # Slice control frames to current chunk to ensure token counts align with hidden_states
+        # Use global_start_frame (= frame_offset + cur_start_frame) instead of cur_start_frame
+        # to correctly index into the depth conditioning during extrapolation
         ctrl_total_frames = control_hidden_states.shape[2]
-        start_f = min(cur_start_frame, ctrl_total_frames)
+        start_f = min(global_start_frame, ctrl_total_frames)
         end_f = min(start_f + num_frames, ctrl_total_frames)
         control_slice = control_hidden_states[:, :, start_f:end_f]
 
@@ -774,6 +781,7 @@ class CausalVACEWan(CausalFastGenNetwork, VACEWan):
         unpatchify_features: bool = True,
         cache_tag: str = "pos",
         cur_start_frame: int = 0,
+        frame_offset: int = 0,
         store_kv: bool = False,
         is_ar: bool = False,
         **fwd_kwargs,
@@ -825,6 +833,9 @@ class CausalVACEWan(CausalFastGenNetwork, VACEWan):
             "store_kv": store_kv,
             "is_ar": is_ar,
             "cur_start_frame": cur_start_frame,
+            # frame_offset is the segment-level offset (e.g., for depth conditioning).
+            # Global frame index is computed as: frame_offset + cur_start_frame
+            "frame_offset": frame_offset,
             "total_num_frames": self.total_num_frames,
         }
 

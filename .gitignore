@@ -152,6 +152,9 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# NVIDIA cache
+.nv
+
 # Cython debug symbols
 cython_debug/
 
@@ -164,6 +167,7 @@ cython_debug/
 
 # large files
 *.zip
+core
 
 # temporal folder
 tmp/

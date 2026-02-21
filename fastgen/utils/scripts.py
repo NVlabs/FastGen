@@ -86,10 +86,18 @@ def setup(args: argparse.Namespace, evaluation: bool = False) -> BaseConfig:
     else:
         logger.info("No DDP or FSDP parallelism")
 
-    # Propagate memory-efficient FSDP loading flag from trainer to model config
-    if config.model.fsdp_meta_init and not config.trainer.fsdp:
-        logger.warning("fsdp_meta_init is enabled but FSDP is disabled. Ignoring.")
-        config.model.fsdp_meta_init = False
+    # Check if we can use memory-efficient FSDP meta init
+    if config.model.fsdp_meta_init:
+        if not config.trainer.fsdp:
+            logger.warning("Ignoring fsdp_meta_init since FSDP is disabled.")
+            config.model.fsdp_meta_init = False
+        elif evaluation:
+            logger.warning("Ignoring fsdp_meta_init for evaluation/inference.")
+            config.model.fsdp_meta_init = False
+        elif config.trainer.checkpointer.pretrained_ckpt_path:
+            # TODO: this functionality is not implemented yet
+            logger.warning("Ignoring fsdp_meta_init for loading pretrained checkpoint.")
+            config.model.fsdp_meta_init = False
 
     # Global batch size
     if getattr(config.trainer, "batch_size_global", None) is not None:

@@ -115,7 +115,7 @@ def model_to_fsdp(
     # Mixed precision policy for FSDP2
     mp_policy = MixedPrecisionPolicy(
         param_dtype=model.precision,
-        reduce_dtype=torch.float32,
+        reduce_dtype=model.precision_fsdp,
         # We avoid casting all inputs so we can control t precision etc.
         output_dtype=None,
         cast_forward_inputs=False,
@@ -127,10 +127,6 @@ def model_to_fsdp(
         if k.startswith("ema"):
             logger.warning("EMA network stored in fsdp_dict will be skipped during FSDP2 wrap.")
             continue
-
-        # CRITICAL: Cast parameters to model.precision BEFORE FSDP wrapping if autocast is disabled.
-        if model.precision_amp is None:
-            v.to(dtype=model.precision)
 
         num_params = sum(p.numel() for p in v.parameters()) / 1e9
         logger.info(f"Starting FSDP2 wrap for '{k}' ({num_params:.2f}B params)...")
