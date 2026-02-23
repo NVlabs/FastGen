@@ -55,10 +55,12 @@ def _pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
 
 
 def _unpack_audio_latents(latents: torch.Tensor, latent_length: int, num_mel_bins: int) -> torch.Tensor:
-    """Unpack audio latents [B, L, C*M] → [B, C, L, M]."""
-    B = latents.size(0)
-    latents = latents.reshape(B, latent_length, num_mel_bins, -1)
-    return latents.permute(0, 3, 1, 2)
+    """Unpack audio latents [B, L, C*M] -> [B, C, L, M].
+    Mirrors pipeline: latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
+    unflatten splits last dim 128 -> [C=8, M=16], giving [B, L, C, M],
+    then transpose(1, 2) -> [B, C, L, M].
+    """
+    return latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
 
 
 def _normalize_latents(
