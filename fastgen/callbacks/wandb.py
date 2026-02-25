@@ -91,7 +91,8 @@ def init_wandb(config: BaseConfig):
     # wandb login
     wandb_credential = config.log_config.wandb_credential
     if os.path.isfile(wandb_credential):
-        os.environ["WANDB_API_KEY"] = open(wandb_credential, encoding="utf-8").read().strip("\n")
+        with open(wandb_credential, encoding="utf-8") as f:
+            os.environ["WANDB_API_KEY"] = f.read().strip("\n")
         logger.info(f"Loading WANDB_API_KEY from {wandb_credential}")
 
     wandb_config = config.log_config
@@ -101,7 +102,8 @@ def init_wandb(config: BaseConfig):
     os.makedirs(wandb_config.save_path, exist_ok=True)
     wandb_id_path = f"{wandb_config.save_path}/wandb_id.txt"
     if os.path.isfile(wandb_id_path):
-        wandb_id = open(wandb_id_path, encoding="utf-8").read().strip()
+        with open(wandb_id_path, encoding="utf-8") as f:
+            wandb_id = f.read().strip()
         logger.info(f"Resuming with an existing wandb id: {wandb_id}")
     else:
         wandb_id = wandb.util.generate_id()
