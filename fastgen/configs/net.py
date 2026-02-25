@@ -11,6 +11,7 @@ from fastgen.networks.DiT.network import DiT
 from fastgen.networks.SD15.network import StableDiffusion15
 from fastgen.networks.SDXL.network import StableDiffusionXL
 from fastgen.networks.Flux.network import Flux
+from fastgen.networks.QwenImage.network import QwenImage
 from fastgen.networks.CogVideoX.network import CogVideoX
 from fastgen.networks.Wan.network import Wan
 from fastgen.networks.Wan.network_causal import CausalWan
@@ -131,6 +132,8 @@ SD15Config: DictConfig = L(StableDiffusion15)()
 SDXLConfig: DictConfig = L(StableDiffusionXL)()
 
 FluxConfig: DictConfig = L(Flux)()
+
+QwenImageConfig: DictConfig = L(QwenImage)()
 
 CogVideoXConfig: DictConfig = L(CogVideoX)(
     model_id_or_local_path="THUDM/CogVideoX-2b",

@@ -18,6 +18,7 @@ from fastgen.configs.net import (
     DiT_IN256_XL_Config,
     SD15Config,
     FluxConfig,
+    QwenImageConfig,
     CogVideoXConfig,
     Wan_1_3B_Config,
     CausalWan_1_3B_Config,
@@ -543,6 +544,82 @@ def test_network_flux():
     assert len(features) == 1  # one feature extracted
 
     # Clear memory after testing
+    clear_gpu_memory()
+
+
+@RunIf(min_gpus=1)
+@pytest.mark.large_model
+def test_network_qwen_image():
+    """Test QwenImage network for text-to-image generation (~20B param MMDiT)."""
+    clear_gpu_memory()
+
+    set_env_vars()
+    teacher_config = QwenImageConfig
+
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    if torch.cuda.is_available():
+        total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if total_memory < 40:
+            pytest.skip(f"Test skipped: QwenImage requires ~40GB+ GPU memory, but only {total_memory:.1f}GB available")
+
+    try:
+        teacher = instantiate(teacher_config)
+    except OSError as e:
+        if "not a valid model identifier" in str(e) or "token" in str(e) or "does not appear" in str(e):
+            pytest.skip(f"Test skipped: QwenImage model not accessible: {e}")
+        raise
+
+    teacher.transformer.transformer_blocks = teacher.transformer.transformer_blocks[:1]
+
+    teacher.init_preprocessors()
+    teacher = teacher.to(device=device)
+    teacher.vae.to(device=device, dtype=dtype)
+    teacher.text_encoder.to(device=device, dtype=dtype)
+
+    validate_noise_scheduler_properties(teacher, device, expected_schedule_type="rf")
+
+    batch_size = 1
+    x = torch.randn(batch_size, 16, 8, 8, device=device, dtype=dtype)
+    t = teacher.noise_scheduler.sample_t(batch_size, time_dist_type="uniform").to(device=device, dtype=dtype)
+
+    captions = ["a caption"]
+    condition = teacher.text_encoder.encode(captions)
+
+    assert isinstance(condition, tuple) and len(condition) == 2
+    prompt_embeds, prompt_embeds_mask = condition
+    prompt_embeds = prompt_embeds.to(device=device, dtype=dtype)
+    prompt_embeds_mask = prompt_embeds_mask.to(device=device)
+    condition = (prompt_embeds, prompt_embeds_mask)
+
+    with torch.autocast(device_type=device.type, dtype=dtype):
+        output = teacher(x, t, condition)
+
+    assert output.shape == x.shape
+    assert output.device == x.device
+
+    teacher = teacher.to(device=device, dtype=dtype)
+
+    output, logvar = teacher(x, t, condition, return_logvar=True)
+    assert output.shape == x.shape
+    assert logvar.shape == torch.Size([batch_size, 1])
+
+    output = teacher(x, t, condition, return_features_early=True, feature_indices=set())
+    assert isinstance(output, list)
+    assert len(output) == 0
+
+    output = teacher(x, t, condition, return_features_early=False, feature_indices={0})
+    assert isinstance(output, list) and len(output) == 2
+    assert output[0].shape == x.shape
+    assert isinstance(output[1], list) and len(output[1]) == 1
+
+    features = teacher(x, t, condition, return_features_early=True, feature_indices={0})
+    assert isinstance(features, list)
+    assert len(features) == 1
+    assert features[0].shape == (batch_size, 3072, 4, 4)
+
+    del teacher
     clear_gpu_memory()
 
 

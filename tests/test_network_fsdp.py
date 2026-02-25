@@ -491,6 +491,21 @@ def generate_flux_inputs(network, device, dtype):
     return {"x_t": x, "t": t, "condition": condition, "guidance": guidance}
 
 
+def generate_qwen_image_inputs(network, device, dtype):
+    """Generate inputs for QwenImage."""
+    batch_size = 1
+    # QwenImage latent: [B, 16, H, W], H/W must be even for 2x2 packing
+    x = torch.randn(batch_size, 16, 8, 8, device=device, dtype=dtype)
+    t = network.noise_scheduler.sample_t(batch_size, time_dist_type="uniform", device=device, dtype=dtype)
+
+    # Use random dummy embeddings instead of Qwen2.5-VL text encoder (hidden_dim=3584)
+    encoder_hidden_states = torch.randn(batch_size, 512, 3584, device=device, dtype=dtype)
+    encoder_hidden_states_mask = torch.ones(batch_size, 512, device=device, dtype=torch.long)
+    condition = (encoder_hidden_states, encoder_hidden_states_mask)
+
+    return {"x_t": x, "t": t, "condition": condition}
+
+
 # =============================================================================
 # Test Implementation Functions
 # =============================================================================
@@ -673,6 +688,15 @@ def _test_flux_impl(rank: int, world_size: int) -> Dict:
     return _generic_fsdp_test_impl(world_size, FluxConfig, generate_flux_inputs, apply_checkpointing=True)
 
 
+def _test_qwen_image_impl(rank: int, world_size: int) -> Dict:
+    from fastgen.configs.net import QwenImageConfig
+
+    set_env_vars()
+    return _generic_fsdp_test_impl(
+        rank, world_size, QwenImageConfig, generate_qwen_image_inputs, apply_checkpointing=True
+    )
+
+
 # =============================================================================
 # Pytest Test Functions - EDM Models (2 GPUs)
 # =============================================================================
@@ -804,6 +828,44 @@ def test_fsdp_flux():
         test_fn=_test_flux_impl,
         world_size=2,
         timeout=900,  # Flux model loading can take 9+ minutes
+        setup_fn=set_env_vars,
+    )
+    assert result is not None, "Test did not return a result"
+    assert result["rank_consistent"], f"Ranks not consistent: diff={result['rank_consistency_diff']}"
+    assert result[
+        "backward_success"
+    ], f"Backward failed: has_grads={result['has_grads']}, finite={result['all_grads_finite']}"
+    clear_gpu_memory()
+
+
+# =============================================================================
+# Pytest Test Functions - QwenImage (8 GPUs)
+# =============================================================================
+
+
+@RunIf(min_gpus=8)
+@pytest.mark.large_model
+def test_fsdp_qwen_image():
+    """Test FSDP forward+backward pass for QwenImage (~20B) with gradient checkpointing."""
+    clear_gpu_memory()
+
+    try:
+        from diffusers.models import QwenImageTransformer2DModel
+
+        QwenImageTransformer2DModel.load_config(
+            "Qwen/Qwen-Image",
+            subfolder="transformer",
+        )
+    except (HTTPError, OSError) as e:
+        err_msg = str(e).lower()
+        if "not a valid model identifier" in err_msg or "token" in err_msg or "gated" in err_msg:
+            pytest.skip(f"Test skipped: QwenImage model not accessible: {e}")
+        raise
+
+    result = run_distributed_test(
+        test_fn=_test_qwen_image_impl,
+        world_size=8,
+        timeout=900,
         setup_fn=set_env_vars,
     )
     assert result is not None, "Test did not return a result"

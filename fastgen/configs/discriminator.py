@@ -49,6 +49,13 @@ Discriminator_Flux_Config: DictConfig = L(Discriminator_ImageDiT)(
     inner_dim=3072,  # Flux hidden dimension
 )
 
+# QwenImage: hidden_dim=3072, 60 dual-stream DiT blocks
+Discriminator_QwenImage_Config: DictConfig = L(Discriminator_ImageDiT)(
+    feature_indices=None,
+    num_blocks=60,  # 60 dual-stream blocks
+    inner_dim=3072,  # 24 heads x 128 head_dim
+)
+
 # 2B patchify: spatial-2, temporal-1; inner_dim=1920; layer=30
 Discriminator_CogVideoX2B_Config = L(Discriminator_VideoDiT)(
     feature_indices=None,
