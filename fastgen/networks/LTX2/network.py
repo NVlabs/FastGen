@@ -928,71 +928,42 @@ class LTX2(FastGenNetwork):
         fps: float = 24.0,
         frame_rate: Optional[float] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, None]:
         """
-        Run the full denoising loop for text-to-video+audio generation.
-
-        Follows pipeline_ltx2.py exactly:
-          - latents kept in float32 throughout
-          - connectors called ONCE on combined [uncond, cond] batch
-          - audio duration derived from pixel-frame count, not latent frames
-          - transformer wrapped in cache_context("cond_uncond")
+        Run the full denoising loop for text-to-video generation (audio always None).
 
         Returns
         -------
-        (video_latents, audio_latents):
-            video: [B, C, F, H, W] denormalised, ready for vae.decode()
-            audio: [B, C, L, M]    denormalised, ready for audio_vae.decode()
+        (video_latents, None):
+            video: [B, C, F, H, W] denormalised video latents
+            audio: always None
         """
         fps = frame_rate if frame_rate is not None else fps
         do_cfg = neg_condition is not None and guidance_scale > 1.0
 
-        device = noise.device
-        B, C, latent_f, latent_h, latent_w = noise.shape
+        transformer_dtype = self.transformer.dtype
+        transformer_device = next(self.transformer.parameters()).device
 
-        # ---- Audio shape ----
-        audio_num_frames, latent_mel_bins, num_audio_ch = self._compute_audio_shape(
-            latent_f, fps, device, torch.float32
-        )
-        num_mel_bins = self.audio_vae.config.mel_bins
+        # Move latents to transformer device and dtype
+        video_latents = noise.to(device=transformer_device, dtype=transformer_dtype)
 
-        # ---- Pack latents (float32 throughout, matching pipeline) ----
-        video_latents = _pack_latents(
-            noise.float(), self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
-        )
-        audio_latents = torch.randn(
-            B, num_audio_ch, audio_num_frames, latent_mel_bins,
-            device=device, dtype=torch.float32
-        )
-        audio_latents = _pack_audio_latents(audio_latents)
-
-        # ---- Text conditioning — connectors called ONCE on combined [uncond, cond] ----
-        prompt_embeds, attention_mask = condition
+        # Build combined condition for CFG so connectors are called once per step
         if do_cfg:
             neg_embeds, neg_mask = neg_condition
-            combined_embeds = torch.cat([neg_embeds, prompt_embeds], dim=0)
-            combined_mask   = torch.cat([neg_mask, attention_mask], dim=0)
+            cond_embeds, cond_mask = condition
+            combined_condition = (
+                torch.cat([neg_embeds, cond_embeds], dim=0).to(device=transformer_device, dtype=transformer_dtype),
+                torch.cat([neg_mask, cond_mask], dim=0).to(device=transformer_device),
+            )
         else:
-            combined_embeds = prompt_embeds
-            combined_mask   = attention_mask
-
-        additive_mask = (1 - combined_mask.to(combined_embeds.dtype)) * -1_000_000.0
-        connector_video_embeds, connector_audio_embeds, connector_attn_mask = self.connectors(
-            combined_embeds, additive_mask, additive_mask=True
-        )
-
-        # ---- Pre-compute RoPE coordinates ----
-        video_coords = self.transformer.rope.prepare_video_coords(
-            B, latent_f, latent_h, latent_w, device, fps=fps
-        )
-        audio_coords = self.transformer.audio_rope.prepare_audio_coords(
-            B, audio_num_frames, device
-        )
-        if do_cfg:
-            video_coords = video_coords.repeat((2,) + (1,) * (video_coords.ndim - 1))
-            audio_coords = audio_coords.repeat((2,) + (1,) * (audio_coords.ndim - 1))
+            embeds, mask = condition
+            combined_condition = (
+                embeds.to(device=transformer_device, dtype=transformer_dtype),
+                mask.to(device=transformer_device),
+            )
 
         # ---- Scheduler timesteps ----
+        B, C, latent_f, latent_h, latent_w = video_latents.shape
         sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
         video_seq_len = latent_f * latent_h * latent_w
         mu = _calculate_shift(
@@ -1002,79 +973,35 @@ class LTX2(FastGenNetwork):
             self.scheduler.config.get("base_shift", 0.95),
             self.scheduler.config.get("max_shift", 2.05),
         )
-        audio_scheduler = copy.deepcopy(self.scheduler)
-        _retrieve_timesteps(audio_scheduler, num_steps, device, sigmas=sigmas, mu=mu)
-        timesteps, num_steps = _retrieve_timesteps(self.scheduler, num_steps, device, sigmas=sigmas, mu=mu)
-
-        prompt_dtype = connector_video_embeds.dtype
-
-        # ---- Token counts after packing ----
-        num_video_tokens = video_latents.shape[1]   # [B, T_v, C]
-        num_audio_tokens = audio_latents.shape[1]   # [B, T_a, C]
+        timesteps, num_steps = _retrieve_timesteps(
+            self.scheduler, num_steps, transformer_device, sigmas=sigmas, mu=mu
+        )
 
         # ---- Denoising loop ----
         for t in timesteps:
-            latent_input       = torch.cat([video_latents] * 2) if do_cfg else video_latents
-            audio_latent_input = torch.cat([audio_latents] * 2) if do_cfg else audio_latents
-            latent_input       = latent_input.to(prompt_dtype)
-            audio_latent_input = audio_latent_input.to(prompt_dtype)
+            latent_input = torch.cat([video_latents] * 2) if do_cfg else video_latents
+            t_input = t.to(dtype=transformer_dtype, device=transformer_device).expand(latent_input.shape[0])
 
-            # Scale timestep and expand to per-token shape.
-            # The scheduler yields sigmas/timesteps that time_embed expects directly —
-            # LTX2AdaLayerNormSingle multiplies by timestep_scale_multiplier internally.
-            bs_input = latent_input.shape[0]
-            t_base = t.to(prompt_dtype).unsqueeze(0).expand(bs_input)              # [B]
-            timestep = t_base.unsqueeze(1).expand(bs_input, num_video_tokens)      # [B, T_v]
-            audio_timestep = t_base.unsqueeze(1).expand(bs_input, num_audio_tokens)# [B, T_a]
-
-            with self.transformer.cache_context("cond_uncond"):
-                # classify_forward returns (video_output, audio_output) when
-                # feature_indices is empty and return_features_early is False.
-                # Note: no return_dict kwarg — classify_forward does not accept it.
-                model_out = self.transformer(
-                    hidden_states=latent_input,
-                    audio_hidden_states=audio_latent_input,
-                    encoder_hidden_states=connector_video_embeds,
-                    audio_encoder_hidden_states=connector_audio_embeds,
-                    encoder_attention_mask=connector_attn_mask,
-                    audio_encoder_attention_mask=connector_attn_mask,
-                    timestep=timestep,
-                    audio_timestep=audio_timestep,
-                    num_frames=latent_f,
-                    height=latent_h,
-                    width=latent_w,
-                    fps=fps,
-                    audio_num_frames=audio_num_frames,
-                    video_coords=video_coords,
-                    audio_coords=audio_coords,
-                )
-            noise_pred_video, noise_pred_audio = model_out
-
-            noise_pred_video = noise_pred_video.float()
-            noise_pred_audio = noise_pred_audio.float()
+            noise_pred = self(
+                latent_input,
+                t_input,
+                condition=combined_condition,
+                fps=fps,
+                fwd_pred_type="flow",
+            )
 
             if do_cfg:
-                video_uncond, video_cond = noise_pred_video.chunk(2)
-                noise_pred_video = video_uncond + guidance_scale * (video_cond - video_uncond)
-                audio_uncond, audio_cond = noise_pred_audio.chunk(2)
-                noise_pred_audio = audio_uncond + guidance_scale * (audio_cond - audio_uncond)
+                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-            video_latents = self.scheduler.step(noise_pred_video, t, video_latents, return_dict=False)[0]
-            audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
+            video_latents = self.scheduler.step(noise_pred, t, video_latents, return_dict=False)[0]
 
-        # ---- Unpack and denormalise ----
-        video_latents = _unpack_latents(
-            video_latents, latent_f, latent_h, latent_w,
-            self.transformer_spatial_patch_size, self.transformer_temporal_patch_size,
-        )
+        # ---- Denormalise ----
         video_latents = _denormalize_latents(
-            video_latents, self.vae.latents_mean, self.vae.latents_std,
+            video_latents,
+            self.vae.latents_mean,
+            self.vae.latents_std,
             self.vae.config.scaling_factor,
         )
 
-        audio_latents = _denormalize_audio_latents(
-            audio_latents, self.audio_vae.latents_mean, self.audio_vae.latents_std
-        )
-        audio_latents = _unpack_audio_latents(audio_latents, audio_num_frames, latent_mel_bins)
-
-        return video_latents, audio_latents
+        return video_latents, None
