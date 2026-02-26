@@ -68,21 +68,11 @@ def test_ltx2_generation():
     # latents:       [B, C, F, H, W] denormalised video latents (float32)
     # audio_latents: [B, C, L, M]    denormalised audio latents (float32)
 
-    # 6. Decode Latents to Video + Audio
-    print("Decoding latents to video and audio...")
+    # 6. Decode Latents to Video
+    print("Decoding latents to video...")
     with torch.no_grad():
-        # vae.decode() signature: decode(z, temb=None, causal=None, return_dict=True)
-        # timestep_conditioning is False for LTX-2, so no temb needed.
-        # Use return_dict=False to get the tensor directly.
         video_tensor = model.vae.decode(latents.to(model.vae.dtype), return_dict=False)[0]
         # video_tensor: [B, C, F, H, W] in ~[-1, 1]
-
-        # Decode mel spectrogram -> waveform via audio_vae + vocoder
-        mel_spectrograms = model.audio_vae.decode(
-            audio_latents.to(model.audio_vae.dtype), return_dict=False
-        )[0]
-        audio_waveform = model.vocoder(mel_spectrograms)
-        # audio_waveform: [B, channels, samples] at vocoder.config.output_sampling_rate Hz
 
     # 7. Post-process and Save
     # Convert [B, C, F, H, W] -> [F, H, W, C] uint8
@@ -91,15 +81,11 @@ def test_ltx2_generation():
     ).clip(0, 255).astype(np.uint8)
 
     print("Saving video to ltx2_test.mp4...")
-    encode_video(
-        video_np,
-        fps=24,
-        audio=audio_waveform[0].float().cpu(),
-        audio_sample_rate=model.vocoder.config.output_sampling_rate,  # 24000 Hz
-        output_path="ltx2_test.mp4",
-    )
+    import imageio
+    with imageio.get_writer("ltx2_test.mp4", fps=24, codec="libx264", quality=8) as writer:
+        for frame in video_np:
+            writer.append_data(frame)
     print("Done!")
-
 
 if __name__ == "__main__":
     test_ltx2_generation()
