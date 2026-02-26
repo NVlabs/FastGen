@@ -1,336 +1,538 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
-from typing import Any, Optional, List, Set, Union, Tuple
+"""
+LTX-2 FastGen network implementation.
+
+Architecture verified against:
+  - diffusers/src/diffusers/pipelines/ltx2/pipeline_ltx2.py
+  - diffusers/src/diffusers/pipelines/ltx2/connectors.py
+  - diffusers/src/diffusers/models/transformers/transformer_ltx2.py
+
+Follows the FastGen network pattern established by Flux and Wan:
+  - Inherits from FastGenNetwork
+  - Monkey-patches classify_forward onto self.transformer
+  - forward() handles video-only latent for distillation (audio flows through but is ignored for loss)
+  - feature_indices extracts video hidden_states only
+"""
+
+import copy
 import types
+from typing import Any, List, Optional, Set, Tuple, Union
 
+import numpy as np
 import torch
-import torch.utils.checkpoint
-from torch import dtype
+import torch.nn as nn
+from diffusers.models.autoencoders import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video
+from diffusers.models.transformers import LTX2VideoTransformer3DModel
+from diffusers.models.transformers.transformer_ltx2 import LTX2VideoTransformerBlock
+from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
+from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from torch.distributed.fsdp import fully_shard
-
-from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
-from diffusers.models import FluxTransformer2DModel
-from diffusers.models.transformers.transformer_flux import FluxTransformerBlock, FluxSingleTransformerBlock
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from fastgen.networks.network import FastGenNetwork
 from fastgen.networks.noise_schedule import NET_PRED_TYPES
-from fastgen.utils.basic_utils import str2bool
 from fastgen.utils.distributed.fsdp import apply_fsdp_checkpointing
 import fastgen.utils.logging_utils as logger
 
 
-class FluxTextEncoder:
-    """Text encoder for Flux using CLIP and T5 models."""
+# ---------------------------------------------------------------------------
+# Helpers (mirrors of diffusers pipeline static methods)
+# ---------------------------------------------------------------------------
 
-    def __init__(self, model_id: str):
-        # CLIP text encoder
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="tokenizer",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="text_encoder",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        self.text_encoder.eval().requires_grad_(False)
-
-        # T5 text encoder
-        self.tokenizer_2 = T5TokenizerFast.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="tokenizer_2",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        self.text_encoder_2 = T5EncoderModel.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="text_encoder_2",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        self.text_encoder_2.eval().requires_grad_(False)
-
-    def encode(
-        self,
-        conditioning: Optional[Any] = None,
-        precision: dtype = torch.float32,
-        max_sequence_length: int = 512,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode text prompts to embeddings.
-
-        Args:
-            conditioning: Text prompt(s) to encode.
-            precision: Data type for the output embeddings.
-            max_sequence_length: Maximum sequence length for T5 tokenization.
-
-        Returns:
-            Tuple of (pooled_prompt_embeds, prompt_embeds) tensors.
-        """
-        if isinstance(conditioning, str):
-            conditioning = [conditioning]
-
-        # CLIP encoding for pooled embeddings
-        text_inputs = self.tokenizer(
-            conditioning,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        with torch.no_grad():
-            text_input_ids = text_inputs.input_ids.to(self.text_encoder.device)
-            prompt_embeds = self.text_encoder(
-                text_input_ids,
-                output_hidden_states=False,
-            )
-            pooled_prompt_embeds = prompt_embeds.pooler_output.to(precision)
-
-        # T5 encoding for text embeddings
-        text_inputs_2 = self.tokenizer_2(
-            conditioning,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        with torch.no_grad():
-            text_input_ids_2 = text_inputs_2.input_ids.to(self.text_encoder_2.device)
-            prompt_embeds_2 = self.text_encoder_2(
-                text_input_ids_2,
-                output_hidden_states=False,
-            )[0].to(precision)
-
-        return pooled_prompt_embeds, prompt_embeds_2
-
-    def to(self, *args, **kwargs):
-        """Moves the model to the specified device."""
-        self.text_encoder.to(*args, **kwargs)
-        self.text_encoder_2.to(*args, **kwargs)
-        return self
+def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int = 1) -> torch.Tensor:
+    """Pack video latents [B, C, F, H, W] → [B, F//pt * H//p * W//p, C*pt*p*p]."""
+    B, C, F, H, W = latents.shape
+    pF = F // patch_size_t
+    pH = H // patch_size
+    pW = W // patch_size
+    latents = latents.reshape(B, C, pF, patch_size_t, pH, patch_size, pW, patch_size)
+    latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+    return latents
 
 
-class FluxImageEncoder:
-    """VAE encoder/decoder for Flux.
+def _unpack_latents(
+    latents: torch.Tensor, num_frames: int, height: int, width: int,
+    patch_size: int = 1, patch_size_t: int = 1
+) -> torch.Tensor:
+    """Unpack video latents [B, T, D] → [B, C, F, H, W]."""
+    B = latents.size(0)
+    latents = latents.reshape(B, num_frames, height, width, -1, patch_size_t, patch_size, patch_size)
+    latents = latents.permute(0, 4, 1, 5, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+    return latents
 
-    Flux VAE uses both scaling_factor and shift_factor for latent normalization.
+
+def _pack_audio_latents(latents: torch.Tensor) -> torch.Tensor:
+    """Pack audio latents [B, C, L, M] → [B, L, C*M]."""
+    return latents.transpose(1, 2).flatten(2, 3)
+
+
+def _unpack_audio_latents(latents: torch.Tensor, latent_length: int, num_mel_bins: int) -> torch.Tensor:
+    """Unpack audio latents [B, L, C*M] -> [B, C, L, M]."""
+    return latents.unflatten(2, (-1, num_mel_bins)).transpose(1, 2)
+
+
+def _normalize_latents(
+    latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor,
+    scaling_factor: float = 1.0,
+) -> torch.Tensor:
+    mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+    std  = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+    return (latents - mean) * scaling_factor / std
+
+
+def _denormalize_latents(
+    latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor,
+    scaling_factor: float = 1.0,
+) -> torch.Tensor:
+    mean = latents_mean.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+    std  = latents_std.view(1, -1, 1, 1, 1).to(latents.device, latents.dtype)
+    return latents * std / scaling_factor + mean
+
+
+def _normalize_audio_latents(
+    latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
+) -> torch.Tensor:
+    mean = latents_mean.to(latents.device, latents.dtype)
+    std  = latents_std.to(latents.device, latents.dtype)
+    return (latents - mean) / std
+
+
+def _denormalize_audio_latents(
+    latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor
+) -> torch.Tensor:
+    mean = latents_mean.to(latents.device, latents.dtype)
+    std  = latents_std.to(latents.device, latents.dtype)
+    return latents * std + mean
+
+
+def _pack_text_embeds(
+    text_hidden_states: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    device: torch.device,
+    padding_side: str = "left",
+    scale_factor: int = 8,
+    eps: float = 1e-6,
+) -> torch.Tensor:
     """
+    Stack all Gemma hidden-state layers, normalize per-batch/per-layer over
+    non-padded positions, and pack into [B, T, H * num_layers].
+    """
+    B, T, H, L = text_hidden_states.shape
+    original_dtype = text_hidden_states.dtype
 
-    def __init__(self, model_id: str):
-        self.vae: AutoencoderKL = AutoencoderKL.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="vae",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        self.vae.eval().requires_grad_(False)
+    token_indices = torch.arange(T, device=device).unsqueeze(0)  # [1, T]
+    if padding_side == "right":
+        mask = token_indices < sequence_lengths[:, None]
+    else:  # left
+        start = T - sequence_lengths[:, None]
+        mask = token_indices >= start
+    mask = mask[:, :, None, None]  # [B, T, 1, 1]
 
-        # Flux VAE uses shift_factor in addition to scaling_factor
-        self.scaling_factor = getattr(self.vae.config, "scaling_factor", 0.3611)
-        self.shift_factor = getattr(self.vae.config, "shift_factor", 0.1159)
+    masked = text_hidden_states.masked_fill(~mask, 0.0)
+    num_valid = (sequence_lengths * H).view(B, 1, 1, 1)
+    mean = masked.sum(dim=(1, 2), keepdim=True) / (num_valid + eps)
 
-    def encode(self, real_images: torch.Tensor) -> torch.Tensor:
-        """Encode images to latent space.
+    x_min = text_hidden_states.masked_fill(~mask, float("inf")).amin(dim=(1, 2), keepdim=True)
+    x_max = text_hidden_states.masked_fill(~mask, float("-inf")).amax(dim=(1, 2), keepdim=True)
 
-        Args:
-            real_images: Input images in [-1, 1] range.
+    normed = (text_hidden_states - mean) / (x_max - x_min + eps) * scale_factor
+    normed = normed.flatten(2)                          # [B, T, H*L]
+    mask_flat = mask.squeeze(-1).expand(-1, -1, H * L)
+    normed = normed.masked_fill(~mask_flat, 0.0)
+    return normed.to(original_dtype)
 
-        Returns:
-            torch.Tensor: Latent representations (shifted and scaled).
-        """
-        latent_images = self.vae.encode(real_images, return_dict=False)[0].sample()
-        # Apply Flux-specific shift and scale
-        latent_images = (latent_images - self.shift_factor) * self.scaling_factor
-        return latent_images
 
-    def decode(self, latent_images: torch.Tensor) -> torch.Tensor:
-        """Decode latents to images.
+def _calculate_shift(
+    image_seq_len: int,
+    base_seq_len: int = 1024,
+    max_seq_len: int = 4096,
+    base_shift: float = 0.95,
+    max_shift: float = 2.05,
+) -> float:
+    """Mirrors the pipeline's calculate_shift — defaults match LTX-2 scheduler config."""
+    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+    b = base_shift - m * base_seq_len
+    return image_seq_len * m + b
 
-        Args:
-            latent_images: Latent representations (shifted and scaled).
 
-        Returns:
-            torch.Tensor: Decoded images in [-1, 1] range.
-        """
-        # Reverse Flux-specific shift and scale
-        latents = (latent_images / self.scaling_factor) + self.shift_factor
-        images = self.vae.decode(latents, return_dict=False)[0].clip(-1.0, 1.0)
-        return images
+def _retrieve_timesteps(scheduler, num_inference_steps, device, sigmas=None, mu=None):
+    """Call scheduler.set_timesteps, forwarding mu when dynamic shifting is enabled."""
+    kwargs = {}
+    if mu is not None:
+        kwargs["mu"] = mu
+    if sigmas is not None:
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+    return scheduler.timesteps, len(scheduler.timesteps)
 
-    def to(self, *args, **kwargs):
-        """Moves the model to the specified device."""
-        self.vae.to(*args, **kwargs)
-        return self
 
+# ---------------------------------------------------------------------------
+# classify_forward — monkey-patched onto self.transformer
+# ---------------------------------------------------------------------------
 
 def classify_forward(
     self,
     hidden_states: torch.Tensor,
-    encoder_hidden_states: torch.Tensor = None,
-    pooled_projections: torch.Tensor = None,
-    timestep: torch.LongTensor = None,
-    img_ids: torch.Tensor = None,
-    txt_ids: torch.Tensor = None,
-    guidance: torch.Tensor = None,
-    joint_attention_kwargs: Optional[dict] = None,
+    audio_hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    audio_encoder_hidden_states: torch.Tensor,
+    timestep: torch.Tensor,
+    audio_timestep: Optional[torch.Tensor] = None,
+    encoder_attention_mask: Optional[torch.Tensor] = None,
+    audio_encoder_attention_mask: Optional[torch.Tensor] = None,
+    num_frames: Optional[int] = None,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
+    fps: float = 24.0,
+    audio_num_frames: Optional[int] = None,
+    video_coords: Optional[torch.Tensor] = None,
+    audio_coords: Optional[torch.Tensor] = None,
+    attention_kwargs: Optional[dict] = None,
+    return_dict: bool = True,           # accepted for API compatibility; always ignored
+    # FastGen distillation kwargs
     return_features_early: bool = False,
     feature_indices: Optional[Set[int]] = None,
     return_logvar: bool = False,
-) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor],                              # (video_out, audio_out)
+    Tuple[Tuple[torch.Tensor, torch.Tensor], List[torch.Tensor]],  # ((video_out, audio_out), features)
+    List[torch.Tensor],                                             # features only (early exit)
+]:
     """
-    Modified forward pass for FluxTransformer2DModel with feature extraction support.
+    Drop-in replacement for LTX2VideoTransformer3DModel.forward that adds FastGen
+    distillation support (feature extraction, early exit, logvar).
 
-    Args:
-        hidden_states: Input latent states.
-        encoder_hidden_states: T5 text encoder hidden states.
-        pooled_projections: CLIP pooled text embeddings.
-        timestep: Current timestep.
-        img_ids: Image position IDs.
-        txt_ids: Text position IDs.
-        guidance: Guidance scale embedding.
-        joint_attention_kwargs: Additional attention kwargs.
-        return_features_early: If True, return features as soon as collected.
-        feature_indices: Set of block indices to extract features from.
-        return_logvar: If True, return log variance estimate.
+    Audio always flows through every block unchanged — we never short-circuit it —
+    but only video hidden_states are stored as features for the discriminator.
 
-    Returns:
-        Model output, optionally with features or logvar.
+    Returns
+    -------
+    Normal mode  (feature_indices empty, return_features_early False):
+        (video_output, audio_output)  — identical to the original forward
+
+    Feature mode (feature_indices non-empty, return_features_early False):
+        ((video_output, audio_output), List[video_feature_tensors])
+
+    Early-exit mode (return_features_early True):
+        List[video_feature_tensors]   — forward stops as soon as all features collected
     """
+    # LoRA scale handling — mirrors the @apply_lora_scale decorator in upstream
+    from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers
+    if attention_kwargs is not None:
+        attention_kwargs = attention_kwargs.copy()
+        lora_scale = attention_kwargs.pop("scale", 1.0)
+    else:
+        lora_scale = 1.0
+    if USE_PEFT_BACKEND:
+        scale_lora_layers(self, lora_scale)
+
     if feature_indices is None:
         feature_indices = set()
 
     if return_features_early and len(feature_indices) == 0:
+        if USE_PEFT_BACKEND:
+            unscale_lora_layers(self, lora_scale)
         return []
 
-    idx, features = 0, []
+    # ------------------------------------------------------------------ #
+    # Steps 1-4: identical to the original forward (no changes)
+    # ------------------------------------------------------------------ #
+    audio_timestep = audio_timestep if audio_timestep is not None else timestep
 
-    # Store original sequence length to compute spatial dims for feature reshaping
-    # hidden_states: [B, seq_len, C*4] where seq_len = (H//2) * (W//2)
-    seq_len = hidden_states.shape[1]
-    spatial_size = int(seq_len**0.5)  # Assuming square spatial dimensions
+    # Convert attention masks to additive bias form
+    if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
+        encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
+        encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
 
-    # 1. Patch embedding
-    hidden_states = self.x_embedder(hidden_states)
+    if audio_encoder_attention_mask is not None and audio_encoder_attention_mask.ndim == 2:
+        audio_encoder_attention_mask = (
+            1 - audio_encoder_attention_mask.to(audio_hidden_states.dtype)
+        ) * -10000.0
+        audio_encoder_attention_mask = audio_encoder_attention_mask.unsqueeze(1)
 
-    # 2. Time embedding
-    timestep_scaled = timestep.to(hidden_states.dtype) * 1000
-    if guidance is not None:
-        guidance_scaled = guidance.to(hidden_states.dtype) * 1000
-        temb = self.time_text_embed(timestep_scaled, guidance_scaled, pooled_projections)
-    else:
-        temb = self.time_text_embed(timestep_scaled, pooled_projections)
+    batch_size = hidden_states.size(0)
 
-    # 3. Text embedding
-    encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+    # 1. RoPE positional embeddings
+    if video_coords is None:
+        video_coords = self.rope.prepare_video_coords(
+            batch_size, num_frames, height, width, hidden_states.device, fps=fps
+        )
+    if audio_coords is None:
+        audio_coords = self.audio_rope.prepare_audio_coords(
+            batch_size, audio_num_frames, audio_hidden_states.device
+        )
 
-    # 4. Prepare positional embeddings
-    ids = torch.cat((txt_ids, img_ids), dim=0)
-    image_rotary_emb = self.pos_embed(ids)
+    video_rotary_emb = self.rope(video_coords, device=hidden_states.device)
+    audio_rotary_emb = self.audio_rope(audio_coords, device=audio_hidden_states.device)
 
-    # 5. Joint transformer blocks
-    for block in self.transformer_blocks:
+    video_cross_attn_rotary_emb = self.cross_attn_rope(video_coords[:, 0:1, :], device=hidden_states.device)
+    audio_cross_attn_rotary_emb = self.cross_attn_audio_rope(
+        audio_coords[:, 0:1, :], device=audio_hidden_states.device
+    )
+
+    # 2. Patchify input projections
+    hidden_states = self.proj_in(hidden_states)
+    audio_hidden_states = self.audio_proj_in(audio_hidden_states)
+
+    # 3. Timestep embeddings and modulation parameters
+    timestep_cross_attn_gate_scale_factor = (
+        self.config.cross_attn_timestep_scale_multiplier / self.config.timestep_scale_multiplier
+    )
+
+    temb, embedded_timestep = self.time_embed(
+        timestep.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype,
+    )
+    temb = temb.view(batch_size, -1, temb.size(-1))
+    embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
+
+    temb_audio, audio_embedded_timestep = self.audio_time_embed(
+        audio_timestep.flatten(), batch_size=batch_size, hidden_dtype=audio_hidden_states.dtype,
+    )
+    temb_audio = temb_audio.view(batch_size, -1, temb_audio.size(-1))
+    audio_embedded_timestep = audio_embedded_timestep.view(batch_size, -1, audio_embedded_timestep.size(-1))
+
+    video_cross_attn_scale_shift, _ = self.av_cross_attn_video_scale_shift(
+        timestep.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype,
+    )
+    video_cross_attn_a2v_gate, _ = self.av_cross_attn_video_a2v_gate(
+        timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+        batch_size=batch_size, hidden_dtype=hidden_states.dtype,
+    )
+    video_cross_attn_scale_shift = video_cross_attn_scale_shift.view(
+        batch_size, -1, video_cross_attn_scale_shift.shape[-1]
+    )
+    video_cross_attn_a2v_gate = video_cross_attn_a2v_gate.view(
+        batch_size, -1, video_cross_attn_a2v_gate.shape[-1]
+    )
+
+    audio_cross_attn_scale_shift, _ = self.av_cross_attn_audio_scale_shift(
+        audio_timestep.flatten(), batch_size=batch_size, hidden_dtype=audio_hidden_states.dtype,
+    )
+    audio_cross_attn_v2a_gate, _ = self.av_cross_attn_audio_v2a_gate(
+        audio_timestep.flatten() * timestep_cross_attn_gate_scale_factor,
+        batch_size=batch_size, hidden_dtype=audio_hidden_states.dtype,
+    )
+    audio_cross_attn_scale_shift = audio_cross_attn_scale_shift.view(
+        batch_size, -1, audio_cross_attn_scale_shift.shape[-1]
+    )
+    audio_cross_attn_v2a_gate = audio_cross_attn_v2a_gate.view(
+        batch_size, -1, audio_cross_attn_v2a_gate.shape[-1]
+    )
+
+    # 4. Prompt embeddings
+    encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+    encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
+
+    audio_encoder_hidden_states = self.audio_caption_projection(audio_encoder_hidden_states)
+    audio_encoder_hidden_states = audio_encoder_hidden_states.view(
+        batch_size, -1, audio_hidden_states.size(-1)
+    )
+
+    # ------------------------------------------------------------------ #
+    # Step 5: Block loop with video-only feature extraction
+    # Audio always flows through every block — we never skip it.
+    # ------------------------------------------------------------------ #
+    features: List[torch.Tensor] = []
+
+    for idx, block in enumerate(self.transformer_blocks):
         if torch.is_grad_enabled() and self.gradient_checkpointing:
-            encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+            hidden_states, audio_hidden_states = self._gradient_checkpointing_func(
                 block,
                 hidden_states,
+                audio_hidden_states,
                 encoder_hidden_states,
+                audio_encoder_hidden_states,
                 temb,
-                image_rotary_emb,
-                joint_attention_kwargs,
+                temb_audio,
+                video_cross_attn_scale_shift,
+                audio_cross_attn_scale_shift,
+                video_cross_attn_a2v_gate,
+                audio_cross_attn_v2a_gate,
+                video_rotary_emb,
+                audio_rotary_emb,
+                video_cross_attn_rotary_emb,
+                audio_cross_attn_rotary_emb,
+                encoder_attention_mask,
+                audio_encoder_attention_mask,
             )
         else:
-            encoder_hidden_states, hidden_states = block(
+            hidden_states, audio_hidden_states = block(
                 hidden_states=hidden_states,
+                audio_hidden_states=audio_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
+                audio_encoder_hidden_states=audio_encoder_hidden_states,
                 temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
+                temb_audio=temb_audio,
+                temb_ca_scale_shift=video_cross_attn_scale_shift,
+                temb_ca_audio_scale_shift=audio_cross_attn_scale_shift,
+                temb_ca_gate=video_cross_attn_a2v_gate,
+                temb_ca_audio_gate=audio_cross_attn_v2a_gate,
+                video_rotary_emb=video_rotary_emb,
+                audio_rotary_emb=audio_rotary_emb,
+                ca_video_rotary_emb=video_cross_attn_rotary_emb,
+                ca_audio_rotary_emb=audio_cross_attn_rotary_emb,
+                encoder_attention_mask=encoder_attention_mask,
+                audio_encoder_attention_mask=audio_encoder_attention_mask,
             )
 
-        # Check if we should extract features at this index
+        # Video-only feature extraction at requested block indices
         if idx in feature_indices:
-            # Reshape from [B, seq_len, hidden_dim] to [B, hidden_dim, H, W] for discriminator
-            feat = hidden_states.clone()
-            B, S, C = feat.shape
-            feat = feat.permute(0, 2, 1).reshape(B, C, spatial_size, spatial_size)
-            features.append(feat)
+            features.append(hidden_states.clone())  # [B, T_v, D_v] — packed video tokens
 
-        # Early return if we have all features
+        # Early exit once all requested features are collected
         if return_features_early and len(features) == len(feature_indices):
             return features
 
-        idx += 1
+    # ------------------------------------------------------------------ #
+    # Step 6: Output layers (video + audio) — unchanged from original
+    # ------------------------------------------------------------------ #
+    scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
+    shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
+    hidden_states = self.norm_out(hidden_states)
+    hidden_states = hidden_states * (1 + scale) + shift
+    video_output = self.proj_out(hidden_states)
 
-    # 6. Single transformer blocks
-    for block in self.single_transformer_blocks:
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-                block,
-                hidden_states,
-                encoder_hidden_states,
-                temb,
-                image_rotary_emb,
-                joint_attention_kwargs,
-            )
-        else:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
+    audio_scale_shift_values = self.audio_scale_shift_table[None, None] + audio_embedded_timestep[:, :, None]
+    audio_shift, audio_scale = audio_scale_shift_values[:, :, 0], audio_scale_shift_values[:, :, 1]
+    audio_hidden_states = self.audio_norm_out(audio_hidden_states)
+    audio_hidden_states = audio_hidden_states * (1 + audio_scale) + audio_shift
+    audio_output = self.audio_proj_out(audio_hidden_states)
 
-        # Check if we should extract features at this index
-        if idx in feature_indices:
-            # Reshape from [B, seq_len, hidden_dim] to [B, hidden_dim, H, W] for discriminator
-            feat = hidden_states.clone()
-            B, S, C = feat.shape
-            feat = feat.permute(0, 2, 1).reshape(B, C, spatial_size, spatial_size)
-            features.append(feat)
-
-        # Early return if we have all features
-        if return_features_early and len(features) == len(feature_indices):
-            return features
-
-        idx += 1
-
-    # 7. Final projection - hidden_states is already image-only after single blocks
-    hidden_states = self.norm_out(hidden_states, temb)
-    output = self.proj_out(hidden_states)
-
-    # If we have all the features, we can exit early
+    # ------------------------------------------------------------------ #
+    # Assemble output following FastGen convention
+    # ------------------------------------------------------------------ #
     if return_features_early:
+        # Should have been caught above; guard for safety
         assert len(features) == len(feature_indices), f"{len(features)} != {len(feature_indices)}"
         return features
 
-    # Prepare output
+    # Logvar (optional — requires logvar_linear to be added to the transformer)
+    logvar = None
+    if return_logvar:
+        assert hasattr(self, "logvar_linear"), (
+            "logvar_linear is required when return_logvar=True. "
+            "It is added by LTX2.__init__."
+        )
+        # temb has shape [B, T_tokens, inner_dim]; take mean over tokens for a scalar logvar per sample
+        logvar = self.logvar_linear(temb.mean(dim=1))  # [B, 1]
+
     if len(feature_indices) == 0:
-        out = output
+        out = (video_output, audio_output)
     else:
-        out = [output, features]
+        out = [(video_output, audio_output), features]
+
+    if USE_PEFT_BACKEND:
+        unscale_lora_layers(self, lora_scale)
 
     if return_logvar:
-        logvar = self.logvar_linear(temb)
         return out, logvar
-
     return out
 
 
-class Flux(FastGenNetwork):
-    """Flux.1 network for text-to-image generation.
+# ---------------------------------------------------------------------------
+# Text encoder wrapper
+# ---------------------------------------------------------------------------
 
-    Reference: https://huggingface.co/black-forest-labs/FLUX.1-dev
+class LTX2TextEncoder(nn.Module):
+    """
+    Wraps Gemma3ForConditionalGeneration for LTX-2 text conditioning.
+
+    Returns both the packed prompt embeddings AND the tokenizer attention mask,
+    which is required by LTX2TextConnectors.
     """
 
-    MODEL_ID = "black-forest-labs/FLUX.1-dev"
+    def __init__(self, model_id: str):
+        super().__init__()
+        self.tokenizer = GemmaTokenizerFast.from_pretrained(model_id, subfolder="tokenizer")
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
+            model_id, subfolder="text_encoder"
+        )
+        self.text_encoder.eval().requires_grad_(False)
+
+    @torch.no_grad()
+    def encode(
+        self,
+        prompt: Union[str, List[str]],
+        precision: torch.dtype = torch.bfloat16,
+        max_sequence_length: int = 1024,
+        scale_factor: int = 8,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode text prompt(s) into packed Gemma hidden states.
+
+        Returns
+        -------
+        prompt_embeds : torch.Tensor  [B, T, H * num_layers]
+        attention_mask : torch.Tensor  [B, T]
+        """
+        if isinstance(prompt, str):
+            prompt = [prompt]
+
+        device = next(self.text_encoder.parameters()).device
+
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=max_sequence_length,
+            truncation=True,
+            add_special_tokens=True,
+            return_tensors="pt",
+        )
+        input_ids      = text_inputs.input_ids.to(device)
+        attention_mask = text_inputs.attention_mask.to(device)
+
+        outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        # Stack all hidden states: [B, T, H, num_layers]
+        hidden_states = torch.stack(outputs.hidden_states, dim=-1)
+        sequence_lengths = attention_mask.sum(dim=-1)
+
+        prompt_embeds = _pack_text_embeds(
+            hidden_states,
+            sequence_lengths,
+            device=device,
+            padding_side=self.tokenizer.padding_side,
+            scale_factor=scale_factor,
+        ).to(precision)
+
+        return prompt_embeds, attention_mask
+
+    def to(self, *args, **kwargs):
+        self.text_encoder.to(*args, **kwargs)
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Main LTX-2 network — follows FastGen pattern (Flux / Wan)
+# ---------------------------------------------------------------------------
+
+class LTX2(FastGenNetwork):
+    """
+    FastGen wrapper for LTX-2 audio-video generation.
+
+    Distillation targets video only:
+      - forward() receives and returns video latents [B, C, F, H, W]
+      - Audio is generated internally but not used for the distillation loss
+      - classify_forward extracts video hidden_states at requested block indices
+
+    Component layout:
+        text_encoder → connectors → transformer (patched) → vae → audio_vae → vocoder
+    """
+
+    MODEL_ID = "Lightricks/LTX-2"
 
     def __init__(
         self,
@@ -338,43 +540,31 @@ class Flux(FastGenNetwork):
         net_pred_type: str = "flow",
         schedule_type: str = "rf",
         disable_grad_ckpt: bool = False,
-        guidance_scale: Optional[float] = 3.5,
         load_pretrained: bool = True,
         **model_kwargs,
     ):
-        """Flux.1 constructor.
+        """
+        LTX-2 constructor.
 
         Args:
-            model_id: The HuggingFace model ID to load.
-                Defaults to "black-forest-labs/FLUX.1-dev".
-            net_pred_type: Prediction type. Defaults to "flow" for flow matching.
+            model_id: HuggingFace model ID or local path. Defaults to "Lightricks/LTX-2".
+            net_pred_type: Prediction type. Defaults to "flow" (flow matching).
             schedule_type: Schedule type. Defaults to "rf" (rectified flow).
-            disable_grad_ckpt: Whether to disable gradient checkpointing during training.
-                Defaults to False. Set to True when using FSDP to avoid memory access errors.
-            guidance_scale: Default guidance scale for Flux.1-dev guidance distillation.
-                None means no guidance. Defaults to 3.5 (recommended for Flux.1-dev).
+            disable_grad_ckpt: Disable gradient checkpointing during training.
+                Set True when using FSDP to avoid memory access errors.
+            load_pretrained: Load pretrained weights. If False, initialises from config only.
         """
         super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **model_kwargs)
 
         self.model_id = model_id
-        self.guidance_scale = guidance_scale
         self._disable_grad_ckpt = disable_grad_ckpt
-        logger.debug(f"Embedded guidance scale: {guidance_scale}")
 
-        # Initialize the network (handles meta device and pretrained loading)
         self._initialize_network(model_id, load_pretrained)
 
-        # Override forward with classify_forward
+        # Monkey-patch classify_forward onto self.transformer (same pattern as Flux / Wan)
         self.transformer.forward = types.MethodType(classify_forward, self.transformer)
 
-        # Disable cuDNN SDPA backend to avoid mha_graph->execute errors during backward.
-        # This is a known issue with Flux transformer and cuDNN attention.
-        # Flash and mem_efficient backends still work; only cuDNN is problematic.
-        if torch.backends.cuda.is_built():
-            torch.backends.cuda.enable_cudnn_sdp(False)
-            logger.info("Disabled cuDNN SDPA backend for Flux compatibility")
-
-        # Gradient checkpointing configuration
+        # Gradient checkpointing
         if disable_grad_ckpt:
             self.transformer.disable_gradient_checkpointing()
         else:
@@ -382,54 +572,152 @@ class Flux(FastGenNetwork):
 
         torch.cuda.empty_cache()
 
-    def _initialize_network(self, model_id: str, load_pretrained: bool) -> None:
-        """Initialize the transformer network.
+    # ------------------------------------------------------------------
+    # Initialisation
+    # ------------------------------------------------------------------
 
-        Args:
-            model_id: The HuggingFace model ID or local path.
-            load_pretrained: Whether to load pretrained weights.
-        """
-        # Check if we're in a meta context (for FSDP memory-efficient loading)
+    def _initialize_network(self, model_id: str, load_pretrained: bool) -> None:
+        """Initialize the transformer and supporting modules."""
         in_meta_context = self._is_in_meta_context()
         should_load_weights = load_pretrained and (not in_meta_context)
 
         if should_load_weights:
-            logger.info("Loading Flux transformer from pretrained")
-            self.transformer: FluxTransformer2DModel = FluxTransformer2DModel.from_pretrained(
-                model_id,
-                cache_dir=os.environ["HF_HOME"],
-                subfolder="transformer",
-                local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
+            logger.info("Loading LTX-2 transformer from pretrained")
+            self.transformer: LTX2VideoTransformer3DModel = LTX2VideoTransformer3DModel.from_pretrained(
+                model_id, subfolder="transformer"
             )
         else:
-            # Load config and create model structure
-            # If we're in a meta context, tensors will automatically be on meta device
-            config = FluxTransformer2DModel.load_config(
-                model_id,
-                cache_dir=os.environ["HF_HOME"],
-                subfolder="transformer",
-                local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-            )
+            config = LTX2VideoTransformer3DModel.load_config(model_id, subfolder="transformer")
             if in_meta_context:
                 logger.info(
-                    "Initializing Flux transformer on meta device (zero memory, will receive weights via FSDP sync)"
+                    "Initializing LTX-2 transformer on meta device "
+                    "(zero memory, will receive weights via FSDP sync)"
                 )
             else:
-                logger.info("Initializing Flux transformer from config (no pretrained weights)")
-                logger.warning("Flux transformer being initialized from config. No weights are loaded!")
-            self.transformer: FluxTransformer2DModel = FluxTransformer2DModel.from_config(config)
+                logger.info("Initializing LTX-2 transformer from config (no pretrained weights)")
+                logger.warning("LTX-2 transformer being initialized from config. No weights are loaded!")
+            self.transformer: LTX2VideoTransformer3DModel = LTX2VideoTransformer3DModel.from_config(config)
 
-        # Add logvar linear layer for variance estimation - Flux uses 3072-dim time embeddings
-        self.transformer.logvar_linear = torch.nn.Linear(3072, 1)
+        # inner_dim = num_attention_heads * attention_head_dim
+        inner_dim = (
+            self.transformer.config.num_attention_heads
+            * self.transformer.config.attention_head_dim
+        )
+
+        # Add logvar_linear for uncertainty weighting (DMD2 / f-distill)
+        # temb mean has shape [B, inner_dim] → logvar scalar per sample
+        self.transformer.logvar_linear = nn.Linear(inner_dim, 1)
+        logger.info(f"Added logvar_linear ({inner_dim} → 1) to LTX-2 transformer")
+
+        # Connectors: top-level sibling of transformer (NOT nested inside it)
+        if should_load_weights:
+            self.connectors: LTX2TextConnectors = LTX2TextConnectors.from_pretrained(
+                model_id, subfolder="connectors"
+            )
+        else:
+            # Connectors are lightweight; always load if pretrained is skipped for the transformer
+            logger.warning("Skipping connector pretrained load (meta context or load_pretrained=False)")
+            self.connectors = None  # will be loaded lazily via init_preprocessors
+
+        # Cache compression ratios used by forward() and sample()
+        if should_load_weights:
+            # VAEs (needed for sample(); not for the training forward pass)
+            self.vae: AutoencoderKLLTX2Video = AutoencoderKLLTX2Video.from_pretrained(
+                model_id, subfolder="vae"
+            )
+            self.vae.eval().requires_grad_(False)
+
+            self.audio_vae: AutoencoderKLLTX2Audio = AutoencoderKLLTX2Audio.from_pretrained(
+                model_id, subfolder="audio_vae"
+            )
+            self.audio_vae.eval().requires_grad_(False)
+
+            self.vocoder: LTX2Vocoder = LTX2Vocoder.from_pretrained(
+                model_id, subfolder="vocoder"
+            )
+            self.vocoder.eval().requires_grad_(False)
+
+            self._cache_vae_constants()
+
+        # Scheduler (used in sample())
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            model_id, subfolder="scheduler"
+        )
+
+    def _cache_vae_constants(self) -> None:
+        """Cache VAE spatial/temporal compression constants for use in forward() / sample()."""
+        self.vae_spatial_compression_ratio   = self.vae.spatial_compression_ratio
+        self.vae_temporal_compression_ratio  = self.vae.temporal_compression_ratio
+        self.transformer_spatial_patch_size  = self.transformer.config.patch_size
+        self.transformer_temporal_patch_size = self.transformer.config.patch_size_t
+
+        self.audio_sampling_rate             = self.audio_vae.config.sample_rate
+        self.audio_hop_length                = self.audio_vae.config.mel_hop_length
+        self.audio_vae_temporal_compression  = self.audio_vae.temporal_compression_ratio
+        self.audio_vae_mel_compression_ratio = self.audio_vae.mel_compression_ratio
+
+    # ------------------------------------------------------------------
+    # Preprocessor initialisation (lazy, matches Flux / Wan pattern)
+    # ------------------------------------------------------------------
+
+    def init_preprocessors(self):
+        """Initialize text encoder and connectors."""
+        if not hasattr(self, "text_encoder") or self.text_encoder is None:
+            self.init_text_encoder()
+        if self.connectors is None:
+            self.connectors = LTX2TextConnectors.from_pretrained(
+                self.model_id, subfolder="connectors"
+            )
+
+    def init_text_encoder(self):
+        """Initialize the Gemma3 text encoder for LTX-2."""
+        self.text_encoder = LTX2TextEncoder(model_id=self.model_id)
+
+    # ------------------------------------------------------------------
+    # Device movement
+    # ------------------------------------------------------------------
+
+    def to(self, *args, **kwargs):
+        super().to(*args, **kwargs)
+        if hasattr(self, "text_encoder") and self.text_encoder is not None:
+            self.text_encoder.to(*args, **kwargs)
+        if hasattr(self, "connectors") and self.connectors is not None:
+            self.connectors.to(*args, **kwargs)
+        if hasattr(self, "vae") and self.vae is not None:
+            self.vae.to(*args, **kwargs)
+        if hasattr(self, "audio_vae") and self.audio_vae is not None:
+            self.audio_vae.to(*args, **kwargs)
+        if hasattr(self, "vocoder") and self.vocoder is not None:
+            self.vocoder.to(*args, **kwargs)
+        return self
+
+    # ------------------------------------------------------------------
+    # FSDP
+    # ------------------------------------------------------------------
+
+    def fully_shard(self, **kwargs):
+        """Fully shard the LTX-2 transformer for FSDP2.
+
+        Shards self.transformer (not self) to avoid ABC __class__ assignment issues.
+        """
+        if self.transformer.gradient_checkpointing:
+            self.transformer.disable_gradient_checkpointing()
+            apply_fsdp_checkpointing(
+                self.transformer,
+                check_fn=lambda block: isinstance(block, LTX2VideoTransformerBlock),
+            )
+            logger.info("Applied FSDP activation checkpointing to LTX-2 transformer blocks")
+
+        for block in self.transformer.transformer_blocks:
+            fully_shard(block, **kwargs)
+        fully_shard(self.transformer, **kwargs)
+
+    # ------------------------------------------------------------------
+    # reset_parameters (required for FSDP meta device init)
+    # ------------------------------------------------------------------
 
     def reset_parameters(self):
-        """Reinitialize parameters for FSDP meta device initialization.
-
-        This is required when using meta device initialization for FSDP2.
-        Reinitializes all linear layers and embeddings.
-        """
-        import torch.nn as nn
-
+        """Reinitialise parameters after meta device materialisation (FSDP2)."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -439,182 +727,84 @@ class Flux(FastGenNetwork):
                 nn.init.normal_(m.weight, std=0.02)
 
         super().reset_parameters()
+        logger.debug("Reinitialized LTX-2 parameters")
 
-        logger.debug("Reinitialized Flux parameters")
+    # ------------------------------------------------------------------
+    # Audio latent sizing helper (shared by forward and sample)
+    # ------------------------------------------------------------------
 
-    def fully_shard(self, **kwargs):
-        """Fully shard the Flux network for FSDP.
-
-        Note: Flux has two types of transformer blocks:
-        - transformer_blocks: Joint attention blocks for text-image interaction
-        - single_transformer_blocks: Single stream blocks for image processing
-
-        We shard `self.transformer` instead of `self` because the network wrapper
-        class may have complex multiple inheritance with ABC, which causes Python's
-        __class__ assignment to fail due to incompatible memory layouts.
+    def _compute_audio_shape(
+        self, latent_f: int, fps: float, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[int, int, int]:
         """
-        # Note: Checkpointing has to happen first, for proper casting during backward pass recomputation.
-        if self.transformer.gradient_checkpointing:
-            # Disable the built-in gradient checkpointing (which uses torch.utils.checkpoint)
-            self.transformer.disable_gradient_checkpointing()
-            # Apply FSDP-compatible activation checkpointing to both block types
-            apply_fsdp_checkpointing(
-                self.transformer,
-                check_fn=lambda block: isinstance(block, (FluxTransformerBlock, FluxSingleTransformerBlock)),
-            )
-            logger.info("Applied FSDP activation checkpointing to Flux transformer blocks")
+        Compute audio latent dimensions from video latent frame count.
 
-        # Apply FSDP sharding to joint transformer blocks
-        for block in self.transformer.transformer_blocks:
-            fully_shard(block, **kwargs)
-
-        # Apply FSDP sharding to single transformer blocks
-        for block in self.transformer.single_transformer_blocks:
-            fully_shard(block, **kwargs)
-
-        fully_shard(self.transformer, **kwargs)
-
-    def init_preprocessors(self):
-        """Initialize text and image encoders."""
-        if not hasattr(self, "text_encoder"):
-            self.init_text_encoder()
-        if not hasattr(self, "vae"):
-            self.init_vae()
-
-    def init_text_encoder(self):
-        """Initialize the text encoder for Flux."""
-        self.text_encoder = FluxTextEncoder(model_id=self.model_id)
-
-    def init_vae(self):
-        """Initialize only the VAE for visualization."""
-        self.vae = FluxImageEncoder(model_id=self.model_id)
-
-    def to(self, *args, **kwargs):
-        """Moves the model to the specified device."""
-        super().to(*args, **kwargs)
-        if hasattr(self, "text_encoder"):
-            self.text_encoder.to(*args, **kwargs)
-        if hasattr(self, "vae"):
-            self.vae.to(*args, **kwargs)
-        return self
-
-    def _prepare_latent_image_ids(
-        self,
-        height: int,
-        width: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Prepare image position IDs for the transformer.
-
-        Args:
-            height: Latent height (before packing, will be divided by 2).
-            width: Latent width (before packing, will be divided by 2).
-            device: Target device.
-            dtype: Target dtype.
-
-        Returns:
-            torch.Tensor: Image position IDs [(H//2)*(W//2), 3] (2D, no batch dim).
+        Returns (audio_num_frames, latent_mel_bins, num_audio_ch).
         """
-        # Use packed dimensions
-        packed_height = height // 2
-        packed_width = width // 2
-        latent_image_ids = torch.zeros(packed_height, packed_width, 3, device=device, dtype=dtype)
-        latent_image_ids[..., 1] = torch.arange(packed_height, device=device, dtype=dtype)[:, None]
-        latent_image_ids[..., 2] = torch.arange(packed_width, device=device, dtype=dtype)[None, :]
-        latent_image_ids = latent_image_ids.reshape(packed_height * packed_width, 3)
-        return latent_image_ids
+        pixel_frames = (latent_f - 1) * self.vae_temporal_compression_ratio + 1
+        duration_s   = pixel_frames / fps
 
-    def _prepare_text_ids(
-        self,
-        seq_length: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Prepare text position IDs.
+        audio_latents_per_second = (
+            self.audio_sampling_rate
+            / self.audio_hop_length
+            / float(self.audio_vae_temporal_compression)
+        )
+        audio_num_frames = round(duration_s * audio_latents_per_second)
+        num_mel_bins     = self.audio_vae.config.mel_bins
+        latent_mel_bins  = num_mel_bins // self.audio_vae_mel_compression_ratio
+        num_audio_ch     = self.audio_vae.config.latent_channels
+        return audio_num_frames, latent_mel_bins, num_audio_ch
 
-        Args:
-            seq_length: Text sequence length.
-            device: Target device.
-            dtype: Target dtype.
-
-        Returns:
-            torch.Tensor: Text position IDs [seq_length, 3] (2D, no batch dim).
-        """
-        text_ids = torch.zeros(seq_length, 3, device=device, dtype=dtype)
-        return text_ids
-
-    def _pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """Pack latents from [B, C, H, W] to [B, (H//2)*(W//2), C*4] for Flux transformer.
-
-        Flux uses 2x2 patch packing where each 2x2 spatial block is flattened into channels.
-
-        Args:
-            latents: Input latents [B, C, H, W].
-
-        Returns:
-            Packed latents [B, (H//2)*(W//2), C*4].
-        """
-        batch_size, channels, height, width = latents.shape
-        # Reshape to [B, C, H//2, 2, W//2, 2]
-        latents = latents.view(batch_size, channels, height // 2, 2, width // 2, 2)
-        # Permute to [B, H//2, W//2, C, 2, 2]
-        latents = latents.permute(0, 2, 4, 1, 3, 5)
-        # Reshape to [B, (H//2)*(W//2), C*4]
-        latents = latents.reshape(batch_size, (height // 2) * (width // 2), channels * 4)
-        return latents
-
-    def _unpack_latents(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
-        """Unpack latents from [B, (H//2)*(W//2), C*4] to [B, C, H, W].
-
-        Reverses the 2x2 patch packing used by Flux.
-
-        Args:
-            latents: Packed latents [B, (H//2)*(W//2), C*4].
-            height: Target height (original H before packing).
-            width: Target width (original W before packing).
-
-        Returns:
-            Unpacked latents [B, C, H, W].
-        """
-        batch_size = latents.shape[0]
-        channels = latents.shape[2] // 4  # C*4 -> C
-        # Reshape to [B, H//2, W//2, C, 2, 2]
-        latents = latents.reshape(batch_size, height // 2, width // 2, channels, 2, 2)
-        # Permute to [B, C, H//2, 2, W//2, 2]
-        latents = latents.permute(0, 3, 1, 4, 2, 5)
-        # Reshape to [B, C, H, W]
-        latents = latents.reshape(batch_size, channels, height, width)
-        return latents
+    # ------------------------------------------------------------------
+    # forward() — video-only distillation interface
+    # ------------------------------------------------------------------
 
     def forward(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
         condition: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        r: Optional[torch.Tensor] = None,  # unused, kept for API compatibility
-        guidance: Optional[torch.Tensor] = None,
+        r: Optional[torch.Tensor] = None,           # unused, kept for API compatibility
+        fps: float = 24.0,
         return_features_early: bool = False,
         feature_indices: Optional[Set[int]] = None,
         return_logvar: bool = False,
         fwd_pred_type: Optional[str] = None,
+        audio_latents: Optional[torch.Tensor] = None,
+        return_audio: bool = False,
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward pass of Flux diffusion model.
+        """Forward pass — video latents in, video latents out.
+
+        Follows the Flux/Wan FastGen pattern. Audio is optional:
+          - Distillation (default): ``audio_latents=None, return_audio=False``.
+            Random noise is used for audio; only video prediction is returned.
+          - Inference via sample(): ``audio_latents=<packed>, return_audio=True``.
+            The current denoising audio latents are passed in and the audio
+            noise prediction is returned alongside the video prediction so that
+            sample() can step both schedulers.
 
         Args:
-            x_t: The diffused data sample [B, C, H, W].
-            t: The current timestep.
-            condition: Tuple of (pooled_prompt_embeds, prompt_embeds) from text encoder.
-            r: Another timestep (for mean flow methods).
-            return_features_early: If True, return features once collected.
-            feature_indices: Set of block indices for feature extraction.
-            return_logvar: If True, return the logvar.
-            fwd_pred_type: Override network prediction type.
-            guidance: Optional guidance scale embedding.
+            x_t: Video latents [B, C, F, H, W].
+            t:   Timestep [B] — scheduler sigmas passed directly to time_embed.
+            condition: Tuple of (prompt_embeds [B, T, D], attention_mask [B, T]).
+            r:   Unused (kept for FastGen API compatibility).
+            fps: Frames per second (needed for RoPE coordinate computation).
+            return_features_early: Return video features as soon as collected.
+            feature_indices: Set of transformer block indices to extract video features from.
+            return_logvar: Return log-variance estimate alongside the output.
+            fwd_pred_type: Override prediction type.
+            audio_latents: Optional packed audio latents [B, T_a, C_a] from sample().
+                           When None, fresh random noise is generated internally.
+            return_audio: When True, return (video_out, audio_packed) instead of
+                          just video_out. Only used by sample().
 
         Returns:
-            Model output tensor or tuple with logvar/features.
+            Normal:        video_out [B, C, F, H, W]
+            return_audio:  (video_out, audio_packed [B, T_a, C_a])
+            With features: (video_out, List[video_feature_tensors])
+            Early exit:    List[video_feature_tensors]
+            With logvar:   (above, logvar [B, 1])
         """
         if feature_indices is None:
             feature_indices = set()
@@ -627,78 +817,122 @@ class Flux(FastGenNetwork):
             assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported"
 
         batch_size = x_t.shape[0]
-        height, width = x_t.shape[2], x_t.shape[3]
+        _, _, latent_f, latent_h, latent_w = x_t.shape
 
-        # Unpack condition: (pooled_prompt_embeds, prompt_embeds)
-        pooled_prompt_embeds, prompt_embeds = condition
+        # Unpack text conditioning
+        prompt_embeds, attention_mask = condition
 
-        # Prepare position IDs (2D tensors, no batch dimension)
-        img_ids = self._prepare_latent_image_ids(height, width, x_t.device, x_t.dtype)
-        txt_ids = self._prepare_text_ids(prompt_embeds.shape[1], x_t.device, x_t.dtype)
+        # ---- Run connectors to get per-modality encoder hidden states ----
+        additive_mask = (1 - attention_mask.to(prompt_embeds.dtype)) * -1_000_000.0
+        connector_video_embeds, connector_audio_embeds, connector_attn_mask = self.connectors(
+            prompt_embeds, additive_mask, additive_mask=True
+        )
 
-        # Pack latents for transformer: [B, C, H, W] -> [B, (H//2)*(W//2), C*4]
-        hidden_states = self._pack_latents(x_t)
+        # ---- Timestep: [B] — time_embed handles scale internally ----
+        timestep = t.to(x_t.dtype).expand(batch_size)  # [B]
 
-        # Note: Flux.1-dev (w/ guidance distillation) uses embedded guidance, so the default guidance is not None
-        if guidance is None:
-            guidance = torch.full(
-                (batch_size,), self.guidance_scale, device=hidden_states.device, dtype=hidden_states.dtype
+        # ---- Pack video latents ----
+        hidden_states = _pack_latents(
+            x_t, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+        )
+
+        # ---- Audio latents: use provided (from sample()) or generate random noise ----
+        audio_num_frames, latent_mel_bins, num_audio_ch = self._compute_audio_shape(
+            latent_f, fps, x_t.device, x_t.dtype
+        )
+        if audio_latents is not None:
+            # Already packed [B, T_a, C_a] — passed in by sample()
+            audio_hidden_states = audio_latents.to(x_t.dtype)
+        else:
+            audio_hidden_states = _pack_audio_latents(
+                torch.randn(
+                    batch_size, num_audio_ch, audio_num_frames, latent_mel_bins,
+                    device=x_t.device, dtype=x_t.dtype,
+                )
             )
 
+        # ---- RoPE coordinates ----
+        video_coords = self.transformer.rope.prepare_video_coords(
+            batch_size, latent_f, latent_h, latent_w, x_t.device, fps=fps
+        )
+        audio_coords = self.transformer.audio_rope.prepare_audio_coords(
+            batch_size, audio_num_frames, x_t.device
+        )
+
+        # ---- Transformer forward (classify_forward, monkey-patched) ----
         model_outputs = self.transformer(
             hidden_states=hidden_states,
-            encoder_hidden_states=prompt_embeds,
-            pooled_projections=pooled_prompt_embeds,
-            timestep=t,  # Flux expects timestep in [0, 1]
-            img_ids=img_ids,
-            txt_ids=txt_ids,
-            guidance=guidance,
+            audio_hidden_states=audio_hidden_states,
+            encoder_hidden_states=connector_video_embeds,
+            audio_encoder_hidden_states=connector_audio_embeds,
+            encoder_attention_mask=connector_attn_mask,
+            audio_encoder_attention_mask=connector_attn_mask,
+            timestep=timestep,
+            num_frames=latent_f,
+            height=latent_h,
+            width=latent_w,
+            fps=fps,
+            audio_num_frames=audio_num_frames,
+            video_coords=video_coords,
+            audio_coords=audio_coords,
             return_features_early=return_features_early,
             feature_indices=feature_indices,
             return_logvar=return_logvar,
         )
 
+        # ---- Early exit: list of video feature tensors ----
         if return_features_early:
-            return model_outputs
+            return model_outputs  # List[Tensor], each [B, T_v, D_v]
 
+        # ---- Unpack logvar if requested ----
         if return_logvar:
             out, logvar = model_outputs[0], model_outputs[1]
         else:
             out = model_outputs
 
-        # Unpack output: [B, H*W, C] -> [B, C, H, W]
-        if isinstance(out, torch.Tensor):
-            out = self._unpack_latents(out, height, width)
-            out = self.noise_scheduler.convert_model_output(
-                x_t, out, t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
+        # ---- Extract video prediction; capture audio for sample() if requested ----
+        if len(feature_indices) == 0:
+            # out is (video_output, audio_output)
+            video_packed = out[0]  # [B, T_v, C_packed]
+            audio_packed = out[1]  # [B, T_a, C_packed] — only used when return_audio=True
+            features = None
         else:
-            out[0] = self._unpack_latents(out[0], height, width)
-            out[0] = self.noise_scheduler.convert_model_output(
-                x_t, out[0], t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
+            # out is [(video_output, audio_output), features]
+            video_packed = out[0][0]  # [B, T_v, C_packed]
+            audio_packed = out[0][1]  # [B, T_a, C_packed]
+            features = out[1]         # List[Tensor]
+
+        # ---- Unpack video tokens → [B, C, F, H, W] ----
+        video_out = _unpack_latents(
+            video_packed, latent_f, latent_h, latent_w,
+            self.transformer_spatial_patch_size, self.transformer_temporal_patch_size,
+        )
+
+        # ---- Convert model output to requested prediction type ----
+        video_out = self.noise_scheduler.convert_model_output(
+            x_t, video_out, t,
+            src_pred_type=self.net_pred_type,
+            target_pred_type=fwd_pred_type,
+        )
+
+        # ---- Re-pack output following FastGen convention ----
+        if features is not None:
+            out = [video_out, features]
+        else:
+            out = video_out
+
+        # Return audio noise pred alongside video when called from sample()
+        if return_audio:
+            out = (out, audio_packed.float())
 
         if return_logvar:
             return out, logvar
         return out
 
-    def _calculate_shift(
-        self,
-        image_seq_len: int,
-        base_seq_len: int = 256,
-        max_seq_len: int = 4096,
-        base_shift: float = 0.5,
-        max_shift: float = 1.16,
-    ) -> float:
-        """Calculate the shift value for the scheduler based on image resolution.
-
-        This implements the resolution-dependent shift from the Flux paper.
-        """
-
-        m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-        b = base_shift - m * base_seq_len
-        mu = image_seq_len * m + b
-        return mu
+    # ------------------------------------------------------------------
+    # sample() — full denoising loop for inference
+    # Follows pipeline_ltx2.py exactly (verified working logic preserved)
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def sample(
@@ -706,91 +940,85 @@ class Flux(FastGenNetwork):
         noise: torch.Tensor,
         condition: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         neg_condition: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        guidance_scale: Optional[float] = 3.5,
-        num_steps: int = 28,
+        guidance_scale: float = 4.0,
+        num_steps: int = 40,
+        fps: float = 24.0,
+        frame_rate: Optional[float] = None,
         **kwargs,
-    ) -> torch.Tensor:
-        """Generate samples using Euler flow matching.
-
-        Args:
-            noise: Initial noise tensor [B, C, H, W].
-            condition: Tuple of (pooled_prompt_embeds, prompt_embeds).
-            neg_condition: Optional negative condition tuple for CFG.
-            guidance_scale: Guidance scale (if not None, enables guidance via distillation).
-            num_steps: Number of sampling steps (default 28 for good quality/speed balance).
-            **kwargs: Additional keyword arguments
-
-        Returns:
-            Generated latent samples.
+    ) -> Tuple[torch.Tensor, None]:
         """
-        batch_size, channels, height, width = noise.shape
+        Run the full denoising loop for text-to-video generation (audio always None).
 
-        # Calculate image sequence length for shift calculation
-        # After 2x2 packing: seq_len = (H // 2) * (W // 2)
-        image_seq_len = (height // 2) * (width // 2)
+        Returns
+        -------
+        (video_latents, None):
+            video: [B, C, F, H, W] denormalised video latents
+            audio: always None
+        """
+        fps = frame_rate if frame_rate is not None else fps
+        do_cfg = neg_condition is not None and guidance_scale > 1.0
 
-        # Calculate resolution-dependent shift (mu)
-        mu = self._calculate_shift(image_seq_len)
+        transformer_dtype = self.transformer.dtype
+        transformer_device = next(self.transformer.parameters()).device
 
-        # Initialize scheduler with proper shift
-        scheduler = FlowMatchEulerDiscreteScheduler(shift=mu)
-        scheduler.set_timesteps(num_steps, device=noise.device)
-        timesteps = scheduler.timesteps
+        # Move latents to transformer device and dtype
+        video_latents = noise.to(device=transformer_device, dtype=transformer_dtype)
 
-        # Initialize latents with proper scaling based on the initial timestep
-        t_init = self.noise_scheduler.safe_clamp(
-            timesteps[0] / 1000.0, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t
-        )
-        latents = self.noise_scheduler.latents(noise=noise, t_init=t_init)
-
-        pooled_prompt_embeds, prompt_embeds = condition
-
-        # Prepare guidance embedding for guidance distillation (Flux.1-dev mode)
-        # Note: Flux.1-dev uses embedded guidance, not traditional CFG
-        guidance_tensor = None
-        if guidance_scale is not None:
-            guidance_tensor = torch.full((batch_size,), guidance_scale, device=latents.device, dtype=latents.dtype)
-
-        # Sampling loop
-        for timestep in timesteps:
-            # Scheduler timesteps are in [0, 1000], transformer expects [0, 1]
-            t = (timestep / 1000.0).expand(batch_size)
-            t = self.noise_scheduler.safe_clamp(t, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t).to(
-                latents.dtype
+        # Build combined condition for CFG so connectors are called once per step
+        if do_cfg:
+            neg_embeds, neg_mask = neg_condition
+            cond_embeds, cond_mask = condition
+            combined_condition = (
+                torch.cat([neg_embeds, cond_embeds], dim=0).to(device=transformer_device, dtype=transformer_dtype),
+                torch.cat([neg_mask, cond_mask], dim=0).to(device=transformer_device),
+            )
+        else:
+            embeds, mask = condition
+            combined_condition = (
+                embeds.to(device=transformer_device, dtype=transformer_dtype),
+                mask.to(device=transformer_device),
             )
 
-            # Two guidance modes:
-            # 1. CFG mode: when neg_condition is provided (doubles batch, uses uncond/cond difference)
-            # 2. Guidance distillation mode: when neg_condition is None (single forward, guidance embedded)
-            if neg_condition is not None:
-                # Traditional CFG mode
-                neg_pooled, neg_prompt = neg_condition
-                latent_model_input = torch.cat([latents, latents], dim=0)
-                pooled_input = torch.cat([neg_pooled, pooled_prompt_embeds], dim=0)
-                prompt_input = torch.cat([neg_prompt, prompt_embeds], dim=0)
-                t_input = torch.cat([t, t], dim=0)
+        # ---- Scheduler timesteps ----
+        B, C, latent_f, latent_h, latent_w = video_latents.shape
+        sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
+        video_seq_len = latent_f * latent_h * latent_w
+        mu = _calculate_shift(
+            video_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 1024),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.95),
+            self.scheduler.config.get("max_shift", 2.05),
+        )
+        timesteps, num_steps = _retrieve_timesteps(
+            self.scheduler, num_steps, transformer_device, sigmas=sigmas, mu=mu
+        )
 
-                noise_pred = self(
-                    latent_model_input,
-                    t_input,
-                    (pooled_input, prompt_input),
-                    fwd_pred_type="flow",
-                    guidance=None,  # No guidance embedding for CFG mode
-                )
+        # ---- Denoising loop ----
+        for t in timesteps:
+            latent_input = torch.cat([video_latents] * 2) if do_cfg else video_latents
+            t_input = t.to(dtype=transformer_dtype, device=transformer_device).expand(latent_input.shape[0])
 
+            noise_pred = self(
+                latent_input,
+                t_input,
+                condition=combined_condition,
+                fps=fps,
+                fwd_pred_type="flow",
+            )
+
+            if do_cfg:
                 noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-            else:
-                # Guidance distillation mode (recommended for Flux.1-dev)
-                noise_pred = self(
-                    latents,
-                    t,
-                    condition,
-                    fwd_pred_type="flow",
-                    guidance=guidance_tensor,
-                )
 
-            # Euler step
-            latents = scheduler.step(noise_pred, timestep, latents, return_dict=False)[0]
+            video_latents = self.scheduler.step(noise_pred, t, video_latents, return_dict=False)[0]
 
-        return latents
+        # ---- Denormalise ----
+        video_latents = _denormalize_latents(
+            video_latents,
+            self.vae.latents_mean,
+            self.vae.latents_std,
+            self.vae.config.scaling_factor,
+        )
+
+        return video_latents, None

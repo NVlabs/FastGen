@@ -753,7 +753,7 @@ class LTX2Pipeline(DiffusionPipeline, FromSingleFileMixin, LTX2LoraLoaderMixin):
 
         # Honour the transformer's construction-time gate — if it has no audio modules,
         # we cannot generate audio regardless of what the caller requests.
-        run_audio = generate_audio and self.transformer.config.audio_enabled
+        run_audio = generate_audio and getattr(self.transformer.config, "audio_enabled", True)
 
         # 1. Check inputs
         self.check_inputs(
