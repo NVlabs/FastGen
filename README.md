@@ -1,4 +1,5 @@
 <h1 align="center">NVIDIA FastGen: Fast Generation from Diffusion Models</h1>
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/NVlabs/FastGen)
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/)
