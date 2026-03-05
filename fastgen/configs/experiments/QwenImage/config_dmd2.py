@@ -3,7 +3,7 @@
 
 from fastgen.configs.discriminator import Discriminator_QwenImage_Config
 import fastgen.configs.methods.config_dmd2 as config_dmd2_default
-from fastgen.configs.data import HiDreamG5_JourneyDB_Loader_Config
+from fastgen.configs.data import ImageLoaderConfig
 from fastgen.configs.net import QwenImageConfig
 
 """Configs for DMD2 distillation on Qwen-Image model."""
@@ -60,7 +60,7 @@ def create_config():
     # config.model.sample_t_cfg.t_list = [0.999,t1,t2,0]
 
     # Dataloader
-    config.dataloader_train = HiDreamG5_JourneyDB_Loader_Config
+    config.dataloader_train = ImageLoaderConfig
     config.dataloader_train.batch_size = 2
     config.dataloader_train.input_res = (config.model.input_shape[-1] * 8, config.model.input_shape[-2] * 8)
 

@@ -1144,10 +1144,6 @@ class CosmosPredict2(FastGenNetwork):
         """
         assert self.schedule_type == "rf", f"{self.schedule_type} is not supported"
 
-        # Temporarily set to eval mode and revert back after generation
-        was_training = self.training
-        self.eval()
-
         # Set timesteps with shift parameter (matching official Cosmos inference)
         if self.sample_scheduler is None:
             self.sample_scheduler = UniPCMultistepScheduler(
@@ -1266,7 +1262,6 @@ class CosmosPredict2(FastGenNetwork):
                 v2w_condition = {"conditioning_latents": conditioning_latents, "condition_mask": condition_mask}
                 latents = self.preserve_conditioning(latents, v2w_condition)
 
-        self.train(was_training)
         return latents
 
     def forward(

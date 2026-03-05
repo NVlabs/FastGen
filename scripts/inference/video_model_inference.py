@@ -217,20 +217,11 @@ def prepare_wani2v_condition(
         pixel_cond[:, :, 0] = conditioning_frames[:, :, 0]  # First frame only
         # Encode through VAE (zeros become VAE-encoded zeros, not latent zeros)
         with basic_utils.inference_mode(vae, precision_amp=model.precision_amp_infer, device_type=model.device.type):
-            first_frame_cond = vae.encode(pixel_cond)
+            first_frame_cond = vae.encode(pixel_cond, mode="argmax")
         logger.info(f"Wan 2.1 I2V: created first_frame_cond via VAE, shape {first_frame_cond.shape}")
     else:
-        # Wan 2.2 5B: pad with zeros in latent space (simpler, no concat)
-        first_frame_cond = torch.zeros(
-            1,
-            conditioning_latents.shape[1],
-            t_latent,
-            conditioning_latents.shape[3],
-            conditioning_latents.shape[4],
-            device=conditioning_latents.device,
-            dtype=conditioning_latents.dtype,
-        )
-        first_frame_cond[:, :, : conditioning_latents.shape[2]] = conditioning_latents
+        # Wan 2.2 5B: first latent frame directly
+        first_frame_cond = conditioning_latents
 
     condition_dict = {"text_embeds": condition, "first_frame_cond": first_frame_cond}
     neg_condition_dict = {"text_embeds": neg_condition, "first_frame_cond": first_frame_cond}
@@ -408,7 +399,7 @@ def prepare_i2v_condition(
 
     conditioning_frames = conditioning_frames.to(**ctx)
     with basic_utils.inference_mode(vae, precision_amp=model.precision_amp_infer, device_type=model.device.type):
-        conditioning_latents = vae.encode(conditioning_frames)
+        conditioning_latents = vae.encode(conditioning_frames, mode="argmax")
     logger.info(f"I2V: encoded image to latents shape {conditioning_latents.shape}")
 
     if getattr(model.net, "is_i2v", False):

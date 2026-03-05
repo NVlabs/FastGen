@@ -4,7 +4,7 @@
 """Image generation inference script.
 
 Supports:
-- Text-conditional models: SD15, SDXL, Flux
+- Text-conditional models: SD15, SDXL, Flux, QwenImage
 - Class-conditional models: EDM, SiT, DiT (ImageNet)
 - Unconditional generation
 

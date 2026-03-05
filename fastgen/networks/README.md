@@ -6,8 +6,8 @@ Neural network architectures for FastGen. All networks inherit from `FastGenNetw
 
 | Type | Networks |
 |------|----------|
-| Image | [`EDM`](EDM/), [`EDM2`](EDM2/), [`DiT`](DiT/), [`SD15`](SD15/), [`SDXL`](SDXL/), [`Flux`](Flux/) |
-| Video | [`Wan`](Wan/), [`WanI2V`](WanI2V/), [`VaceWan`](VaceWan/), [`CogVideoX`](CogVideoX/), [`cosmos_predict2`](cosmos_predict2/) |
+| Image | [`EDM`](EDM/), [`EDM2`](EDM2/), [`DiT`](DiT/), [`SD15`](SD15/), [`SDXL`](SDXL/), [`Flux`](Flux/), [`QwenImage`](QwenImage/) |
+| Video | [`Wan`](Wan/), [`WanI2V`](WanI2V/), [`VaceWan`](VaceWan/), [`CogVideoX`](CogVideoX/), [`Cosmos-Predict2`](cosmos_predict2/) |
 
 
 ## Pretrained Models
@@ -26,6 +26,7 @@ The following networks load pretrained weights automatically from HuggingFace Hu
 | `Wan` | [`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B-Diffusers), [`Wan-AI/Wan2.1-T2V-14B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-T2V-14B-Diffusers) |
 | `WanI2V` | [`Wan-AI/Wan2.1-I2V-14B-480P-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-480P-Diffusers), [`Wan-AI/Wan2.1-I2V-14B-720P-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-I2V-14B-720P-Diffusers) |
 | `VaceWan` | [`Wan-AI/Wan2.1-VACE-1.3B-Diffusers`](https://huggingface.co/Wan-AI/Wan2.1-VACE-1.3B-Diffusers) |
+| `QwenImage` | [`Qwen/Qwen-Image`](https://huggingface.co/Qwen/Qwen-Image) |
 | `CogVideoX` | [`THUDM/CogVideoX-2b`](https://huggingface.co/THUDM/CogVideoX-2b), [`THUDM/CogVideoX-5b`](https://huggingface.co/THUDM/CogVideoX-5b) |
 
 Set `HF_HOME` for cache location, `LOCAL_FILES_ONLY=true` for offline use.
@@ -97,7 +98,7 @@ Defined in `noise_schedule.py`:
 |----------|-------------|----------|
 | `edm` | EDM sigma-based (t = σ) | EDM, EDM2 |
 | `sd` / `sdxl` | Stable Diffusion alphas | SD15, SDXL |
-| `rf` | Rectified Flow (α=1-t, σ=t) | Flux, WAN, Cosmos |
+| `rf` | Rectified Flow (α=1-t, σ=t) | Flux, QwenImage, WAN, Cosmos |
 | `cogvideox` | CogVideoX schedule | CogVideoX |
 | `trig` | Trigonometric (α=cos, σ=sin) | Consistency models |
 

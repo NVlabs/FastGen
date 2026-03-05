@@ -1209,19 +1209,23 @@ class CausalWan(CausalFastGenNetwork, Wan):
             torch.Tensor: The sample output.
         """
         assert self.schedule_type == "rf", f"{self.schedule_type} is not supported"
-        # Temporarily set to eval mode and revert back after generation
-        was_training = self.training
-        self.eval()
         # Ensure caches are clean at the start of sampling
         self.clear_caches()
 
-        x = noise
-        batch_size = x.shape[0]
-        num_frames = x.shape[2]
+        batch_size = noise.shape[0]
+        num_frames = noise.shape[2]
 
         num_chunks = num_frames // self.chunk_size
         remaining_size = num_frames % self.chunk_size
         time_rescale_factor = self.unipc_scheduler.config.num_train_timesteps
+
+        # Create initial latents
+        self.unipc_scheduler.config.flow_shift = shift
+        self.unipc_scheduler.set_timesteps(num_inference_steps=sample_steps, device=noise.device)
+        timesteps = self.unipc_scheduler.timesteps
+        t_init = timesteps[0] / time_rescale_factor
+        x = self.noise_scheduler.latents(noise=noise, t_init=t_init)
+
         for i in range(max(1, num_chunks)):
             if num_chunks == 0:
                 start, end = 0, remaining_size
@@ -1230,9 +1234,8 @@ class CausalWan(CausalFastGenNetwork, Wan):
                 end = self.chunk_size * (i + 1) + remaining_size
 
             x_next = x[:, :, start:end]
-            self.unipc_scheduler.config.flow_shift = shift
+            # Reset scheduler state (model_outputs, lower_order_nums, etc.)
             self.unipc_scheduler.set_timesteps(num_inference_steps=sample_steps, device=noise.device)
-            timesteps = self.unipc_scheduler.timesteps
             for timestep in tqdm(timesteps, total=sample_steps - 1):
                 t = (timestep / time_rescale_factor).expand(batch_size)
                 x_cur = x_next
@@ -1290,6 +1293,4 @@ class CausalWan(CausalFastGenNetwork, Wan):
 
         # cleanup caches after full sampling
         self.clear_caches()
-        # Revert to original mode
-        self.train(was_training)
         return x

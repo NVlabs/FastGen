@@ -6,7 +6,7 @@ FastGen uses a hierarchical Python-based configuration system built on [Hydra](h
 
 ```
 fastgen/configs/
-├── experiments/         # Experiment configs (cifar10, Wan, sdxl, etc.)
+├── experiments/         # Experiment configs (EDM, Flux, QwenImage, Wan, etc.)
 ├── methods/             # Method-specific configs (DMD2, CM, KD, SFT, etc.)
 ├── callbacks.py         # Callback configurations (EMA, WandB, GradClip, etc.)
 ├── config_utils.py      # Utilities (import, override, serialize configs)

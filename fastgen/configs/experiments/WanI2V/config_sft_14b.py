@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import fastgen.configs.methods.config_sft as config_sft_default
-from fastgen.configs.data import VideoLatentLoaderConfig
+from fastgen.configs.data import VideoLoaderConfig
 from fastgen.configs.net import Wan21_I2V_14B_480P_Config
 from fastgen.utils import LazyCall as L
 from fastgen.methods import SFTModel
@@ -25,13 +25,13 @@ def create_config():
     # VAE compress ratio for WAN: (1+T/4) * H / 8 * W / 8
     config.model.input_shape = [16, 21, 60, 104]  # cthw
     config.model.net = Wan21_I2V_14B_480P_Config
-    config.model.enable_preprocessors = False
 
     config.model.sample_t_cfg.time_dist_type = "uniform"
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
 
-    config.dataloader_train = VideoLatentLoaderConfig
+    # The loader needs to include the raw video since we need the first frame in pixel space
+    config.dataloader_train = VideoLoaderConfig
     config.dataloader_train.batch_size = 1
 
     # 480p (832x480) resolution

@@ -435,6 +435,12 @@ class Trainer:
                         data["first_frame_cond"] = model.net.vae.encode(first_frame_cond, mode="argmax")
                     else:
                         data["first_frame_cond"] = first_frame_cond
+                        if model.net.concat_mask:
+                            logger.debug(
+                                "Consider using a pixel-space dataloader: "
+                                "Current latent dataloader uses latent zeros for image condition "
+                                "while pretrained Wan2.1 I2V uses VAE-encoded zeros."
+                            )
 
                 if hasattr(model.net, "image_encoder"):
                     # Encode the first video frame with CLIP

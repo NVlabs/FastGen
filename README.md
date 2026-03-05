@@ -128,7 +128,7 @@ Detailed documentation is available in each component's README:
 | Component | Documentation | Description |
 |-----------|---------------|-------------|
 | **Methods** | [fastgen/methods/README.md](fastgen/methods/README.md) | Training methods (sCM, MeanFlow, DMD2, Self-Forcing, etc.) |
-| **Networks** | [fastgen/networks/README.md](fastgen/networks/README.md) | Network architectures (EDM, SD, SDXL, Flux, WAN, CogVideoX, Cosmos) and pretrained models |
+| **Networks** | [fastgen/networks/README.md](fastgen/networks/README.md) | Network architectures (EDM, SD, SDXL, Flux, Qwen-Image, WAN, CogVideoX, Cosmos) and pretrained models |
 | **Configs** | [fastgen/configs/README.md](fastgen/configs/README.md) | Configuration system, environment variables, and creating custom configs |
 | **Datasets** | [fastgen/datasets/README.md](fastgen/datasets/README.md) | Dataset preparation and WebDataset loaders |
 | **Callbacks** | [fastgen/callbacks/README.md](fastgen/callbacks/README.md) | Training callbacks (EMA, logging, gradient clipping, etc.) |
@@ -152,7 +152,7 @@ FastGen is designed to be **agnostic to the network and data** and you can add y
 
 | Data | Networks |
 |------|----------|
-| **Image** | EDM, EDM2, DiT, SD 1.5, SDXL, Flux |
+| **Image** | EDM, EDM2, DiT, SD 1.5, SDXL, Flux, Qwen-Image |
 | **Video** | WAN (T2V, I2V, VACE), CogVideoX, Cosmos Predict2 |
 
 See [fastgen/networks/README.md](fastgen/networks/README.md) for details. 
