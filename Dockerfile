@@ -67,7 +67,6 @@ RUN pip install wandb[media] \
     sentencepiece \
     "numpy<2.0.0" 
 RUN pip uninstall -y apex 
-RUN pip install --index-url=https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hwinf-mlwfo-pypi/simple --upgrade one-logger-utils
 
 WORKDIR /workspace
 
