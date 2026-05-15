@@ -85,6 +85,31 @@ DMD2 extended for causal video generation with autoregressive chunk-by-chunk pro
 
 ---
 
+## AnyFlow
+
+**File:** [`anyflow.py`](anyflow.py) | **Reference:** AnyFlow — any-step video diffusion framework on flow maps
+
+Single model that supports arbitrary inference NFE by learning a flow map `u_θ(x_t, t, r)` (average velocity from `t` back to `r`). Trained in two stages:
+
+1. **Pretrain** — flow-map prediction with a central-difference target that reuses the network's own forward at `(t ± δ, r)` to estimate `dF/dt`. Per-batch sampling assigns `r = t` to a `diffusion_ratio` fraction (recovering plain flow matching) and `r = 0` to a `consistency_ratio` fraction (forcing consistency to clean data).
+2. **On-policy** — distribution-matching distillation with `r = 0` conditioning on top of the pretrained flow-map weights. Inherits DMD2's alternating fake_score / discriminator / VSD machinery.
+
+**Key Parameters:**
+- `loss_config.training_stage`: `"pretrain"` or `"onpolicy"`
+- `loss_config.jvp_finite_diff_eps`: central-difference step δ (in noise scheduler t-units)
+- `loss_config.diffusion_ratio` / `loss_config.consistency_ratio`: per-batch fraction with `r=t` / `r=0`
+- `loss_config.weight_type`: `gaussian` | `beta08` | `uniform` per-timestep loss weight
+- `loss_config.shift`: flow-matching schedule shift (5.0 for Wan video)
+- See also key parameters of DMD2 above (used by the on-policy stage)
+
+**Backbone requirement:** the student network must accept a secondary timestep `r` (Wan with `r_timestep=True`).
+
+**Note:** the on-policy stage in this PR uses single-step student generation. Multi-step rollout-with-gradient (matching `self_forcing.py`'s `rollout_with_gradient`) is intentionally deferred to a follow-up PR.
+
+**Configs:** [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py)
+
+---
+
 ## Self-Forcing
 
 **File:** [`self_forcing.py`](self_forcing.py) | **Reference:** [Huang et al., 2025](https://arxiv.org/abs/2506.08009)
