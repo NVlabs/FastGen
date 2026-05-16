@@ -46,6 +46,45 @@ from fastgen.utils import expand_like
 import fastgen.utils.logging_utils as logger
 
 
+def remap_anyflow_keys(state_dict: dict) -> dict:
+    """Remap an AnyFlow HF release state_dict to FastGen's Wan layout.
+
+    AnyFlow's ``FAR_Wan_Transformer3DModel`` stores the r-pathway inside the
+    main ``condition_embedder`` as ``delta_embedder``, and uses ONE shared
+    ``time_proj`` for both t and (t, r). FastGen exposes a separate top-level
+    ``r_embedder`` with its own ``time_embedder`` + ``time_proj``. The two
+    layouts are functionally equivalent (FastGen's ``r_embedder.time_proj``
+    starts as a deepcopy of ``condition_embedder.time_proj`` per
+    :meth:`Wan.init_embedder`), so we just rename / duplicate the tensors.
+
+    The function is a no-op when no ``condition_embedder.delta_embedder.*``
+    keys are present, so it's safe to call unconditionally.
+    """
+    delta_keys = [k for k in state_dict if k.startswith("condition_embedder.delta_embedder.")]
+    if not delta_keys:
+        return state_dict
+    new_sd = dict(state_dict)
+    for k in delta_keys:
+        # condition_embedder.delta_embedder.linear_1.weight
+        #   -> r_embedder.time_embedder.linear_1.weight
+        new_k = k.replace("condition_embedder.delta_embedder.", "r_embedder.time_embedder.")
+        new_sd[new_k] = new_sd.pop(k)
+    # AnyFlow's gated fusion shares the final time_proj. FastGen has a
+    # separate r_embedder.time_proj that mathematically substitutes for the
+    # shared one when fusion="gated"; copy the weights across so the two
+    # projections start identical (and AnyFlow's training never diverges them).
+    for sub in ("weight", "bias"):
+        src = f"condition_embedder.time_proj.{sub}"
+        dst = f"r_embedder.time_proj.{sub}"
+        if src in new_sd and dst not in new_sd:
+            new_sd[dst] = new_sd[src].clone()
+    logger.info(
+        f"remap_anyflow_keys: rewrote {len(delta_keys)} delta_embedder tensors "
+        "and duplicated time_proj weights into r_embedder."
+    )
+    return new_sd
+
+
 if TYPE_CHECKING:
     from fastgen.configs.methods.config_anyflow import ModelConfig
 

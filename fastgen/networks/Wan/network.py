@@ -338,14 +338,27 @@ def classify_forward_prepare(
             r_timestep = r_timestep.to(time_embedder_dtype)
 
         remb = self.r_embedder.time_embedder(r_timestep).type_as(encoder_hidden_states)
-        r_timestep_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(remb))
-        r_timestep_proj = unflatten_timestep_proj(r_timestep_proj, rs_seq_len)
 
-        if self.encoder_depth is None:
-            timestep_proj = timestep_proj + r_timestep_proj
-            temb = temb + remb
+        # AnyFlow-style gated mixing: convex-combine t- and r-embeddings BEFORE
+        # the shared final projection, matching the WanTwoTimeTextImageEmbedding
+        # forward in the AnyFlow reference. The released AnyFlow HF checkpoints
+        # require this fusion to reproduce the published forward pass.
+        if getattr(self.r_embedder, "fusion_mode", "additive") == "gated":
+            gate = self.r_embedder.gate_value.to(remb.dtype)
+            rt_emb = (1 - gate) * temb + gate * remb
+            timestep_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(rt_emb))
+            timestep_proj = unflatten_timestep_proj(timestep_proj, rs_seq_len)
+            r_timestep_proj = None
+            temb = rt_emb
         else:
-            temb = remb
+            r_timestep_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(remb))
+            r_timestep_proj = unflatten_timestep_proj(r_timestep_proj, rs_seq_len)
+
+            if self.encoder_depth is None:
+                timestep_proj = timestep_proj + r_timestep_proj
+                temb = temb + remb
+            else:
+                temb = remb
     elif r_timestep is not None:
         # Raise an error here, otherwise we silently ignore the r_timestep
         raise ValueError("r_timestep provided but no r_embedder is present")
@@ -557,6 +570,8 @@ class Wan(FastGenNetwork):
         load_pretrained: bool = True,
         use_fsdp_checkpoint: bool = True,
         use_wan_official_sinusoidal: bool = False,
+        r_embedder_fusion: str = "additive",
+        r_embedder_gate_value: float = 0.25,
         **model_kwargs,
     ):
         """Wan2.1/2.2 model constructor.
@@ -610,6 +625,20 @@ class Wan(FastGenNetwork):
         if r_timestep:
             logger.info(f"Initializing r embedder with {r_embedder_init}")
             self.transformer.r_embedder = self.init_embedder(r_embedder_init)
+            # Stash fusion config on the r_embedder module so the (method-bound)
+            # forward override can branch on it without changing its signature.
+            if r_embedder_fusion not in ("additive", "gated"):
+                raise ValueError(f"r_embedder_fusion must be 'additive' or 'gated', got {r_embedder_fusion!r}")
+            self.transformer.r_embedder.fusion_mode = r_embedder_fusion
+            self.transformer.r_embedder.register_buffer(
+                "gate_value",
+                torch.tensor([float(r_embedder_gate_value)], dtype=torch.float32),
+                persistent=False,
+            )
+            logger.info(
+                f"r_embedder fusion={r_embedder_fusion}"
+                + (f" gate_value={r_embedder_gate_value}" if r_embedder_fusion == "gated" else "")
+            )
         else:
             self.transformer.r_embedder = None
 
