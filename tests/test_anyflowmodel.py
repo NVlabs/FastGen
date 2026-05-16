@@ -56,6 +56,10 @@ def _build_onpolicy_model():
     instance.precision = "float32" if instance.device == torch.device("cpu") else "bfloat16"
     instance.pretrained_model_path = ""
     instance.student_update_freq = 2
+    # Exercise the multi-step rollout-with-gradient path (matches the
+    # AnyFlow paper's on-policy training mode). student_sample_steps=2 is
+    # the smallest value that runs the rollout loop more than once.
+    instance.student_sample_steps = 2
     instance.input_shape = [3, 8, 8]
 
     model = AnyFlowModel(instance)
@@ -161,6 +165,28 @@ def test_onpolicy_fake_score_discriminator_update_step():
     assert "fake_score_loss" in loss_map
     assert "gan_loss_disc" in loss_map
     assert "gen_rand" in outputs
+
+
+def test_onpolicy_rollout_propagates_gradient():
+    """The multi-step rollout must allow gradient flow on the chosen step.
+
+    Mirrors AnyFlow's ``training_rollout`` (pipeline_wan_anyflow.py L370):
+    one randomly-chosen step in the rollout has gradients enabled; the
+    remaining steps are no_grad. ``gen_data.requires_grad`` should be True
+    at the rollout output so the DMD generator update has a valid gradient.
+    """
+    model = _build_onpolicy_model()
+    real = torch.randn(1, 3, 8, 8, device=model.device, dtype=model.precision)
+    cond = torch.nn.functional.one_hot(torch.tensor([0]), num_classes=10).to(model.device, model.precision)
+    # Exercise rollout under grad-enabled context (mirrors student update step).
+    gen = model._rollout_with_gradient(batch_size=real.shape[0], dtype=real.dtype, condition=cond)
+    assert tuple(gen.shape) == (1, 3, 8, 8), f"rollout output shape mismatch: {gen.shape}"
+    assert gen.requires_grad, "rollout output must keep autograd graph at the chosen step"
+    # Trivial scalar loss; backward should succeed without NaN.
+    loss = gen.float().pow(2).mean()
+    loss.backward()
+    grad_seen = any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.net.parameters())
+    assert grad_seen, "no gradient reached the student network through the rollout"
 
 
 def test_onpolicy_optimizer_step():

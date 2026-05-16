@@ -326,6 +326,77 @@ class AnyFlowModel(DMD2Model):
         ns = self.net.noise_scheduler
         return torch.full_like(t, float(ns.min_t))
 
+    def _sample_grad_step(self, num_steps: int) -> int:
+        """Pick one step index in ``[0, num_steps - 1]`` to enable gradients on.
+
+        Broadcast from rank 0 in distributed runs so all ranks agree on the
+        same window — matches AnyFlow's reference (`training_rollout` in
+        ``pipeline_wan_anyflow.py`` ``broadcast(sample_step, src=0)``).
+        """
+        idx = torch.randint(0, num_steps, (1,), device=self.device, dtype=torch.long)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(idx, src=0)
+        return int(idx.item())
+
+    def _rollout_with_gradient(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        condition: Optional[Any],
+    ) -> torch.Tensor:
+        """Multi-step student rollout from pure noise with one gradient-enabled step.
+
+        Mirrors AnyFlow's ``WanAnyFlowPipeline.training_rollout`` (see
+        ``pipeline_wan_anyflow.py`` lines 370--454). Starts from
+        :math:`x_T \\sim \\mathcal{N}(0, \\sigma_{\\max}^2)`, runs
+        :attr:`student_sample_steps` Euler-flow steps with ``r = t_next``
+        (mean-velocity sampling, matching AnyFlow's ``use_mean_velocity=True``
+        default), and enables gradients at one randomly-chosen step index so
+        the DMD generator update receives a usable gradient through one full
+        denoising forward.
+        """
+        num_steps = int(self.config.student_sample_steps)
+        if num_steps < 1:
+            raise ValueError(f"student_sample_steps must be >=1, got {num_steps}")
+
+        ns = self.net.noise_scheduler
+        grad_step = self._sample_grad_step(num_steps)
+
+        # Initial latents at the maximum-noise timestep.
+        eps_init = torch.randn(batch_size, *self.input_shape, device=self.device, dtype=dtype)
+        x = ns.latents(noise=eps_init)
+
+        # Timestep schedule. Use config-provided t_list when set (matches
+        # AnyFlow's hand-tuned step lists, e.g. [0.999, 0.937, 0.833, 0.624, 0.0]
+        # for 4-step Wan); otherwise fall back to the scheduler's default.
+        if self.config.sample_t_cfg.t_list is not None:
+            t_list = torch.tensor(self.config.sample_t_cfg.t_list, device=self.device, dtype=ns.t_precision)
+            if len(t_list) != num_steps + 1:
+                raise ValueError(
+                    f"sample_t_cfg.t_list has {len(t_list)} entries, "
+                    f"expected {num_steps + 1} for student_sample_steps={num_steps}"
+                )
+        else:
+            t_list = ns.get_t_list(sample_steps=num_steps, device=self.device)
+
+        for step in range(num_steps):
+            t_cur = t_list[step].expand(batch_size).to(ns.t_precision)
+            t_next = t_list[step + 1].expand(batch_size).to(ns.t_precision)
+
+            enable_grad = (step == grad_step) and torch.is_grad_enabled()
+            with torch.set_grad_enabled(enable_grad):
+                # Mean-velocity flow prediction: u_theta(x_t, t, r=t_next)
+                flow_pred = self.net(x, t_cur, r=t_next, condition=condition, fwd_pred_type="flow")
+
+            # Euler-flow step. Keep ``x`` attached to the autograd graph
+            # unconditionally: steps run inside ``torch.no_grad()`` do not add
+            # graph nodes anyway, but detaching would also strip the gradient
+            # that earlier grad-enabled step(s) installed onto ``x``.
+            delta_t = (t_cur - t_next).view(batch_size, *([1] * (x.ndim - 1))).to(x.dtype)
+            x = x - delta_t * flow_pred
+
+        return x
+
     def _onpolicy_student_update_step(
         self,
         input_student: torch.Tensor,
@@ -336,11 +407,16 @@ class AnyFlowModel(DMD2Model):
         condition: Optional[Any],
         neg_condition: Optional[Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        r_zero = self._zeros_like_t(t_student)
         r_zero_t = self._zeros_like_t(t)
+        del input_student, t_student  # unused — rollout starts from fresh pure noise
 
-        # Student rollout to a single x0 estimate, conditioned on r=0.
-        gen_data = self.net(input_student, t_student, r=r_zero, condition=condition, fwd_pred_type="x0")
+        # Multi-step rollout-with-gradient from pure noise; gradient is enabled
+        # at one randomly-chosen step matching AnyFlow's training_rollout.
+        gen_data = self._rollout_with_gradient(
+            batch_size=data["real"].shape[0],
+            dtype=data["real"].dtype,
+            condition=condition,
+        )
         perturbed_data = self.net.noise_scheduler.forward_process(gen_data, eps, t)
 
         with torch.no_grad():
@@ -383,7 +459,7 @@ class AnyFlowModel(DMD2Model):
             "vsd_loss": vsd_loss,
             "gan_loss_gen": gan_loss_gen,
         }
-        outputs = self._get_outputs(gen_data, input_student, condition=condition)
+        outputs = self._get_outputs(gen_data, condition=condition)
         return loss_map, outputs
 
     def _onpolicy_fake_score_discriminator_update_step(
@@ -395,11 +471,16 @@ class AnyFlowModel(DMD2Model):
         real_data: torch.Tensor,
         condition: Optional[Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        r_zero = self._zeros_like_t(t_student)
         r_zero_t = self._zeros_like_t(t)
+        del input_student, t_student  # unused in rollout path
 
+        # Generate via the same multi-step rollout (no gradient needed on the
+        # fake-score / discriminator update step — caller wraps the whole
+        # update in no_grad effectively by detaching everything below).
         with torch.no_grad():
-            gen_data = self.net(input_student, t_student, r=r_zero, condition=condition, fwd_pred_type="x0")
+            gen_data = self._rollout_with_gradient(
+                batch_size=real_data.shape[0], dtype=real_data.dtype, condition=condition
+            )
             x_t_sg = self.net.noise_scheduler.forward_process(gen_data, eps, t)
 
         from fastgen.methods.common_loss import (
@@ -480,7 +561,7 @@ class AnyFlowModel(DMD2Model):
         }
         if self.config.gan_loss_weight_gen > 0 and self.config.gan_r1_reg_weight > 0:
             loss_map["gan_loss_ar1"] = gan_loss_ar1
-        outputs = self._get_outputs(gen_data, input_student, condition=condition)
+        outputs = self._get_outputs(gen_data, condition=condition)
         return loss_map, outputs
 
     def _onpolicy_single_train_step(
@@ -515,14 +596,9 @@ class AnyFlowModel(DMD2Model):
             noise = input_student / (ns.max_sigma if hasattr(ns, "max_sigma") else 1.0)
             return {"gen_rand": gen_data, "input_rand": noise}
 
-        # On-policy stage delegates to DMD2's get_outputs path so multi-step
-        # generators are produced consistently with the rest of the family.
-        if self.config.student_sample_steps == 1:
-            assert input_student is not None, "input_student must be provided"
-            ns = self.net.noise_scheduler
-            noise = input_student / (ns.max_sigma if hasattr(ns, "max_sigma") else 1.0)
-            return {"gen_rand": gen_data, "input_rand": noise}
-
+        # On-policy stage: gen_data already comes from the multi-step
+        # rollout (`_rollout_with_gradient`), so a fresh noise sample is
+        # sufficient for the validation generator hook.
         noise = torch.randn_like(gen_data, dtype=self.precision)
         gen_rand_func = partial(
             self.generator_fn,
