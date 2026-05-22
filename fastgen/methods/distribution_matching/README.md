@@ -102,11 +102,13 @@ Single model that supports arbitrary inference NFE by learning a flow map `u_θ(
 - `loss_config.shift`: flow-matching schedule shift (5.0 for Wan video)
 - See also key parameters of DMD2 above (used by the on-policy stage)
 
-**Backbone requirement:** the student network must accept a secondary timestep `r` (Wan with `r_timestep=True`).
+**Backbone requirement:** the student network must accept a secondary timestep `r` (Wan with `r_timestep=True`). When loading the published AnyFlow HF checkpoints, set `r_embedder_fusion="gated"` on the Wan constructor — this routes the t/r mix through `Wan/network.py::_fuse_r_embedding`'s gated branch (shared with MeanFlow's additive default) so the released weights reproduce bit-for-bit.
 
-**Note:** the on-policy stage in this PR uses single-step student generation. Multi-step rollout-with-gradient (matching `self_forcing.py`'s `rollout_with_gradient`) is intentionally deferred to a follow-up PR.
+**Note:** correctness of the port is established via forward-parity and single-step training-step parity against the AnyFlow reference (see PR #25 discussion). End-to-end convergence-scale validation on the paper's training corpus is deferred to a follow-up.
 
-**Configs:** [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py)
+**Configs:**
+- [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py) — Stage 2 pretrain (6k iter, lr=5e-5, shift=5, beta08, paper-aligned)
+- [`WanT2V/config_anyflow_onpolicy.py`](../../configs/experiments/WanT2V/config_anyflow_onpolicy.py) — Stage 3 on-policy distillation (1.2k iter, lr=2e-6, GAN on; full-rank fine-tune of a Stage 2 pretrain ckpt — the paper's rank-256 LoRA variant awaits a PEFT path in FastGen)
 
 ---
 

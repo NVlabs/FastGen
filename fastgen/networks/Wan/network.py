@@ -274,6 +274,49 @@ def classify_forward(
     return out
 
 
+def _fuse_r_embedding(
+    self,
+    temb: torch.Tensor,
+    timestep_proj: torch.Tensor,
+    remb: torch.Tensor,
+    rs_seq_len: Optional[torch.LongTensor],
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Combine the t- and r-time embeddings into the final timestep projection.
+
+    Two fusion modes share the same ``r_embedder.time_proj`` / ``act_fn`` modules:
+
+    * ``additive`` (MeanFlow default, ``r_embedder.fusion_mode`` absent or "additive"):
+      ``r_timestep_proj = time_proj(act_fn(remb))`` is added to ``timestep_proj``
+      and ``remb`` is added to ``temb``. T2V dual-stream variants (``encoder_depth``
+      set) instead replace ``temb`` with ``remb`` and leave ``timestep_proj`` alone.
+
+    * ``gated`` (AnyFlow, opt-in): convex-combine the two embeddings *before* the
+      shared projection — ``rt_emb = (1-g)·temb + g·remb`` then
+      ``timestep_proj = time_proj(act_fn(rt_emb))``. This matches the
+      ``WanTwoTimeTextImageEmbedding.forward_timestep`` path in the AnyFlow
+      reference and is required to reproduce the published HF checkpoint
+      forward bit-for-bit.
+
+    Returns ``(temb, timestep_proj, r_timestep_proj)`` where ``r_timestep_proj``
+    is ``None`` in the gated branch (the t/r mix is folded into ``timestep_proj``
+    itself).
+    """
+    fusion = getattr(self.r_embedder, "fusion_mode", "additive")
+
+    if fusion == "gated":
+        gate = self.r_embedder.gate_value.to(remb.dtype)
+        rt_emb = (1 - gate) * temb + gate * remb
+        ts_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(rt_emb))
+        return rt_emb, unflatten_timestep_proj(ts_proj, rs_seq_len), None
+
+    # additive — MeanFlow original path, bit-identical
+    r_ts_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(remb))
+    r_ts_proj = unflatten_timestep_proj(r_ts_proj, rs_seq_len)
+    if self.encoder_depth is None:
+        return temb + remb, timestep_proj + r_ts_proj, r_ts_proj
+    return remb, timestep_proj, r_ts_proj
+
+
 def classify_forward_prepare(
     self,
     hidden_states: torch.Tensor,
@@ -339,26 +382,9 @@ def classify_forward_prepare(
 
         remb = self.r_embedder.time_embedder(r_timestep).type_as(encoder_hidden_states)
 
-        # AnyFlow-style gated mixing: convex-combine t- and r-embeddings BEFORE
-        # the shared final projection, matching the WanTwoTimeTextImageEmbedding
-        # forward in the AnyFlow reference. The released AnyFlow HF checkpoints
-        # require this fusion to reproduce the published forward pass.
-        if getattr(self.r_embedder, "fusion_mode", "additive") == "gated":
-            gate = self.r_embedder.gate_value.to(remb.dtype)
-            rt_emb = (1 - gate) * temb + gate * remb
-            timestep_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(rt_emb))
-            timestep_proj = unflatten_timestep_proj(timestep_proj, rs_seq_len)
-            r_timestep_proj = None
-            temb = rt_emb
-        else:
-            r_timestep_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(remb))
-            r_timestep_proj = unflatten_timestep_proj(r_timestep_proj, rs_seq_len)
-
-            if self.encoder_depth is None:
-                timestep_proj = timestep_proj + r_timestep_proj
-                temb = temb + remb
-            else:
-                temb = remb
+        temb, timestep_proj, r_timestep_proj = self._fuse_r_embedding(
+            temb, timestep_proj, remb, rs_seq_len
+        )
     elif r_timestep is not None:
         # Raise an error here, otherwise we silently ignore the r_timestep
         raise ValueError("r_timestep provided but no r_embedder is present")
@@ -861,6 +887,7 @@ class Wan(FastGenNetwork):
         # Override transformer forward methods with custom implementations
         for block in self.transformer.blocks:
             block.forward = types.MethodType(block_forward, block)
+        self.transformer._fuse_r_embedding = types.MethodType(_fuse_r_embedding, self.transformer)
         self.transformer.classify_forward_prepare = types.MethodType(classify_forward_prepare, self.transformer)
         self.transformer.classify_forward_block_forward = types.MethodType(
             classify_forward_block_forward, self.transformer
