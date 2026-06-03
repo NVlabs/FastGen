@@ -1,0 +1,105 @@
+name: FastGen CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  WANDB_MODE: disabled
+
+jobs:
+  lint:
+    runs-on: [self-hosted, FG_Runner]
+    
+    container:
+      # Pointing to the new GitHub Container Registry image
+      image: ghcr.io/juliusberner/fastgen:0.0.3c
+      options: --entrypoint ""
+      # Automatic authentication using GitHub's built-in token
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore/Save Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/pip
+            .mypy_cache
+          key: ${{ runner.os }}-pip-mypy-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-pip-mypy-
+
+      - name: Install linters
+        run: make install-linters
+
+      - name: Run lint
+        run: make lint
+
+      - name: Run mypy
+        run: make mypy
+
+  test:
+    needs: lint
+    runs-on: [self-hosted, FG_Runner]
+    
+    container:
+      image: ghcr.io/juliusberner/fastgen:0.0.3c
+      options: --entrypoint ""
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore/Save Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/pip
+            .mypy_cache
+          key: ${{ runner.os }}-pip-mypy-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-pip-mypy-
+
+      - name: Increase file descriptor limit
+        run: ulimit -n 4096 || echo "Could not increase file descriptor limit"
+
+      - name: Run Pytest
+        run: make pytest
+
+  install_fastgen_package:
+    needs: test
+    runs-on: [self-hosted, FG_Runner] 
+    
+    container:
+      image: ghcr.io/juliusberner/fastgen:0.0.3c
+      options: --entrypoint ""
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore/Save Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/pip
+            .mypy_cache
+          key: ${{ runner.os }}-pip-mypy-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-pip-mypy-
+
+      - name: Install fastgen
+        run: make install-fastgen
