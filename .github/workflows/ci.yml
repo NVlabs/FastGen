@@ -16,7 +16,7 @@ jobs:
     container:
       # Pointing to the new GitHub Container Registry image
       image: ghcr.io/juliusberner/fastgen:0.0.3c
-      options: --entrypoint ""
+      options: --entrypoint "" --gpus all --shm-size=8g
       # Automatic authentication using GitHub's built-in token
       credentials:
         username: ${{ github.actor }}
@@ -51,7 +51,7 @@ jobs:
     
     container:
       image: ghcr.io/juliusberner/fastgen:0.0.3c
-      options: --entrypoint ""
+      options: --entrypoint "" --gpus all --shm-size=8g
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -82,7 +82,7 @@ jobs:
     
     container:
       image: ghcr.io/juliusberner/fastgen:0.0.3c
-      options: --entrypoint ""
+      options: --entrypoint "" --gpus all --shm-size=8g
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
