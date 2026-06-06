@@ -482,8 +482,8 @@ def test_network_flux():
     # Try to instantiate Flux model - skip if not accessible (gated model)
     try:
         teacher = instantiate(teacher_config)
-    except OSError as e:
-        if "not a valid model identifier" in str(e) or "token" in str(e):
+    except Exception as e:
+        if "not a valid model identifier" in str(e) or "token" in str(e).lower() or "gated" in str(e).lower():
             pytest.skip(f"Test skipped: Flux model not accessible (requires HuggingFace authentication): {e}")
         raise
     teacher.init_preprocessors()

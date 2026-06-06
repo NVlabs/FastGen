@@ -819,10 +819,8 @@ def test_fsdp_flux():
             "black-forest-labs/FLUX.1-dev",
             subfolder="transformer",
         )
-    except (HTTPError, OSError) as e:
-        err_msg = str(e).lower()
-        access_markers = ("not a valid model identifier", "token", "gated", "401", "403", "unauthorized", "restricted")
-        if any(marker in err_msg for marker in access_markers):
+    except Exception as e:
+        if "not a valid model identifier" in str(e) or "token" in str(e).lower() or "gated" in str(e).lower():
             pytest.skip(f"Test skipped: Flux model not accessible (requires HuggingFace authentication): {e}")
         raise
 
