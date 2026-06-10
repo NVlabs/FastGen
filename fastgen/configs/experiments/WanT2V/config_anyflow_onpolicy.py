@@ -74,7 +74,10 @@ def create_config():
     config.model.sample_t_cfg.t_list = None  # rollout schedules are computed per NFE
 
     # ------ co-trained Stage-2 flow-map loss (reference cotrain_forward_kl) ------
-    config.model.cotrain_pretrain_weight = 1.0
+    # FastGen's VSD loss carries a 0.5 factor the reference's DMD loss does
+    # not; 0.5 here keeps the DMD : flow-map gradient ratio at the
+    # reference's 1 : 1 (the common 0.5 scale is absorbed by Adam).
+    config.model.cotrain_pretrain_weight = 0.5
     config.model.loss_config.use_cd = False
     config.model.loss_config.loss_type = "l2"
     config.model.loss_config.weight_type = "beta08"
