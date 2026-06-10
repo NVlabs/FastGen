@@ -295,19 +295,23 @@ def _fuse_r_embedding(
       ``timestep_proj = time_proj(act_fn(rt_emb))``. This matches the
       ``WanTwoTimeTextImageEmbedding.forward_timestep`` path in the AnyFlow
       reference and is required to reproduce the published HF checkpoint
-      forward bit-for-bit.
+      forward bit-for-bit. With ``encoder_depth`` set, the first
+      ``encoder_depth`` blocks keep the t-only ``timestep_proj`` and the
+      remaining blocks switch to the gated projection (mirroring additive).
 
     Returns ``(temb, timestep_proj, r_timestep_proj)`` where ``r_timestep_proj``
-    is ``None`` in the gated branch (the t/r mix is folded into ``timestep_proj``
-    itself).
+    is ``None`` when the r-information is already folded into ``timestep_proj``.
     """
     fusion = getattr(self.r_embedder, "fusion_mode", "additive")
 
     if fusion == "gated":
-        gate = self.r_embedder.gate_value.to(remb.dtype)
+        gate = self.r_embedder.gate_value
         rt_emb = (1 - gate) * temb + gate * remb
-        ts_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(rt_emb))
-        return rt_emb, unflatten_timestep_proj(ts_proj, rs_seq_len), None
+        rt_ts_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(rt_emb))
+        rt_ts_proj = unflatten_timestep_proj(rt_ts_proj, rs_seq_len)
+        if self.encoder_depth is None:
+            return rt_emb, rt_ts_proj, None
+        return rt_emb, timestep_proj, rt_ts_proj
 
     # additive — MeanFlow original path, bit-identical
     r_ts_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(remb))
@@ -460,6 +464,50 @@ def classify_forward_block_forward(
             return hidden_states, features
 
     return hidden_states, features
+
+
+def remap_anyflow_keys(state_dict: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Remap an AnyFlow HF release state_dict to FastGen's Wan layout.
+
+    AnyFlow's ``FAR_Wan_Transformer3DModel`` stores the r-pathway inside the
+    main ``condition_embedder`` as ``delta_embedder``, and uses ONE shared
+    ``time_proj`` for both t and (t, r). FastGen exposes a separate top-level
+    ``r_embedder`` with its own ``time_embedder`` + ``time_proj``. The two
+    layouts are functionally equivalent (FastGen's ``r_embedder.time_proj``
+    starts as a deepcopy of ``condition_embedder.time_proj`` per
+    :meth:`Wan.init_embedder`), so we just rename / duplicate the tensors.
+
+    The function is a no-op when no ``condition_embedder.delta_embedder.*``
+    keys are present, so it's safe to call unconditionally. Keys with or
+    without the ``transformer.`` module prefix are both handled.
+    """
+    delta_marker = "condition_embedder.delta_embedder."
+    delta_keys = [k for k in state_dict if delta_marker in k]
+    if not delta_keys:
+        return state_dict
+
+    new_sd = dict(state_dict)
+    prefixes = set()
+    for k in delta_keys:
+        # [transformer.]condition_embedder.delta_embedder.linear_1.weight
+        #   -> [transformer.]r_embedder.time_embedder.linear_1.weight
+        prefix, _, suffix = k.partition(delta_marker)
+        prefixes.add(prefix)
+        new_sd[f"{prefix}r_embedder.time_embedder.{suffix}"] = new_sd.pop(k)
+    # AnyFlow's gated fusion shares the final time_proj. FastGen has a
+    # separate r_embedder.time_proj that substitutes for the shared one when
+    # fusion="gated"; copy the weights so the two projections start identical.
+    for prefix in prefixes:
+        for sub in ("weight", "bias"):
+            src = f"{prefix}condition_embedder.time_proj.{sub}"
+            dst = f"{prefix}r_embedder.time_proj.{sub}"
+            if src in new_sd and dst not in new_sd:
+                new_sd[dst] = new_sd[src].clone()
+    logger.info(
+        f"remap_anyflow_keys: rewrote {len(delta_keys)} delta_embedder tensors "
+        "and duplicated time_proj weights into r_embedder."
+    )
+    return new_sd
 
 
 class WanTextEncoder:
@@ -656,11 +704,9 @@ class Wan(FastGenNetwork):
             if r_embedder_fusion not in ("additive", "gated"):
                 raise ValueError(f"r_embedder_fusion must be 'additive' or 'gated', got {r_embedder_fusion!r}")
             self.transformer.r_embedder.fusion_mode = r_embedder_fusion
-            self.transformer.r_embedder.register_buffer(
-                "gate_value",
-                torch.tensor([float(r_embedder_gate_value)], dtype=torch.float32),
-                persistent=False,
-            )
+            # Plain float (not a buffer) so FSDP's reset_parameters does not
+            # need to re-materialize it after meta-device init.
+            self.transformer.r_embedder.gate_value = float(r_embedder_gate_value)
             logger.info(
                 f"r_embedder fusion={r_embedder_fusion}"
                 + (f" gate_value={r_embedder_gate_value}" if r_embedder_fusion == "gated" else "")
@@ -1124,6 +1170,10 @@ class Wan(FastGenNetwork):
                 new_state[new_k] = v
             state_dict = new_state
 
+        # AnyFlow HF releases store the r-pathway as condition_embedder.delta_embedder;
+        # remap to FastGen's r_embedder layout (no-op for all other checkpoints).
+        state_dict = remap_anyflow_keys(state_dict)
+
         return super().load_state_dict(state_dict, **kwargs)
 
     def forward(
@@ -1173,6 +1223,16 @@ class Wan(FastGenNetwork):
             assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
 
         condition = torch.stack(condition, dim=0) if isinstance(condition, list) else condition
+
+        # A gated-fusion flow-map network always consumes the r-pathway (the
+        # fusion happens inside the shared time projection), so r=None has no
+        # in-distribution meaning for it. Default to r=t, i.e. the
+        # instantaneous velocity u(x_t, t, t) — this is how the AnyFlow
+        # reference queries its real/fake score models. Additive-fusion
+        # (MeanFlow) networks keep the skip-r-pathway behavior.
+        if r is None and getattr(self.transformer.r_embedder, "fusion_mode", None) == "gated":
+            r = t
+
         timestep_mask = torch.ones_like(x_t[:, 0])  # shape: [batch_size, num_latent_frames, H, W]
         timestep = self._compute_timestep_inputs(t, timestep_mask)
         r_timestep = None if r is None else self._compute_timestep_inputs(r, timestep_mask)

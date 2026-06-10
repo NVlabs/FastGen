@@ -68,6 +68,10 @@ class MeanFlowModel(CMModel):
             self.precision_amp_jvp = basic_utils.PRECISION_MAP[self.config.precision_amp_jvp]
             logger.critical(f"Using precision {self.precision_amp_jvp} for JVP")
 
+        # Normalization constant for the fixed per-timestep loss weighting
+        # (computed lazily on first use, see _get_timestep_weight).
+        self._timestep_weight_scale: Optional[float] = None
+
     def _mix_condition(
         self,
         condition: Any,
@@ -251,6 +255,34 @@ class MeanFlowModel(CMModel):
 
         return u_theta_jvp
 
+    def _timestep_weight_raw(self, t: torch.Tensor) -> torch.Tensor:
+        """Unnormalized per-timestep weight as a direct function of t in [0, 1]."""
+        weight_type = self.loss_config.weight_type
+        if weight_type == "beta08":
+            return t * (1 - t).clamp(min=0).sqrt()
+        if weight_type == "gaussian":
+            # exp(-2 (t - 1/2)^2), shifted so the minimum over [0, 1] is zero.
+            return (torch.exp(-2 * (t - 0.5) ** 2) - float(torch.exp(torch.tensor(-0.5)))).clamp(min=0)
+        if weight_type == "uniform":
+            return torch.ones_like(t)
+        raise ValueError(f"Invalid weight_type: {weight_type!r}")
+
+    @torch.no_grad()
+    def _get_timestep_weight(self, t: torch.Tensor) -> torch.Tensor:
+        """Fixed per-timestep loss weight w(t) (AnyFlow-style).
+
+        The weight is evaluated directly as a function of t. The normalization
+        constant matches the AnyFlow reference scheduler, which normalizes the
+        weights over its shifted discrete timestep grid; we compute the same
+        constant once and cache it.
+        """
+        if self._timestep_weight_scale is None:
+            shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type == "shifted" else 1.0
+            grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)
+            grid = shift * grid / (1 + (shift - 1) * grid)
+            self._timestep_weight_scale = float(1000.0 / self._timestep_weight_raw(grid).sum())
+        return self._timestep_weight_raw(t) * self._timestep_weight_scale
+
     @torch.no_grad()
     def _compute_weight(self, tensor: torch.Tensor) -> torch.Tensor:
         norm_method, *norm_args = self.loss_config.norm_method.split("_")
@@ -306,9 +338,15 @@ class MeanFlowModel(CMModel):
         if self.loss_config.loss_type == "l2":
             tangent = dxt_dt - warmup_weight * delta_t * u_theta_jvp
             loss = (u_theta - tangent).pow(2)
-            loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
-            weight = self._compute_weight(loss)
-            loss = loss * weight
+            if self.loss_config.weight_type is not None:
+                # Fixed per-timestep weighting with mean reduction (AnyFlow).
+                loss = torch.mean(loss, dim=list(range(1, loss.ndim)))
+                weight = self._get_timestep_weight(t)
+                loss = loss * weight
+            else:
+                loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
+                weight = self._compute_weight(loss)
+                loss = loss * weight
 
         # use explicit gradient
         elif self.loss_config.loss_type == "opt_grad":
@@ -467,6 +505,14 @@ class MeanFlowModel(CMModel):
         flow_matching_size = (torch.rand(batch_size, device=self.device) >= self.sample_t_cfg.r_sample_ratio).sum()
         zero_mask = torch.arange(batch_size, device=self.device) < flow_matching_size
         r = torch.where(zero_mask, t, r)
+
+        # set r=min_t (consistency-to-clean, AnyFlow) for a subset of the batch.
+        # Taken from the tail so it never overlaps the flow-matching head.
+        if self.sample_t_cfg.consistency_ratio > 0:
+            num_consistency = (torch.rand(batch_size, device=self.device) < self.sample_t_cfg.consistency_ratio).sum()
+            num_consistency = torch.minimum(num_consistency, batch_size - flow_matching_size)
+            consistency_mask = torch.arange(batch_size, device=self.device) >= batch_size - num_consistency
+            r = torch.where(consistency_mask, torch.full_like(r, self.net.noise_scheduler.min_t), r)
 
         (
             mf_loss,

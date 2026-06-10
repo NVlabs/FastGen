@@ -924,6 +924,12 @@ class EDMPrecond(FastGenNetwork):
             else condition.reshape(-1, self.label_dim)
         )
 
+        # A dual-timestep network always consumes the r-pathway (the embedding
+        # widths are sized for it), so r=None is not a valid input for it.
+        # Default to r=t, i.e. the instantaneous velocity u(x_t, t, t).
+        if r is None and getattr(self.model, "r_timestep", None) is not None:
+            r = t
+
         # Preconditioning weights for input
         x_t_in, t_in = x_t, t
         if self.drop_precond not in ["input", "both"]:

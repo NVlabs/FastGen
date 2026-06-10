@@ -36,6 +36,10 @@ class SampleTConfig(BaseSampleTConfig):
     # ratio for randomly sampling r
     r_sample_ratio: float = 0.0
 
+    # fraction of the batch forced to r = min_t (consistency-to-clean,
+    # used by AnyFlow; 0.0 keeps the original MeanFlow behavior)
+    consistency_ratio: float = 0.0
+
 
 @attrs.define(slots=False)
 class SampleRConfig(BaseSampleTConfig):
@@ -71,6 +75,10 @@ class LossConfig:
     tangent_spatial_invariance: bool = False
     # loss type (choice between l2 and opt_grad)
     loss_type: str = "opt_grad"
+    # fixed per-timestep loss weighting evaluated as a function of t
+    # ("beta08", "gaussian", "uniform"; used by AnyFlow). None keeps the
+    # adaptive norm_method weighting above. Only applies to loss_type="l2".
+    weight_type: Optional[str] = None
 
 
 @attrs.define(slots=False)

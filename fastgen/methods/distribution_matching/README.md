@@ -91,18 +91,20 @@ DMD2 extended for causal video generation with autoregressive chunk-by-chunk pro
 
 Single model that supports arbitrary inference NFE by learning a flow map `u_θ(x_t, t, r)` (average velocity from `t` back to `r`). Trained in two stages:
 
-1. **Pretrain** — flow-map prediction with a central-difference target that reuses the network's own forward at `(t ± δ, r)` to estimate `dF/dt`. Per-batch sampling assigns `r = t` to a `diffusion_ratio` fraction (recovering plain flow matching) and `r = 0` to a `consistency_ratio` fraction (forcing consistency to clean data).
-2. **On-policy** — distribution-matching distillation with `r = 0` conditioning on top of the pretrained flow-map weights. Inherits DMD2's alternating fake_score / discriminator / VSD machinery.
+1. **Pretrain** — the MeanFlow objective with AnyFlow's hyperparameters, run directly on [`MeanFlowModel`](../consistency_model/mean_flow.py): finite-difference JVP, a fixed `beta08` per-timestep loss weight (`loss_config.weight_type`), shifted timestep sampling, and a `sample_t_cfg.consistency_ratio` fraction of the batch pinned to `r = min_t`. There is no AnyFlow-specific pretrain code.
+2. **On-policy** — distribution-matching distillation on top of the pretrained flow-map weights ([`anyflow.py`](anyflow.py)). Stock DMD2 with two overrides: the student generates via a multi-step Euler-flow rollout from pure noise with gradient enabled at one randomly-chosen step (`gen_data_from_net`), and always starts from `max_t` (`_generate_noise_and_time`). The teacher / fake_score are flow-map networks queried at the instantaneous velocity `r = t` (the network-level default for gated-fusion Wan when `r` is not passed).
 
-**Key Parameters:**
-- `loss_config.training_stage`: `"pretrain"` or `"onpolicy"`
-- `loss_config.jvp_finite_diff_eps`: central-difference step δ (in noise scheduler t-units)
-- `loss_config.diffusion_ratio` / `loss_config.consistency_ratio`: per-batch fraction with `r=t` / `r=0`
-- `loss_config.weight_type`: `gaussian` | `beta08` | `uniform` per-timestep loss weight
-- `loss_config.shift`: flow-matching schedule shift (5.0 for Wan video)
-- See also key parameters of DMD2 above (used by the on-policy stage)
+**Key Parameters (on-policy):**
+- `student_sample_steps` / `sample_t_cfg.t_list`: rollout length and hand-tuned step schedule
+- See also key parameters of DMD2 above
 
-**Backbone requirement:** the student network must accept a secondary timestep `r` (Wan with `r_timestep=True`). When loading the published AnyFlow HF checkpoints, set `r_embedder_fusion="gated"` on the Wan constructor — this routes the t/r mix through `Wan/network.py::_fuse_r_embedding`'s gated branch (shared with MeanFlow's additive default) so the released weights reproduce bit-for-bit.
+**Key Parameters (pretrain, on MeanFlow):**
+- `loss_config.weight_type`: `beta08` | `gaussian` | `uniform` fixed per-timestep loss weight
+- `loss_config.use_jvp_finite_diff` / `loss_config.jvp_finite_diff_eps`: central-difference step δ
+- `sample_t_cfg.r_sample_ratio` / `sample_t_cfg.consistency_ratio`: per-batch fraction with sampled `r` / `r = min_t`
+- `sample_t_cfg.time_dist_type="shifted"`, `sample_t_cfg.shift`: shifted timestep sampling (5.0 for Wan video)
+
+**Backbone requirement:** the student network must accept a secondary timestep `r` (Wan with `r_timestep=True`). When loading the published AnyFlow HF checkpoints, set `r_embedder_fusion="gated"` and `time_cond_type="abs"` on the Wan constructor — this routes the t/r mix through `Wan/network.py::_fuse_r_embedding`'s gated branch (shared with MeanFlow's additive default) so the released weights reproduce bit-for-bit. `Wan.load_state_dict` remaps the AnyFlow checkpoint layout (`condition_embedder.delta_embedder.*`) automatically.
 
 **Note:** correctness of the port is established via forward-parity and single-step training-step parity against the AnyFlow reference (see PR #25 discussion). End-to-end convergence-scale validation on the paper's training corpus is deferred to a follow-up.
 
