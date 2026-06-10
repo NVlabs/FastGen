@@ -104,6 +104,25 @@ class MeanFlowModel(CMModel):
 
         return condition, dxt_dt
 
+    def _drop_condition(self, condition: Any, neg_condition: Any) -> Any:
+        """Replace the condition with neg_condition for a random per-sample subset.
+
+        Plain text dropout (used by the prediction-side guidance fusion); the
+        dropped samples then train the unconditional pathway.
+        """
+        if self.config.cond_dropout_prob is None or neg_condition is None:
+            return condition
+        ref = neg_condition if isinstance(neg_condition, torch.Tensor) else next(iter(neg_condition.values()))
+        keep = torch.rand(ref.shape[0], device=ref.device) >= self.config.cond_dropout_prob
+        if isinstance(condition, torch.Tensor):
+            return torch.where(expand_like(keep, condition), condition, neg_condition)
+        if isinstance(condition, dict):
+            condition = condition.copy()
+            for k in condition.keys() - set(self.config.cond_keys_no_dropout):
+                condition[k] = torch.where(expand_like(keep, condition[k]), condition[k], neg_condition[k])
+            return condition
+        raise TypeError(f"Unsupported condition type: {type(condition)}")
+
     @torch.no_grad()
     def _get_velocity(
         self,
@@ -255,6 +274,78 @@ class MeanFlowModel(CMModel):
 
         return u_theta_jvp
 
+    def _sample_t_r_buckets(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample (t, r) with t >= r and assign the per-batch buckets.
+
+        Returns ``(t, r, is_diffusion)`` where ``is_diffusion`` marks the
+        samples with ``r = t`` (pure flow matching).
+
+        With ``consistency_ratio == 0`` (MeanFlow default) the flow-matching
+        head size is stochastic, as before. With ``consistency_ratio > 0``
+        (AnyFlow) the buckets are assigned deterministically over the GLOBAL
+        batch by rank index, exactly like the AnyFlow reference
+        (``sample_timestep`` in ``trainer_wan_anyflow_pretrain.py``): the
+        first ``round((1 - r_sample_ratio) * global_bsz)`` samples get
+        ``r = t``, the next ``round(consistency_ratio * global_bsz)`` get
+        ``r = 0`` (consistency to clean data), and the rest keep the sampled
+        random pair.
+        """
+        t_sample_kwargs = convert_cfg_to_dict(self.sample_t_cfg)
+        t = self.net.noise_scheduler.sample_t(batch_size, **t_sample_kwargs, device=self.device)
+        r_sample_kwargs = convert_cfg_to_dict(self.sample_r_cfg) if self.sample_r_cfg.enabled else t_sample_kwargs
+        r = self.net.noise_scheduler.sample_t(batch_size, **r_sample_kwargs, device=self.device)
+        t, r = torch.maximum(t, r), torch.minimum(t, r)
+        assert torch.all(t >= r), "r cannot be larger than t"
+
+        if self.sample_t_cfg.consistency_ratio > 0:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                world_size, rank = torch.distributed.get_world_size(), torch.distributed.get_rank()
+            else:
+                world_size, rank = 1, 0
+            global_bsz = world_size * batch_size
+            n_diffusion = round((1.0 - self.sample_t_cfg.r_sample_ratio) * global_bsz)
+            n_consistency = round(self.sample_t_cfg.consistency_ratio * global_bsz)
+            global_idx = rank * batch_size + torch.arange(batch_size, device=self.device)
+            is_diffusion = global_idx < n_diffusion
+            is_consistency = (global_idx >= n_diffusion) & (global_idx < n_diffusion + n_consistency)
+            r = torch.where(is_diffusion, t, r)
+            r = torch.where(is_consistency, torch.zeros_like(r), r)
+        else:
+            # set t=r (flow matching loss) for a subset of the batch
+            flow_matching_size = (torch.rand(batch_size, device=self.device) >= self.sample_t_cfg.r_sample_ratio).sum()
+            is_diffusion = torch.arange(batch_size, device=self.device) < flow_matching_size
+            r = torch.where(is_diffusion, t, r)
+
+        return t, r, is_diffusion
+
+    def _reduce_mf_loss(self, mf_loss: torch.Tensor, is_diffusion: torch.Tensor) -> torch.Tensor:
+        """Reduce the per-sample loss to a scalar, optionally rebalancing.
+
+        With ``loss_config.rebalance_to_diffusion`` set (AnyFlow), every
+        non-diffusion sample's loss is multiplied by the detached factor
+        ``mean(global diffusion losses) / (own loss + 1e-5)``, matching the
+        AnyFlow reference (``train_bidirection``): flow-map / consistency
+        gradients are self-normalized and rescaled to the global
+        diffusion-loss mean.
+        """
+        if getattr(self.loss_config, "rebalance_to_diffusion", False) and (~is_diffusion).any():
+            with torch.no_grad():
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    world_size = torch.distributed.get_world_size()
+                    gathered_loss = [torch.zeros_like(mf_loss) for _ in range(world_size)]
+                    gathered_mask = [torch.zeros_like(is_diffusion) for _ in range(world_size)]
+                    torch.distributed.all_gather(gathered_loss, mf_loss.contiguous())
+                    torch.distributed.all_gather(gathered_mask, is_diffusion.contiguous())
+                    global_loss = torch.cat(gathered_loss, dim=0)
+                    global_mask = torch.cat(gathered_mask, dim=0)
+                else:
+                    global_loss, global_mask = mf_loss, is_diffusion
+                scale = torch.ones_like(mf_loss)
+                if global_mask.any():
+                    scale[~is_diffusion] = global_loss[global_mask].mean() / (mf_loss[~is_diffusion] + 1e-5)
+            mf_loss = mf_loss * scale
+        return mf_loss.mean()
+
     def _timestep_weight_raw(self, t: torch.Tensor) -> torch.Tensor:
         """Unnormalized per-timestep weight as a direct function of t in [0, 1]."""
         weight_type = self.loss_config.weight_type
@@ -276,6 +367,9 @@ class MeanFlowModel(CMModel):
         weights over its shifted discrete timestep grid; we compute the same
         constant once and cache it.
         """
+        if self.loss_config.weight_type == "uniform":
+            # The reference uses exactly 1.0 for uniform (no grid normalization).
+            return torch.ones_like(t)
         if self._timestep_weight_scale is None:
             shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type == "shifted" else 1.0
             grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)
@@ -440,21 +534,47 @@ class MeanFlowModel(CMModel):
         z = torch.randn_like(real_data)
         x_t = self.net.noise_scheduler.forward_process(real_data, z, t)
 
-        condition, dxt_dt = self._get_velocity(real_data, z, t, condition=condition, neg_condition=neg_condition)
-        # prevent JVP to use cached conversions (which can break the computational graph) that were created in the no_grad context of _get_velocity
-        torch.clear_autocast_cache()
-        u_theta_jvp = self._jvp(x_t, t, r, dxt_dt, condition=condition)
-        assert not u_theta_jvp.requires_grad, "u_theta_jvp should not require gradients"
+        guidance_fuse_scale = getattr(self.loss_config, "guidance_fuse_scale", None)
+        if guidance_fuse_scale is not None:
+            # AnyFlow-style guidance distillation: the guidance is fused on the
+            # PREDICTION side — the conditional output is trained to be the
+            # guided flow directly. Matches the reference ``train_bidirection``:
+            # the regression target stays the raw data velocity, the
+            # unconditional branch is queried at the SAME (t, r) flow-map
+            # slice, and the effective prediction is
+            # (u_cond + (g - 1) * u_uncond) / g. Text dropout replaces the
+            # condition with neg_condition for a random subset beforehand.
+            g = float(guidance_fuse_scale)
+            condition = self._drop_condition(condition, neg_condition)
+            dxt_dt = self.net.noise_scheduler.cond_velocity(x=real_data, eps=z, t=t)
+            torch.clear_autocast_cache()
+            # dF/dt of the fused prediction: finite difference of the
+            # conditional output divided by g (the unconditional derivative is
+            # dropped, as in the reference's compute_central_difference).
+            u_theta_jvp = self._jvp(x_t, t, r, dxt_dt, condition=condition) / g
+            assert not u_theta_jvp.requires_grad, "u_theta_jvp should not require gradients"
 
-        # additional forward pass to get u_theta with gradient; see also https://github.com/Gsunshine/py-meanflow?tab=readme-ov-file#note-on-jvp
-        assert x_t.dtype == real_data.dtype, f"x_t.dtype: {x_t.dtype}, real_data.dtype: {real_data.dtype}"
-        u_theta = self.net(
-            x_t,
-            t,
-            r=r,
-            condition=condition,
-            fwd_pred_type="flow",
-        )
+            assert x_t.dtype == real_data.dtype, f"x_t.dtype: {x_t.dtype}, real_data.dtype: {real_data.dtype}"
+            u_theta = self.net(x_t, t, r=r, condition=condition, fwd_pred_type="flow")
+            with torch.no_grad():
+                u_uncond = self.net(x_t, t, r=r, condition=neg_condition, fwd_pred_type="flow")
+            u_theta = (u_theta + (g - 1.0) * u_uncond) / g
+        else:
+            condition, dxt_dt = self._get_velocity(real_data, z, t, condition=condition, neg_condition=neg_condition)
+            # prevent JVP to use cached conversions (which can break the computational graph) that were created in the no_grad context of _get_velocity
+            torch.clear_autocast_cache()
+            u_theta_jvp = self._jvp(x_t, t, r, dxt_dt, condition=condition)
+            assert not u_theta_jvp.requires_grad, "u_theta_jvp should not require gradients"
+
+            # additional forward pass to get u_theta with gradient; see also https://github.com/Gsunshine/py-meanflow?tab=readme-ov-file#note-on-jvp
+            assert x_t.dtype == real_data.dtype, f"x_t.dtype: {x_t.dtype}, real_data.dtype: {real_data.dtype}"
+            u_theta = self.net(
+                x_t,
+                t,
+                r=r,
+                condition=condition,
+                fwd_pred_type="flow",
+            )
         mf_loss, tangent, loss_weight, warmup_weight = self._mf_pred_to_loss(
             u_theta=u_theta, u_theta_jvp=u_theta_jvp, x_t=x_t, dxt_dt=dxt_dt, t=t, r=r, iteration=iteration
         )
@@ -492,27 +612,8 @@ class MeanFlowModel(CMModel):
         real_data, condition, neg_condition = self._prepare_training_data(data)
         batch_size = real_data.shape[0]
 
-        # sample t and r
-        t_sample_kwargs = convert_cfg_to_dict(self.sample_t_cfg)
-        t = self.net.noise_scheduler.sample_t(batch_size, **t_sample_kwargs, device=self.device)
-        r_sample_kwargs = convert_cfg_to_dict(self.sample_r_cfg) if self.sample_r_cfg.enabled else t_sample_kwargs
-        r = self.net.noise_scheduler.sample_t(batch_size, **r_sample_kwargs, device=self.device)
-        t, r = torch.maximum(t, r), torch.minimum(t, r)
-        assert torch.all(t >= r), "r cannot be larger than t"
-
-        # set t=r (flow matching loss) for a subset of the batch
-        batch_size = real_data.shape[0]
-        flow_matching_size = (torch.rand(batch_size, device=self.device) >= self.sample_t_cfg.r_sample_ratio).sum()
-        zero_mask = torch.arange(batch_size, device=self.device) < flow_matching_size
-        r = torch.where(zero_mask, t, r)
-
-        # set r=min_t (consistency-to-clean, AnyFlow) for a subset of the batch.
-        # Taken from the tail so it never overlaps the flow-matching head.
-        if self.sample_t_cfg.consistency_ratio > 0:
-            num_consistency = (torch.rand(batch_size, device=self.device) < self.sample_t_cfg.consistency_ratio).sum()
-            num_consistency = torch.minimum(num_consistency, batch_size - flow_matching_size)
-            consistency_mask = torch.arange(batch_size, device=self.device) >= batch_size - num_consistency
-            r = torch.where(consistency_mask, torch.full_like(r, self.net.noise_scheduler.min_t), r)
+        # sample t and r, with per-batch buckets (flow matching / consistency)
+        t, r, is_diffusion = self._sample_t_r_buckets(batch_size)
 
         (
             mf_loss,
@@ -532,7 +633,7 @@ class MeanFlowModel(CMModel):
             neg_condition=neg_condition,
         )
 
-        loss = mf_loss.mean()
+        loss = self._reduce_mf_loss(mf_loss, is_diffusion)
         loss_map = {
             "total_loss": loss,
             "mf_loss": loss,

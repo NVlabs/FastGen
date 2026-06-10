@@ -79,6 +79,15 @@ class LossConfig:
     # ("beta08", "gaussian", "uniform"; used by AnyFlow). None keeps the
     # adaptive norm_method weighting above. Only applies to loss_type="l2".
     weight_type: Optional[str] = None
+    # prediction-side guidance fusion scale (AnyFlow guidance distillation):
+    # the conditional output is trained to be the guided flow directly via
+    # (u_cond + (g-1) * u_uncond) / g against the raw data velocity, with
+    # plain text dropout (cond_dropout_prob). None keeps MeanFlow's
+    # target-side guidance (guidance_scale, eq. 19).
+    guidance_fuse_scale: Optional[float] = None
+    # rebalance non-diffusion (r < t) sample losses to the global
+    # diffusion-loss mean via a detached per-sample factor (AnyFlow)
+    rebalance_to_diffusion: bool = False
 
 
 @attrs.define(slots=False)

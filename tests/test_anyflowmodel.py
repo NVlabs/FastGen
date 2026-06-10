@@ -69,10 +69,19 @@ def _build_onpolicy_model():
     instance.precision = "float32" if instance.device == torch.device("cpu") else "bfloat16"
     instance.pretrained_model_path = ""
     instance.student_update_freq = 2
-    # student_sample_steps=2 is the smallest value that runs the rollout loop
-    # more than once.
     instance.student_sample_steps = 2
     instance.input_shape = [3, 8, 8]
+
+    # Co-trained flow-map loss settings (MeanFlow machinery on the tiny net).
+    instance.sample_t_cfg.time_dist_type = "uniform"
+    instance.sample_t_cfg.min_t = 0.001
+    instance.sample_t_cfg.max_t = 0.999
+    instance.sample_t_cfg.r_sample_ratio = 0.5
+    instance.sample_t_cfg.consistency_ratio = 0.25
+    instance.loss_config.loss_type = "l2"
+    instance.loss_config.weight_type = "uniform"
+    instance.loss_config.use_jvp_finite_diff = True
+    instance.loss_config.jvp_finite_diff_eps = 1e-2
 
     model = AnyFlowModel(instance)
     model.on_train_begin()
@@ -140,30 +149,68 @@ def test_pretrain_finite_difference_falls_back_at_boundaries():
     assert torch.isfinite(u_theta_jvp).all(), "boundary samples must yield finite JVP estimates"
 
 
-def test_pretrain_consistency_bucket_pins_r_to_min_t():
+def test_pretrain_consistency_bucket_pins_r_to_zero():
     """With consistency_ratio=1.0 (and no flow-matching head), every sample's
-    r must be pinned to min_t."""
+    r must be pinned to 0 (consistency to clean data, as in the reference)."""
     model = _build_pretrain_model(consistency_ratio=1.0, r_sample_ratio=1.0)
-    data = _make_data(model, batch_size=4)
+    t, r, is_diffusion = model._sample_t_r_buckets(4)
+    assert not is_diffusion.any()
+    assert torch.allclose(r.float(), torch.zeros_like(r.float()))
 
-    captured = {}
-    orig = model._compute_mf_loss
 
-    def spy(real_data, t, r, **kwargs):
-        captured["r"] = r
-        return orig(real_data=real_data, t=t, r=r, **kwargs)
+def test_pretrain_bucket_partition_is_deterministic():
+    """With consistency_ratio > 0, buckets follow the reference's deterministic
+    global partition: diffusion head, consistency middle, random-pair tail."""
+    model = _build_pretrain_model(consistency_ratio=0.25, r_sample_ratio=0.5)
+    batch_size = 8
+    t, r, is_diffusion = model._sample_t_r_buckets(batch_size)
 
-    model._compute_mf_loss = spy
-    model.single_train_step(data, 0)
+    n_diffusion = round(0.5 * batch_size)
+    n_consistency = round(0.25 * batch_size)
+    assert is_diffusion.tolist() == [True] * n_diffusion + [False] * (batch_size - n_diffusion)
+    assert torch.equal(r[:n_diffusion], t[:n_diffusion])
+    assert torch.allclose(
+        r[n_diffusion : n_diffusion + n_consistency].float(),
+        torch.zeros(n_consistency),
+    )
 
-    min_t = float(model.net.noise_scheduler.min_t)
-    assert torch.allclose(captured["r"].float(), torch.full_like(captured["r"].float(), min_t))
+
+def test_pretrain_rebalance_to_diffusion():
+    """With rebalancing on, each non-diffusion loss is rescaled to the
+    diffusion-loss mean by a detached per-sample factor."""
+    model = _build_pretrain_model()
+    model.loss_config.rebalance_to_diffusion = True
+
+    mf_loss = torch.tensor([2.0, 4.0, 10.0, 100.0], dtype=torch.float64, requires_grad=True)
+    is_diffusion = torch.tensor([True, True, False, False])
+    loss = model._reduce_mf_loss(mf_loss, is_diffusion)
+
+    # diffusion mean = 3.0; each non-diffusion sample becomes ~3.0.
+    expected = (2.0 + 4.0 + 3.0 * (10.0 / 10.00001) + 3.0 * (100.0 / 100.00001)) / 4.0
+    assert abs(loss.item() - expected) < 1e-3
+    loss.backward()
+    assert mf_loss.grad is not None and torch.isfinite(mf_loss.grad).all()
+
+
+def test_pretrain_prediction_side_guidance_fusion():
+    """The AnyFlow guidance-distillation branch (guidance_fuse_scale) must run
+    end to end and keep gradients on the fused prediction."""
+    model = _build_pretrain_model()
+    model.loss_config.guidance_fuse_scale = 3.0
+    model.config.cond_dropout_prob = 0.5
+    data = _make_data(model, batch_size=2)
+
+    loss_map, _ = model.single_train_step(data, 0)
+    assert torch.isfinite(loss_map["total_loss"]).all()
+    loss_map["total_loss"].backward()
+    grad_seen = any(p.grad is not None for p in model.net.parameters())
+    assert grad_seen
 
 
 @pytest.mark.parametrize("weight_type", ["beta08", "gaussian", "uniform"])
 def test_timestep_weight_function(weight_type):
     """The fixed per-timestep weight is a direct function of t: non-negative,
-    finite, and normalized to ~unit mean over the shifted timestep grid."""
+    finite, and normalized like the reference scheduler."""
     model = _build_pretrain_model(weight_type=weight_type)
     model._timestep_weight_scale = None  # force re-derivation for this weight_type
 
@@ -172,11 +219,15 @@ def test_timestep_weight_function(weight_type):
     assert torch.all(w >= 0), f"{weight_type} weights must be non-negative"
     assert torch.isfinite(w).all()
 
-    # The normalization matches the reference: sum over the shifted grid == 1000.
-    shift = model.sample_t_cfg.shift
-    grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)
-    grid = shift * grid / (1 + (shift - 1) * grid)
-    assert abs(model._get_timestep_weight(grid).sum().item() - 1000.0) < 1e-6
+    if weight_type == "uniform":
+        # The reference uses exactly 1.0 for uniform.
+        assert torch.allclose(w, torch.ones_like(w))
+    else:
+        # The normalization matches the reference: sum over the shifted grid == 1000.
+        shift = model.sample_t_cfg.shift
+        grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)
+        grid = shift * grid / (1 + (shift - 1) * grid)
+        assert abs(model._get_timestep_weight(grid).sum().item() - 1000.0) < 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +241,42 @@ def test_onpolicy_student_update_step():
     loss_map, outputs = model.single_train_step(data, 0)  # iteration 0 -> student update
     assert "total_loss" in loss_map
     assert "vsd_loss" in loss_map
+    # The co-trained Stage-2 flow-map loss is part of every student update.
+    assert "bidirection_loss" in loss_map
+    assert torch.isfinite(loss_map["total_loss"]).all()
     assert "gen_rand" in outputs
+
+
+def test_onpolicy_cotrain_can_be_disabled():
+    model = _build_onpolicy_model()
+    model.config.cotrain_pretrain_weight = 0.0
+    data = _make_data(model, img_resolution=8)
+    loss_map, _ = model.single_train_step(data, 0)
+    assert "bidirection_loss" not in loss_map
+
+
+def test_onpolicy_rollout_compresses_to_three_forwards():
+    """Regardless of the sampled NFE, the rollout must run at most three
+    network forwards (jump -> fine step -> jump), with gradient through all."""
+    model = _build_onpolicy_model()
+    model.config.student_sample_steps_list = [16]
+    real = torch.randn(1, 3, 8, 8, device=model.device, dtype=model.precision)
+    cond = torch.nn.functional.one_hot(torch.tensor([0]), num_classes=10).to(model.device, model.precision)
+    input_student, t_student, _, _ = model._generate_noise_and_time(real)
+
+    calls = []
+    orig_forward = model.net.forward
+
+    def counting_forward(*args, **kwargs):
+        calls.append(1)
+        return orig_forward(*args, **kwargs)
+
+    model.net.forward = counting_forward
+    gen = model.gen_data_from_net(input_student, t_student, condition=cond)
+    model.net.forward = orig_forward
+
+    assert len(calls) <= 3, f"rollout must compress to <= 3 forwards, got {len(calls)}"
+    assert gen.requires_grad
 
 
 def test_onpolicy_fake_score_discriminator_update_step():

@@ -48,11 +48,17 @@ def create_config():
     config.model.loss_config.weight_type = "beta08"
     config.model.loss_config.use_jvp_finite_diff = True
     config.model.loss_config.jvp_finite_diff_eps = 5e-3
+    # Rebalance the non-diffusion (flow-map / consistency) sample losses to
+    # the global diffusion-loss mean (reference scale_weight).
+    config.model.loss_config.rebalance_to_diffusion = True
     config.model.precision_amp_jvp = "float32"
 
-    # Velocity-level guidance fusion with text dropout (reference:
-    # drop_text_ratio=0.1, fuse_guidance_scale=3.0).
-    config.model.guidance_scale = 3.0
+    # Prediction-side guidance fusion with text dropout (reference:
+    # drop_text_ratio=0.1, fuse_guidance_scale=3.0): the conditional output
+    # learns the guided flow directly. guidance_scale stays None — MeanFlow's
+    # target-side eq. 19 fusion is a different mechanism.
+    config.model.guidance_scale = None
+    config.model.loss_config.guidance_fuse_scale = 3.0
     config.model.cond_dropout_prob = 0.1
 
     # ------ (t, r) sampling: shifted uniform pairs + AnyFlow buckets ------
@@ -66,16 +72,22 @@ def create_config():
     # consistency_ratio=0.25 of the batch is pinned to r = min_t.
     config.model.sample_t_cfg.consistency_ratio = 0.25
 
-    # ------ optimization (reference: AdamW lr=5e-5, wd=0, betas=(0.9, 0.95)) ------
+    # ------ optimization (reference: AdamW lr=5e-5, wd=0, betas=(0.9, 0.95),
+    # max_grad_norm=1.0, 1000-step LR warmup, EMA decay 0.999) ------
     config.model.net_optimizer.optim_type = "adamw"
     config.model.net_optimizer.lr = 5e-5
     config.model.net_optimizer.betas = (0.9, 0.95)
     config.model.net_optimizer.weight_decay = 0.0
+    config.model.net_scheduler.warm_up_steps = [1000]
+    config.trainer.callbacks.grad_clip.grad_norm = 1.0
+    config.trainer.callbacks.ema.beta = 0.999
 
     # ------ inference / validation ------
     config.model.student_sample_type = "ode"
     config.model.student_sample_steps = 4
-    config.model.sample_t_cfg.t_list = [0.999, 0.937, 0.833, 0.624, 0.0]
+    # 4-step shifted schedule shift*s/(1+(shift-1)*s) on s=linspace(1,0,5),
+    # first entry clamped to max_t (the reference samples from t=1.0).
+    config.model.sample_t_cfg.t_list = [0.999, 0.9375, 0.83333333, 0.625, 0.0]
 
     # ------ data / trainer ------
     config.dataloader_train = VideoLoaderConfig
