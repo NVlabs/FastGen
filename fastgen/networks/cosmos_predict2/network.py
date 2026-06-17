@@ -51,6 +51,55 @@ import fastgen.utils.logging_utils as logger
 from fastgen.utils.basic_utils import str2bool
 
 
+_COSMOS_KARRAS_SIGMA_MAX = 200.0
+_COSMOS_KARRAS_SIGMA_MIN = 0.01
+_COSMOS_KARRAS_RHO = 7.0
+
+
+def _build_cosmos_predict2_karras_schedule(
+    num_steps: int,
+    num_train_timesteps: int,
+    device: Union[torch.device, str],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build the Karras sigma/timestep schedule used by official Cosmos Predict2.5 inference."""
+    if num_steps <= 0:
+        raise ValueError(f"num_steps must be positive, got {num_steps}")
+
+    ramp = torch.arange(num_steps + 1, dtype=torch.float64) / num_steps
+    min_inv_rho = _COSMOS_KARRAS_SIGMA_MIN ** (1 / _COSMOS_KARRAS_RHO)
+    max_inv_rho = _COSMOS_KARRAS_SIGMA_MAX ** (1 / _COSMOS_KARRAS_RHO)
+    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** _COSMOS_KARRAS_RHO
+    sigmas = sigmas / (1 + sigmas)
+
+    timesteps = (sigmas * num_train_timesteps).to(device=device, dtype=torch.int64)
+    sigmas = torch.cat([sigmas, sigmas.new_zeros(1)]).to(dtype=torch.float32)
+    return sigmas, timesteps
+
+
+def _reset_unipc_scheduler_state(scheduler: UniPCMultistepScheduler) -> None:
+    scheduler.model_outputs = [None] * scheduler.config.solver_order
+    scheduler.lower_order_nums = 0
+    scheduler.last_sample = None
+    scheduler._step_index = None
+    scheduler._begin_index = None
+
+
+def _apply_cosmos_predict2_karras_schedule(
+    scheduler: UniPCMultistepScheduler,
+    num_steps: int,
+    device: Union[torch.device, str],
+) -> None:
+    sigmas, timesteps = _build_cosmos_predict2_karras_schedule(
+        num_steps=num_steps,
+        num_train_timesteps=scheduler.config.num_train_timesteps,
+        device=device,
+    )
+    scheduler.sigmas = sigmas
+    scheduler.timesteps = timesteps
+    scheduler.num_inference_steps = len(timesteps)
+    _reset_unipc_scheduler_state(scheduler)
+
+
 # ---------------------- DiT Network -----------------------
 
 
@@ -767,6 +816,7 @@ class CosmosPredict2(FastGenNetwork):
         use_wan_fp32_strategy: bool = True,
         # FPS for temporal position embeddings
         fps: float = 24.0,
+        use_karras_sigma_schedule: bool = True,
         # Video2world (image-to-video) mode settings
         is_video2world: bool = False,
         num_conditioning_frames: int = 1,
@@ -823,6 +873,9 @@ class CosmosPredict2(FastGenNetwork):
 
         # Default FPS for temporal position embeddings
         self.fps = fps
+
+        # Match official Cosmos Predict2.5 SFT inference schedule by default.
+        self.use_karras_sigma_schedule = use_karras_sigma_schedule
 
         # Initialize the sample scheduler for inference later (otherwise it causes issues with Meta init)
         self.sample_scheduler = None
@@ -1105,6 +1158,7 @@ class CosmosPredict2(FastGenNetwork):
         num_conditioning_frames: int = 1,
         conditional_frame_timestep: float = 0.0,
         denoise_replace_gt_frames: bool = True,
+        use_karras_sigma_schedule: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Multistep sampling using the FlowUniPC method.
@@ -1139,11 +1193,15 @@ class CosmosPredict2(FastGenNetwork):
                 to disable the special conditioning-frame timestep.
             denoise_replace_gt_frames: Whether to replace velocity for conditioning frames
                 with analytical velocity (noise - gt_frames). Default True.
+            use_karras_sigma_schedule: Whether to use the official Cosmos Predict2.5
+                Karras sigma schedule for SFT inference. Defaults to self.use_karras_sigma_schedule.
 
         Returns:
             The denoised sample tensor.
         """
         assert self.schedule_type == "rf", f"{self.schedule_type} is not supported"
+        if use_karras_sigma_schedule is None:
+            use_karras_sigma_schedule = self.use_karras_sigma_schedule
 
         # Set timesteps with shift parameter (matching official Cosmos inference)
         if self.sample_scheduler is None:
@@ -1156,6 +1214,8 @@ class CosmosPredict2(FastGenNetwork):
         else:
             self.sample_scheduler.config.flow_shift = shift
         self.sample_scheduler.set_timesteps(num_inference_steps=num_steps, device=noise.device)
+        if use_karras_sigma_schedule:
+            _apply_cosmos_predict2_karras_schedule(self.sample_scheduler, num_steps=num_steps, device=noise.device)
         timesteps = self.sample_scheduler.timesteps
 
         # Initialize latents with proper scaling based on the initial timestep
@@ -1211,7 +1271,7 @@ class CosmosPredict2(FastGenNetwork):
             # Store initial noise for velocity replacement
             initial_noise = latents.clone()
 
-        for idx, timestep in tqdm(enumerate(timesteps), total=num_steps, desc="Sampling"):
+        for idx, timestep in tqdm(enumerate(timesteps), total=len(timesteps), desc="Sampling"):
             # Normalize timestep to [0, 1] range
             t = (timestep / self.sample_scheduler.config.num_train_timesteps).expand(latents.shape[0])
             t = self.noise_scheduler.safe_clamp(t, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t).to(

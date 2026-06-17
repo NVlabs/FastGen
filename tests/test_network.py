@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 import torch
 import pytest
 
@@ -35,6 +39,10 @@ from fastgen.configs.discriminator import (
     Discriminator_EDM_ImageNet64_Config,
 )
 from fastgen.configs.config_utils import override_config_with_opts
+from fastgen.networks.cosmos_predict2.network import (
+    _apply_cosmos_predict2_karras_schedule,
+    _build_cosmos_predict2_karras_schedule,
+)
 from fastgen.utils.basic_utils import clear_gpu_memory
 from fastgen.utils.test_utils import RunIf
 from fastgen.utils.io_utils import set_env_vars
@@ -247,6 +255,76 @@ def validate_noise_scheduler_properties(teacher, device, expected_schedule_type=
 
     else:
         raise ValueError(f"Unrecognized schedule type: {expected_schedule_type}")
+
+
+def _reference_cosmos_karras_schedule(num_steps, num_train_timesteps=1000):
+    sigma_max, sigma_min, rho = 200.0, 0.01, 7.0
+    sigmas = np.arange(num_steps + 1, dtype=np.float64) / num_steps
+    min_inv_rho = sigma_min ** (1 / rho)
+    max_inv_rho = sigma_max ** (1 / rho)
+    sigmas = (max_inv_rho + sigmas * (min_inv_rho - max_inv_rho)) ** rho
+    sigmas = sigmas / (1 + sigmas)
+    timesteps = (sigmas * num_train_timesteps).astype(np.int64)
+    sigmas = np.concatenate([sigmas, [0.0]]).astype(np.float32)
+    return sigmas, timesteps
+
+
+def test_cosmos_predict2_karras_schedule_matches_reference():
+    num_steps = 35
+    sigmas, timesteps = _build_cosmos_predict2_karras_schedule(
+        num_steps=num_steps,
+        num_train_timesteps=1000,
+        device=torch.device("cpu"),
+    )
+    expected_sigmas, expected_timesteps = _reference_cosmos_karras_schedule(num_steps)
+
+    assert sigmas.shape == (num_steps + 2,)
+    assert timesteps.shape == (num_steps + 1,)
+    assert sigmas.dtype == torch.float32
+    assert timesteps.dtype == torch.int64
+    assert sigmas[-1].item() == 0.0
+    assert torch.all(sigmas[:-1][:-1] > sigmas[:-1][1:])
+    np.testing.assert_allclose(sigmas.numpy(), expected_sigmas, rtol=0, atol=1e-6)
+    np.testing.assert_array_equal(timesteps.numpy(), expected_timesteps)
+
+
+def test_cosmos_predict2_karras_schedule_small_steps_and_state_reset():
+    for num_steps in [1, 2]:
+        scheduler = SimpleNamespace(
+            config=SimpleNamespace(num_train_timesteps=1000, solver_order=3),
+            sigmas=torch.ones(1),
+            timesteps=torch.ones(1, dtype=torch.int64),
+            num_inference_steps=1,
+            model_outputs=["stale"] * 3,
+            lower_order_nums=2,
+            last_sample=torch.ones(1),
+            _step_index=5,
+            _begin_index=4,
+        )
+
+        _apply_cosmos_predict2_karras_schedule(scheduler, num_steps=num_steps, device=torch.device("cpu"))
+        expected_sigmas, expected_timesteps = _reference_cosmos_karras_schedule(num_steps)
+
+        assert scheduler.sigmas.shape == (num_steps + 2,)
+        assert scheduler.timesteps.shape == (num_steps + 1,)
+        assert scheduler.timesteps.dtype == torch.int64
+        assert scheduler.num_inference_steps == num_steps + 1
+        np.testing.assert_allclose(scheduler.sigmas.numpy(), expected_sigmas, rtol=0, atol=1e-6)
+        np.testing.assert_array_equal(scheduler.timesteps.numpy(), expected_timesteps)
+        assert scheduler.model_outputs == [None, None, None]
+        assert scheduler.lower_order_nums == 0
+        assert scheduler.last_sample is None
+        assert scheduler._step_index is None
+        assert scheduler._begin_index is None
+
+
+def test_video_model_inference_cosmos_example_uses_cosmos_negative_prompt():
+    script = Path("scripts/inference/video_model_inference.py").read_text()
+    cosmos_example = script.split("# Video2World: Cosmos Predict2", 1)[1].split("# Eval with skip-layer guidance", 1)[0]
+
+    assert "--neg_prompt_file scripts/inference/prompts/negative_prompt_cosmos.txt" in cosmos_example
+    assert '--config fastgen/configs/experiments/CosmosPredict2/config_sft.py \\' in cosmos_example
+    assert 'model.input_shape="[16, 24, 88, 160]"' in cosmos_example
 
 
 def test_network_edm_cifar10():
