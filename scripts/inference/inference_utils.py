@@ -161,8 +161,6 @@ def setup_inference_modules(
     Returns:
         Tuple of (teacher, student, vae) - any may be None
     """
-    model.apply_torch_compile()  # no-op if torch_compile_mode is None
-
     teacher, student, vae = None, None, None
 
     if do_teacher_sampling:
@@ -182,6 +180,8 @@ def setup_inference_modules(
         model.net.init_preprocessors()
         vae = model.net.vae
         vae.to(device=model.device, dtype=precision)
+
+    model.apply_torch_compile()  # no-op if torch_compile_mode is None; must run after init_preprocessors
 
     return teacher, student, vae
 

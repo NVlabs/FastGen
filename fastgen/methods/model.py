@@ -306,6 +306,9 @@ class FastGenModel(torch.nn.Module):
                         modules[f"{name}.{attr}"] = submodule
 
         for name, module in modules.items():
+            if getattr(module, "_compiled_call_impl", None) is not None:
+                logger.info(f"Skipping torch.compile for {name} (already compiled)")
+                continue
             logger.info(f"Applying torch.compile (mode={mode}) to {name}")
             module.compile(mode=mode)
 
