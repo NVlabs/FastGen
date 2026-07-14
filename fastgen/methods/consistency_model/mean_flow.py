@@ -548,6 +548,10 @@ class MeanFlowModel(CMModel):
             # (u_cond + (g - 1) * u_uncond) / g. Text dropout replaces the
             # condition with neg_condition for a random subset beforehand.
             g = float(guidance_fuse_scale)
+            assert g > 0, f"guidance_fuse_scale must be > 0, got {g} (set it to None to disable guidance fusion)"
+            assert (
+                neg_condition is not None
+            ), "guidance_fuse_scale requires neg_condition: the unconditional branch is queried at the same (t, r)"
             condition = self._drop_condition(condition, neg_condition)
             dxt_dt = self.net.noise_scheduler.cond_velocity(x=real_data, eps=z, t=t)
             torch.clear_autocast_cache()
