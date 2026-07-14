@@ -310,12 +310,12 @@ def test_onpolicy_fake_score_discriminator_update_step():
 
 
 def test_onpolicy_rollout_propagates_gradient():
-    """The multi-step rollout must allow gradient flow on the chosen step.
+    """The rollout output must keep the autograd graph so the DMD generator
+    update has a valid gradient.
 
-    Mirrors AnyFlow's ``training_rollout`` (pipeline_wan_anyflow.py): one
-    randomly-chosen step in the rollout has gradients enabled; the remaining
-    steps are no_grad. The rollout output must keep the autograd graph so the
-    DMD generator update has a valid gradient.
+    Mirrors AnyFlow's ``training_rollout`` (pipeline_wan_anyflow.py): the
+    compressed jump -> fine step -> jump rollout runs with gradient through
+    all segments.
     """
     model = _build_onpolicy_model()
     real = torch.randn(1, 3, 8, 8, device=model.device, dtype=model.precision)
