@@ -302,6 +302,17 @@ class MeanFlowModel(CMModel):
             global_bsz = world_size() * batch_size
             n_flow_matching = round((1.0 - self.sample_t_cfg.r_sample_ratio) * global_bsz)
             n_consistency = round(self.sample_t_cfg.consistency_ratio * global_bsz)
+            if (n_flow_matching == 0 or n_consistency == 0) and not getattr(self, "_bucket_warned", False):
+                self._bucket_warned = True
+                logger.warning(
+                    f"The deterministic (t, r) bucket partition is degenerate: with "
+                    f"world_size * batch_size = {global_bsz}, r_sample_ratio="
+                    f"{self.sample_t_cfg.r_sample_ratio} and consistency_ratio="
+                    f"{self.sample_t_cfg.consistency_ratio} yield bucket sizes "
+                    f"({n_flow_matching}, {n_consistency}). The partition spans ranks but not "
+                    f"gradient-accumulation rounds (as in the AnyFlow reference), so empty "
+                    f"buckets stay empty every iteration."
+                )
             global_idx = get_rank() * batch_size + torch.arange(batch_size, device=self.device)
             r_eq_t_mask = global_idx < n_flow_matching
             is_consistency = (global_idx >= n_flow_matching) & (global_idx < n_flow_matching + n_consistency)
@@ -327,18 +338,19 @@ class MeanFlowModel(CMModel):
         """
         if getattr(self.loss_config, "rebalance_to_diffusion", False) and (~r_eq_t_mask).any():
             with torch.no_grad():
+                # The global flow-matching-loss mean only needs the global sum
+                # and count, so reduce two scalars instead of gathering the
+                # per-sample losses (equivalent to the reference's
+                # cat(all_gather(loss))[mask].mean(), and independent of the
+                # per-rank batch sizes).
+                fm_loss_sum = torch.where(r_eq_t_mask, mf_loss, torch.zeros_like(mf_loss)).sum()
+                fm_count = r_eq_t_mask.sum().to(mf_loss.dtype)
                 if world_size() > 1:
-                    gathered_loss = [torch.zeros_like(mf_loss) for _ in range(world_size())]
-                    gathered_mask = [torch.zeros_like(r_eq_t_mask) for _ in range(world_size())]
-                    torch.distributed.all_gather(gathered_loss, mf_loss.contiguous())
-                    torch.distributed.all_gather(gathered_mask, r_eq_t_mask.contiguous())
-                    global_loss = torch.cat(gathered_loss, dim=0)
-                    global_mask = torch.cat(gathered_mask, dim=0)
-                else:
-                    global_loss, global_mask = mf_loss, r_eq_t_mask
+                    torch.distributed.all_reduce(fm_loss_sum)
+                    torch.distributed.all_reduce(fm_count)
                 scale = torch.ones_like(mf_loss)
-                if global_mask.any():
-                    scale[~r_eq_t_mask] = global_loss[global_mask].mean() / (mf_loss[~r_eq_t_mask] + 1e-5)
+                if fm_count > 0:
+                    scale[~r_eq_t_mask] = (fm_loss_sum / fm_count) / (mf_loss[~r_eq_t_mask] + 1e-5)
             mf_loss = mf_loss * scale
         return mf_loss.mean()
 
