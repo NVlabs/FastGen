@@ -336,7 +336,10 @@ class MeanFlowModel(CMModel):
         consistency gradients are self-normalized and rescaled to the global
         flow-matching-loss mean.
         """
-        if getattr(self.loss_config, "rebalance_to_diffusion", False) and (~r_eq_t_mask).any():
+        # No rank-local condition here: the branch must be taken (or not) by
+        # every rank so the collective below cannot deadlock. Applying the
+        # scale to an empty ~r_eq_t_mask selection is a no-op.
+        if getattr(self.loss_config, "rebalance_to_diffusion", False):
             with torch.no_grad():
                 # The global flow-matching-loss mean only needs the global sum
                 # and count, so reduce two scalars instead of gathering the

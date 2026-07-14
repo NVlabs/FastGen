@@ -194,6 +194,19 @@ def test_pretrain_rebalance_to_diffusion():
     assert mf_loss.grad is not None and torch.isfinite(mf_loss.grad).all()
 
 
+def test_pretrain_rebalance_all_flow_matching_batch():
+    """A rank whose batch is entirely flow-matching (r = t) must still take
+    the rebalance branch (the collective inside must run on every rank) and
+    reduce to the plain mean."""
+    model = _build_pretrain_model()
+    model.loss_config.rebalance_to_diffusion = True
+
+    mf_loss = torch.tensor([2.0, 4.0], dtype=torch.float64)
+    r_eq_t_mask = torch.tensor([True, True])
+    loss = model._reduce_mf_loss(mf_loss, r_eq_t_mask)
+    assert abs(loss.item() - 3.0) < 1e-8
+
+
 def test_pretrain_prediction_side_guidance_fusion():
     """The AnyFlow guidance-distillation branch (guidance_fuse_scale) must run
     end to end and keep gradients on the fused prediction."""
