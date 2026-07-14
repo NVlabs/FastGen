@@ -6,33 +6,7 @@ into FastGen, targeting Wan diffusion transformers.
 - Reference paper: <https://arxiv.org/pdf/2511.16664>
 - Reference implementation: `Megatron-LM/megatron/elastification/`
 
-## 1. What the algorithm does
-
-Trains a single "elastic" backbone that contains many pruned sub-architectures, plus a small
-router that picks one sub-architecture at inference time based on a target **budget** (e.g.
-fraction of full parameters). Sub-architectures are realized at inference by masking
-activations rather than by changing the module structure — hooks apply prefix masks driven
-by the router's Gumbel-softmax choices.
-
-Five conceptual pieces (as in Megatron):
-
-1. **Search space** — per-axis lists of candidate integer widths (`emb_int_list`,
-   `mlp_int_list`, optional `layer_ranking_list`) plus a `budget_list` of target fractions.
-2. **Router** — small MLP mapping a one-hot budget vector to Gumbel-softmax choice logits per
-   axis. Tau anneals over training. Interpolates between one-hots for intermediate budgets.
-3. **Elasticity hooks** — one hook manager per module class; each attaches
-   `register_forward_pre_hook` / `register_forward_hook` that build prefix masks
-   `[True]*k + [False]*(N-k)`, multiply activations by the mask, multiply by the router
-   probability (STE — this is the gradient bridge back to the router), and rescale
-   LayerNorm eps by the effective width ratio.
-4. **Budget loss** — analytical parameter count applied to soft router outputs. Loss is
-   `|current / (target * full) - 1|` with a small dead-zone and an MSE anchor at
-   `budget = 1.0` that keeps the identity path clean.
-5. **Wiring** — per training step: sample a budget → router forward → push soft choices to
-   hook managers → normal forward through the net (hooks fire during it) → combine LM/DSM
-   loss with budget loss (and optional distillation loss).
-
-## 2. Locked-in decisions for this port
+## 1. Locked-in decisions for this port
 
 | Area | Decision | Rationale |
 |---|---|---|
@@ -43,19 +17,19 @@ Five conceptual pieces (as in Megatron):
 | Mamba / MoE hooks | **Dropped** | Wan has neither. |
 | Layout | Single directory `fastgen/methods/elastification/` | Method won't compose with other step-distillation methods (per user), so no shared-lib split needed. |
 | Phases | All three (joint / freeze-model / freeze-router) via config flags | Matches Megatron. Simple `param.requires_grad` toggles. |
-| Distillation | Included; **form open** | Choose A / B / C — see §7. |
+| Distillation | Included; **external frozen teacher** | Uses FastGen's `build_teacher()` infra; mirrors Megatron. Separate Wan checkpoint loaded frozen; +1 teacher forward per step. |
 | Checkpoint loading | Reuse FastGen's `pretrained_model_path` path | `load_student_weights_and_ema()` handles it. |
 | Head_dim divisibility constraint | **No hard enforcement** | Not needed for correctness. Optional soft warning if a user picks an `emb_int` that would produce a non-standard sub-net shape at materialization time. |
 | Materialization (weight cropping) | **v2, separate PR** | Not needed for algorithm correctness. Ships real inference perf savings. |
 
-## 3. Wan integration points
+## 2. Wan integration points
 
 FastGen's `Wan` (`fastgen/networks/Wan/network.py`) wraps diffusers'
 `WanTransformer3DModel` and monkey-patches several methods via
 `override_transformer_forward` (line 831-846). Relevant to us:
 
-- `block.forward = block_forward` — FastGen's block replacement, handles Wan2.1 vs Wan2.2
-  TI2V modulation + optional sCM `norm_temb`. This is what our hooks attach around.
+- `block.forward = block_forward` — FastGen's block replacement, handles Wan2.1 T2V
+  modulation + optional sCM `norm_temb`. This is what our hooks attach around.
 - `transformer.forward = classify_forward` — FastGen's transformer-level forward.
   Supports `skip_layers` (guidance-time layer skipping) — **note: this is NOT our
   router-driven layer-skip**. Don't route through it; use our own block-level hook.
@@ -71,7 +45,7 @@ This ordering is automatic; do not move elasticity setup earlier.
 - `attn1` — self-attention (`WanAttention` with separate `to_q`, `to_k`, `to_v`,
   `to_out.0`, `norm_q`, `norm_k`).
 - `attn2` — cross-attention over text embeddings. Same shape as `attn1` but K, V come from
-  the text encoder side. Extra `add_k_proj`, `add_v_proj`, `norm_added_k` for I2V.
+  the text encoder side.
 - `ffn` — diffusers `FeedForward` (need to check its internal structure at implementation
   time — likely has `.net.0.proj` and `.net.2`).
 - `scale_shift_table` — AdaLN modulation tensor `[6, inner_dim]`; needs emb masking on the
@@ -85,7 +59,7 @@ This ordering is automatic; do not move elasticity setup earlier.
 - `mlp_hidden` — no effect on cross-attn.
 - `layer_skip` — dropping a block skips its cross-attn too.
 
-## 4. File structure
+## 3. File structure
 
 ### Implementation (new)
 
@@ -160,7 +134,7 @@ tests/elastification/
 Comparable to Megatron's `elastification/` (~4800 impl + ~2300 tests), scoped down for
 the smaller search space (no Mamba, no MoE, no per-block heterogeneity, no TP router).
 
-## 5. Per-file design notes
+## 4. Per-file design notes
 
 ### `config.py`
 
@@ -198,7 +172,7 @@ class ElastConfig:
     freeze_router: bool = False
 
     # ── Distillation ──────────────────────────────────
-    distillation_mode: str = "none"               # "none" | "external_teacher" | "self_double_forward"
+    distillation: bool = False                    # enable external-teacher distillation
     distill_coeff: float = 1.0
 
     # ── Eval / inference override ─────────────────────
@@ -286,8 +260,6 @@ Orchestrator. Modeled on Megatron's `FlextronModelManager`.
   `|current / (target * full) - 1|`, clipped inside 5% dead-zone, MSE anchor at `budget = 1.0`.
 - `distillation_loss_func(student_pred, teacher_pred)` — MSE.
 - `combine_losses(dsm_loss, budget_loss, distill_loss, alpha, distill_coeff) → total_loss, loss_map`.
-- Helper for KD mode B: `self_distill_forward(net, manager, inputs, sampled_budget)` — runs
-  net twice with different router settings.
 
 ### `model.py` — `ElastificationModel(FastGenModel)`
 
@@ -297,7 +269,7 @@ A FastGen method (subclass of FastGenModel) with a Megatron-style hook orchestra
   1. `super().build_model()` builds `self.net` (Wan)
   2. `self.load_student_weights_and_ema()` loads pretrained ckpt
   3. `self.manager = ElastificationManager(self.net, self.config.elast)` — sets up router + hooks
-  4. If `distillation_mode == "external_teacher"`: `self.build_teacher()` (FastGen infra)
+  4. If `distillation`: `self.build_teacher()` (FastGen infra)
   5. Apply freeze flags: `self.net.requires_grad_(False)` if `freeze_model`;
      `self.manager.router.requires_grad_(False)` if `freeze_router`
 - `single_train_step(data, iteration)`:
@@ -329,7 +301,7 @@ Post-training utility. Given trained elastic model + fixed budget, physically cr
 
 Delivers real inference perf savings (activation masking alone doesn't). Separate PR.
 
-## 6. Inference
+## 5. Inference
 
 ### At runtime
 
@@ -364,128 +336,3 @@ Activation masking does not reduce compute. Attention still runs at full head co
 FFN still projects to full `mlp_hidden`. For real perf savings, use v2 materialization
 after training.
 
-## 7. Open decisions
-
-### KD form — needs a choice
-
-The paper trains a self-distillation between the full model and the sub-model. Three ways
-to realize this in FastGen:
-
-| Option | Teacher | Cost per step | Notes |
-|---|---|---|---|
-| **A** External frozen teacher | Separate Wan checkpoint, `build_teacher()`, `requires_grad=False` | +1 teacher forward | Mirrors Megatron. Uses FastGen's existing `build_teacher()` infra. Doubles teacher-weights memory. |
-| **B** Self-distillation via double forward | None — run live model twice: once at `budget=1.0` (`torch.no_grad`), once at sampled budget | +1 forward through same model | No extra weights. Teacher is a moving target — relies on the identity anchor keeping `budget=1.0` close to the original pretrained model. |
-| **C** No KD | None | 0 | Rely solely on `original_model_sample_prob` identity anchor. Simplest. |
-
-Recommendation: **A**, because it composes with FastGen's existing teacher infrastructure
-and mirrors Megatron exactly. Confirm before starting `model.py`.
-
-### Interaction with FastGen's `skip_layers` guidance flag
-
-FastGen's `classify_forward_block_forward` already supports a `skip_layers: List[int]`
-kwarg used for skip-layer guidance during teacher forward. Our router-driven layer-skip
-uses a different mechanism (block-level pre/post hooks). They don't conflict, but:
-
-- Our block hook must not be attached to a block that's already on the guidance
-  `skip_layers` list, else it double-skips silently. Address by having the block hook
-  no-op if the block is being called at all (which won't happen if it's on the skip list).
-- Router-driven skip must never appear in the guidance skip_layers list — kept independent.
-
-## 8. Test plan
-
-Coverage mirrors Megatron's `tests/unit_tests/elastification/` (~2300 lines, plumbing-style
-tests using stubs). We add numerical invariants Megatron doesn't check.
-
-### Plumbing tests (Megatron parity)
-
-- Router construction, DP-seeded Gumbel determinism, tau decay, budget interpolation.
-- Budget-utils analytical param count, linearity, soft interpolation, gradient flow.
-- Per-manager hook attach/detach lifecycle, right hooks on right sub-modules.
-- Manager orchestration order (router → push → forward).
-- Config validation.
-
-### Numerical invariants (new)
-
-1. **`test_budget_1_hard_choice_equals_original`** — the most valuable test. Take fresh
-   pretrained tiny Wan, wrap with elastification, manually override router to hard one-hot
-   on largest candidate in every axis, forward. Compare against unwrapped tiny Wan on same
-   input. Must agree to ~1e-3 in bf16, ~1e-6 in fp32.
-2. **`test_materialized_subnet_equals_elasticized`** (needs v2) — for a chosen budget:
-   run elasticized model with router pinned to that budget's hard choices, run cropped-weight
-   materialized model at those same choices. Should agree numerically.
-3. **`test_layer_skip_is_identity_residual`** — force layer L to be skipped, verify the
-   block's output equals its input.
-4. **`test_hooks_detach_restores_original`** — attach hooks, detach, forward. Should equal
-   a fresh forward with no hooks ever attached.
-5. **`test_freeze_flags_actually_freeze`** — check `param.requires_grad` and post-step
-   parameter deltas for all three phase combinations.
-6. **`test_identity_anchor_holds`** — with `original_model_sample_prob=1.0`, train N steps;
-   `max(router_prob)` on the largest candidate stays > 0.9.
-7. **`test_checkpoint_roundtrip`** — save + reload elastic model; same output as before save.
-
-### Debug playbook
-
-If invariant 1 fails: (a) toggle each hook manager individually to isolate; (b) within a
-manager, disable each hook individually; (c) at `budget=1.0` all `sqrt(k/N)` and `eps*(k/N)`
-corrections should be identity — if they're not, that's the bug; (d) check
-`router.gate_*.weight.grad` is non-None after backward.
-
-## 9. Implementation order (~15 working days)
-
-1. `router.py` — self-contained, unit-testable in isolation. (~2 days)
-2. `budget_utils.py` — pure functions. Manual sanity check against
-   `sum(p.numel() for p in wan.parameters())`. (~1 day)
-3. `hooks/self_attention.py` — one hook manager fully working on a stub `WanAttention`.
-   Test `budget_1_hard_choice_equals_original` for attention only. (~2 days)
-4. Extend to `cross_attention.py`, `ffn.py`, `block.py`, `stack.py`. One at a time, each
-   with its own numerical test. (~4 days)
-5. `manager.py` + `hooks/__init__.py` — glue. Run
-   `budget_1_hard_choice_equals_original` end-to-end on tiny Wan. (~1 day)
-6. `loss.py`, `model.py`, `config.py`, `config_elastification.py` — full FastGen
-   integration. Register in `fastgen/methods/__init__.py`. (~2 days)
-7. `scripts/inference/run_elastification_inference.py` — verify sub-net inference actually
-   runs on a tiny Wan checkpoint. (~1 day)
-8. Full test suite pass + fix bugs uncovered. (~2 days)
-9. **v2 PR (later):** `materialize.py` + `test_materialized_subnet_equals_elasticized`.
-   (~2 days)
-
-## 10. Non-goals for v1
-
-- Mamba / MoE elasticity
-- Attention-heads / head_dim elasticity
-- Per-block heterogeneous choices (Megatron's `flex_hetero_*` axes)
-- Memory-budget mode + memory-quantization profiles
-- Wan / SDXL integration (SDXL later, after Wan pattern is proven)
-- Tensor-parallel router weight sharding (FastGen uses DDP/FSDP, not TP)
-- Weight materialization (v2, separate PR)
-
-## Appendix A. Wan overrides we compose with
-
-FastGen's `Wan.override_transformer_forward` (`fastgen/networks/Wan/network.py:831-846`)
-does five monkey-patches at construction time:
-
-1. Per-block `block.forward = block_forward` (handles Wan2.1 + Wan2.2 TI2V modulation + sCM `norm_temb`)
-2. `transformer.classify_forward_prepare` (input prep helper)
-3. `transformer.classify_forward_block_forward` (per-block iteration with `skip_layers`, `feature_indices`, etc.)
-4. `transformer.forward = classify_forward` (adds `return_features_early`, `return_logvar`, etc.)
-5. Optional `timesteps_proj.forward` (official WAN sinusoidal)
-
-These exist because Wan uses diffusers as a third-party dep and FastGen composes rather
-than forks. Our elasticity hooks bind to the FastGen-overridden `block.forward` because
-`build_model()` runs after `Wan.__init__`. All compose cleanly at sub-module hook points
-(`attn1`, `attn2`, `ffn`) — orthogonal to the FastGen overrides.
-
-## Appendix B. What differs from the Megatron reference
-
-| Concern | Megatron | Ours |
-|---|---|---|
-| Method registration | Bare imperative `pretrain_hybrid_flex.py` script | `ElastificationModel(FastGenModel)` subclass |
-| How elasticity triggers per step | Monkey-patched `model.forward` runs router + hooks + original forward | `single_train_step` explicitly runs router + push-to-hooks + `self.net(...)` |
-| Router LR override | `ParamGroupOverride` via patched `get_megatron_optimizer_config` | First-class second optimizer via `get_optimizers` |
-| Distillation | ModelOpt `mtd.convert(model, ..., ("kd_loss", ...))` wraps in `DistillationModel` | FastGen's `build_teacher()` (option A) or double forward on live model (option B) |
-| Tensor parallelism | TE column/row parallel linear in router | Plain `nn.Linear` — FastGen uses DDP/FSDP only |
-| Search space axes | emb + mlp + Mamba heads + MoE experts + layer-skip | emb + mlp + layer-skip (no Mamba, no MoE) |
-| Attention-heads axis | Not implemented (comment: "no longer supported") | Not implemented (match Megatron) |
-| Memory-budget mode | Full memory profile support (`bpe_*`, YAML presets) | Param-only budget |
-| Inference entry point | None shipped (flags exist, no caller) | `scripts/inference/run_elastification_inference.py` shipped from day one |
-| Weight materialization | Not implemented | v2 (`materialize.py`) — separate PR |
