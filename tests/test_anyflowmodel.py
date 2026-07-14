@@ -31,6 +31,7 @@ def _build_pretrain_model(weight_type="beta08", consistency_ratio=0.25, r_sample
 
     instance.loss_config.loss_type = "l2"
     instance.loss_config.weight_type = weight_type
+    instance.loss_config.norm_method = None
     instance.loss_config.use_jvp_finite_diff = True
     instance.loss_config.jvp_finite_diff_eps = 1e-2
 
@@ -80,6 +81,7 @@ def _build_onpolicy_model():
     instance.sample_t_cfg.consistency_ratio = 0.25
     instance.loss_config.loss_type = "l2"
     instance.loss_config.weight_type = "uniform"
+    instance.loss_config.norm_method = None
     instance.loss_config.use_jvp_finite_diff = True
     instance.loss_config.jvp_finite_diff_eps = 1e-2
 
@@ -153,8 +155,8 @@ def test_pretrain_consistency_bucket_pins_r_to_zero():
     """With consistency_ratio=1.0 (and no flow-matching head), every sample's
     r must be pinned to 0 (consistency to clean data, as in the reference)."""
     model = _build_pretrain_model(consistency_ratio=1.0, r_sample_ratio=1.0)
-    t, r, is_diffusion = model._sample_t_r_buckets(4)
-    assert not is_diffusion.any()
+    _t, r, r_eq_t_mask = model._sample_t_r_buckets(4)
+    assert not r_eq_t_mask.any()
     assert torch.allclose(r.float(), torch.zeros_like(r.float()))
 
 
@@ -163,15 +165,15 @@ def test_pretrain_bucket_partition_is_deterministic():
     global partition: diffusion head, consistency middle, random-pair tail."""
     model = _build_pretrain_model(consistency_ratio=0.25, r_sample_ratio=0.5)
     batch_size = 8
-    t, r, is_diffusion = model._sample_t_r_buckets(batch_size)
+    t, r, r_eq_t_mask = model._sample_t_r_buckets(batch_size)
 
-    n_diffusion = round(0.5 * batch_size)
+    n_flow_matching = round(0.5 * batch_size)
     n_consistency = round(0.25 * batch_size)
-    assert is_diffusion.tolist() == [True] * n_diffusion + [False] * (batch_size - n_diffusion)
-    assert torch.equal(r[:n_diffusion], t[:n_diffusion])
+    assert r_eq_t_mask.tolist() == [True] * n_flow_matching + [False] * (batch_size - n_flow_matching)
+    assert torch.equal(r[:n_flow_matching], t[:n_flow_matching])
     assert torch.allclose(
-        r[n_diffusion : n_diffusion + n_consistency].float(),
-        torch.zeros(n_consistency),
+        r[n_flow_matching : n_flow_matching + n_consistency].float(),
+        torch.zeros(n_consistency, device=r.device),
     )
 
 
@@ -182,8 +184,8 @@ def test_pretrain_rebalance_to_diffusion():
     model.loss_config.rebalance_to_diffusion = True
 
     mf_loss = torch.tensor([2.0, 4.0, 10.0, 100.0], dtype=torch.float64, requires_grad=True)
-    is_diffusion = torch.tensor([True, True, False, False])
-    loss = model._reduce_mf_loss(mf_loss, is_diffusion)
+    r_eq_t_mask = torch.tensor([True, True, False, False])
+    loss = model._reduce_mf_loss(mf_loss, r_eq_t_mask)
 
     # diffusion mean = 3.0; each non-diffusion sample becomes ~3.0.
     expected = (2.0 + 4.0 + 3.0 * (10.0 / 10.00001) + 3.0 * (100.0 / 100.00001)) / 4.0
@@ -220,14 +222,15 @@ def test_timestep_weight_function(weight_type):
     assert torch.isfinite(w).all()
 
     if weight_type == "uniform":
-        # The reference uses exactly 1.0 for uniform.
+        # Uniform normalizes to exactly 1.0 over the reference grid.
         assert torch.allclose(w, torch.ones_like(w))
-    else:
-        # The normalization matches the reference: sum over the shifted grid == 1000.
-        shift = model.sample_t_cfg.shift
-        grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)
-        grid = shift * grid / (1 + (shift - 1) * grid)
-        assert abs(model._get_timestep_weight(grid).sum().item() - 1000.0) < 1e-6
+
+    # The normalization matches the reference set_timesteps grid (1000 points,
+    # t=0 excluded): sum over the shifted grid == 1000.
+    shift = model.sample_t_cfg.shift
+    grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)[:-1]
+    grid = shift * grid / (1 + (shift - 1) * grid)
+    assert abs(model._get_timestep_weight(grid).sum().item() - 1000.0) < 1e-6
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import torch
 from fastgen.methods import CMModel
 from fastgen.utils import basic_utils, expand_like
 from fastgen.utils.basic_utils import convert_cfg_to_dict
+from fastgen.utils.distributed import get_rank, world_size
 import fastgen.utils.logging_utils as logger
 
 
@@ -277,7 +278,7 @@ class MeanFlowModel(CMModel):
     def _sample_t_r_buckets(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample (t, r) with t >= r and assign the per-batch buckets.
 
-        Returns ``(t, r, is_diffusion)`` where ``is_diffusion`` marks the
+        Returns ``(t, r, r_eq_t_mask)`` where ``r_eq_t_mask`` marks the
         samples with ``r = t`` (pure flow matching).
 
         With ``consistency_ratio == 0`` (MeanFlow default) the flow-matching
@@ -298,51 +299,46 @@ class MeanFlowModel(CMModel):
         assert torch.all(t >= r), "r cannot be larger than t"
 
         if self.sample_t_cfg.consistency_ratio > 0:
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                world_size, rank = torch.distributed.get_world_size(), torch.distributed.get_rank()
-            else:
-                world_size, rank = 1, 0
-            global_bsz = world_size * batch_size
-            n_diffusion = round((1.0 - self.sample_t_cfg.r_sample_ratio) * global_bsz)
+            global_bsz = world_size() * batch_size
+            n_flow_matching = round((1.0 - self.sample_t_cfg.r_sample_ratio) * global_bsz)
             n_consistency = round(self.sample_t_cfg.consistency_ratio * global_bsz)
-            global_idx = rank * batch_size + torch.arange(batch_size, device=self.device)
-            is_diffusion = global_idx < n_diffusion
-            is_consistency = (global_idx >= n_diffusion) & (global_idx < n_diffusion + n_consistency)
-            r = torch.where(is_diffusion, t, r)
+            global_idx = get_rank() * batch_size + torch.arange(batch_size, device=self.device)
+            r_eq_t_mask = global_idx < n_flow_matching
+            is_consistency = (global_idx >= n_flow_matching) & (global_idx < n_flow_matching + n_consistency)
+            r = torch.where(r_eq_t_mask, t, r)
             r = torch.where(is_consistency, torch.zeros_like(r), r)
         else:
             # set t=r (flow matching loss) for a subset of the batch
             flow_matching_size = (torch.rand(batch_size, device=self.device) >= self.sample_t_cfg.r_sample_ratio).sum()
-            is_diffusion = torch.arange(batch_size, device=self.device) < flow_matching_size
-            r = torch.where(is_diffusion, t, r)
+            r_eq_t_mask = torch.arange(batch_size, device=self.device) < flow_matching_size
+            r = torch.where(r_eq_t_mask, t, r)
 
-        return t, r, is_diffusion
+        return t, r, r_eq_t_mask
 
-    def _reduce_mf_loss(self, mf_loss: torch.Tensor, is_diffusion: torch.Tensor) -> torch.Tensor:
+    def _reduce_mf_loss(self, mf_loss: torch.Tensor, r_eq_t_mask: torch.Tensor) -> torch.Tensor:
         """Reduce the per-sample loss to a scalar, optionally rebalancing.
 
         With ``loss_config.rebalance_to_diffusion`` set (AnyFlow), every
-        non-diffusion sample's loss is multiplied by the detached factor
-        ``mean(global diffusion losses) / (own loss + 1e-5)``, matching the
-        AnyFlow reference (``train_bidirection``): flow-map / consistency
-        gradients are self-normalized and rescaled to the global
-        diffusion-loss mean.
+        flow-map / consistency (r < t) sample's loss is multiplied by the
+        detached factor ``mean(global flow-matching losses) / (own loss + 1e-5)``,
+        matching the AnyFlow reference (``train_bidirection``): flow-map /
+        consistency gradients are self-normalized and rescaled to the global
+        flow-matching-loss mean.
         """
-        if getattr(self.loss_config, "rebalance_to_diffusion", False) and (~is_diffusion).any():
+        if getattr(self.loss_config, "rebalance_to_diffusion", False) and (~r_eq_t_mask).any():
             with torch.no_grad():
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    world_size = torch.distributed.get_world_size()
-                    gathered_loss = [torch.zeros_like(mf_loss) for _ in range(world_size)]
-                    gathered_mask = [torch.zeros_like(is_diffusion) for _ in range(world_size)]
+                if world_size() > 1:
+                    gathered_loss = [torch.zeros_like(mf_loss) for _ in range(world_size())]
+                    gathered_mask = [torch.zeros_like(r_eq_t_mask) for _ in range(world_size())]
                     torch.distributed.all_gather(gathered_loss, mf_loss.contiguous())
-                    torch.distributed.all_gather(gathered_mask, is_diffusion.contiguous())
+                    torch.distributed.all_gather(gathered_mask, r_eq_t_mask.contiguous())
                     global_loss = torch.cat(gathered_loss, dim=0)
                     global_mask = torch.cat(gathered_mask, dim=0)
                 else:
-                    global_loss, global_mask = mf_loss, is_diffusion
+                    global_loss, global_mask = mf_loss, r_eq_t_mask
                 scale = torch.ones_like(mf_loss)
                 if global_mask.any():
-                    scale[~is_diffusion] = global_loss[global_mask].mean() / (mf_loss[~is_diffusion] + 1e-5)
+                    scale[~r_eq_t_mask] = global_loss[global_mask].mean() / (mf_loss[~r_eq_t_mask] + 1e-5)
             mf_loss = mf_loss * scale
         return mf_loss.mean()
 
@@ -364,33 +360,41 @@ class MeanFlowModel(CMModel):
 
         The weight is evaluated directly as a function of t. The normalization
         constant matches the AnyFlow reference scheduler, which normalizes the
-        weights over its shifted discrete timestep grid; we compute the same
-        constant once and cache it.
+        weights over its shifted discrete timestep grid (``set_timesteps``:
+        1000 points excluding t=0); we compute the same constant once and
+        cache it.
         """
-        if self.loss_config.weight_type == "uniform":
-            # The reference uses exactly 1.0 for uniform (no grid normalization).
-            return torch.ones_like(t)
         if self._timestep_weight_scale is None:
             shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type == "shifted" else 1.0
-            grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)
+            grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)[:-1]
             grid = shift * grid / (1 + (shift - 1) * grid)
             self._timestep_weight_scale = float(1000.0 / self._timestep_weight_raw(grid).sum())
         return self._timestep_weight_raw(t) * self._timestep_weight_scale
 
     @torch.no_grad()
-    def _compute_weight(self, tensor: torch.Tensor) -> torch.Tensor:
-        norm_method, *norm_args = self.loss_config.norm_method.split("_")
-
-        if norm_method == "poly":
-            power = float(norm_args[0])
-            assert len(norm_args) == 1, "poly norm method requires 1 argument"
-            weight = 1 / (tensor + self.loss_config.norm_const).pow(power)
-        elif norm_method == "exp":
-            assert len(norm_args) == 2, "exp norm method requires 2 arguments"
-            const, scale = float(norm_args[0]), float(norm_args[1])
-            weight = const * torch.exp(scale * tensor + self.loss_config.norm_const)
+    def _compute_weight(self, tensor: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Per-sample loss weight: the adaptive normalization (``norm_method``,
+        a function of the per-sample loss; ``None`` disables it) times the
+        optional fixed per-timestep weight (``weight_type``, a function of t).
+        """
+        if self.loss_config.norm_method is None:
+            weight = torch.ones_like(tensor)
         else:
-            raise ValueError(f"Invalid norm method: {self.loss_config.norm_method}")
+            norm_method, *norm_args = self.loss_config.norm_method.split("_")
+
+            if norm_method == "poly":
+                power = float(norm_args[0])
+                assert len(norm_args) == 1, "poly norm method requires 1 argument"
+                weight = 1 / (tensor + self.loss_config.norm_const).pow(power)
+            elif norm_method == "exp":
+                assert len(norm_args) == 2, "exp norm method requires 2 arguments"
+                const, scale = float(norm_args[0]), float(norm_args[1])
+                weight = const * torch.exp(scale * tensor + self.loss_config.norm_const)
+            else:
+                raise ValueError(f"Invalid norm method: {self.loss_config.norm_method}")
+
+        if self.loss_config.weight_type is not None:
+            weight = weight * self._get_timestep_weight(t)
 
         assert (
             weight.shape == tensor.shape
@@ -432,15 +436,14 @@ class MeanFlowModel(CMModel):
         if self.loss_config.loss_type == "l2":
             tangent = dxt_dt - warmup_weight * delta_t * u_theta_jvp
             loss = (u_theta - tangent).pow(2)
-            if self.loss_config.weight_type is not None:
-                # Fixed per-timestep weighting with mean reduction (AnyFlow).
+            if self.loss_config.norm_method is None:
+                # Without adaptive normalization the reduction matters: the
+                # per-element mean matches the AnyFlow reference loss scale.
                 loss = torch.mean(loss, dim=list(range(1, loss.ndim)))
-                weight = self._get_timestep_weight(t)
-                loss = loss * weight
             else:
                 loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
-                weight = self._compute_weight(loss)
-                loss = loss * weight
+            weight = self._compute_weight(loss, t)
+            loss = loss * weight
 
         # use explicit gradient
         elif self.loss_config.loss_type == "opt_grad":
@@ -453,7 +456,7 @@ class MeanFlowModel(CMModel):
                 tangent = tangent * sample_dim_inv
 
             opt_grad_norm = torch.linalg.vector_norm(tangent.flatten(1), dim=-1)
-            weight = self._compute_weight(opt_grad_norm)
+            weight = self._compute_weight(opt_grad_norm, t)
             weight = expand_like(weight, tangent)
             loss = (u_theta - (u_theta + tangent * weight).detach()).pow(2)
             loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
@@ -613,7 +616,7 @@ class MeanFlowModel(CMModel):
         batch_size = real_data.shape[0]
 
         # sample t and r, with per-batch buckets (flow matching / consistency)
-        t, r, is_diffusion = self._sample_t_r_buckets(batch_size)
+        t, r, r_eq_t_mask = self._sample_t_r_buckets(batch_size)
 
         (
             mf_loss,
@@ -633,7 +636,7 @@ class MeanFlowModel(CMModel):
             neg_condition=neg_condition,
         )
 
-        loss = self._reduce_mf_loss(mf_loss, is_diffusion)
+        loss = self._reduce_mf_loss(mf_loss, r_eq_t_mask)
         loss_map = {
             "total_loss": loss,
             "mf_loss": loss,

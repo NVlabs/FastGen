@@ -59,7 +59,7 @@ class ModelConfig(DMD2ModelConfig):
 
     # Text dropout for the co-trained flow-map loss (reference drop_text_ratio).
     cond_dropout_prob: Optional[float] = None
-    cond_keys_no_dropout: List[str] = []
+    cond_keys_no_dropout: List[str] = attrs.field(factory=list)
 
     # Precision for autocast in the co-trained loss JVP (None = training precision).
     precision_amp_jvp: str | None = None

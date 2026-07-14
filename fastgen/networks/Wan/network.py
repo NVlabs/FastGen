@@ -386,9 +386,7 @@ def classify_forward_prepare(
 
         remb = self.r_embedder.time_embedder(r_timestep).type_as(encoder_hidden_states)
 
-        temb, timestep_proj, r_timestep_proj = self._fuse_r_embedding(
-            temb, timestep_proj, remb, rs_seq_len
-        )
+        temb, timestep_proj, r_timestep_proj = self._fuse_r_embedding(temb, timestep_proj, remb, rs_seq_len)
     elif r_timestep is not None:
         # Raise an error here, otherwise we silently ignore the r_timestep
         raise ValueError("r_timestep provided but no r_embedder is present")

@@ -81,6 +81,7 @@ def create_config():
     config.model.loss_config.use_cd = False
     config.model.loss_config.loss_type = "l2"
     config.model.loss_config.weight_type = "beta08"
+    config.model.loss_config.norm_method = None
     config.model.loss_config.use_jvp_finite_diff = True
     config.model.loss_config.jvp_finite_diff_eps = 5e-3
     config.model.loss_config.rebalance_to_diffusion = True

@@ -65,8 +65,9 @@ class LossConfig:
     use_jvp_finite_diff: bool = False
     # epsilon for finite difference estimate of JVP
     jvp_finite_diff_eps: float = 1e-4
-    # normalize JVP
-    norm_method: str = "poly_1.0"
+    # adaptive loss normalization as a function of the per-sample loss
+    # (None disables it; the l2 loss then reduces with a per-element mean)
+    norm_method: Optional[str] = "poly_1.0"
     # tangent warmup constant
     norm_const: float = 1e-1
     # tangent warmup steps
@@ -75,9 +76,9 @@ class LossConfig:
     tangent_spatial_invariance: bool = False
     # loss type (choice between l2 and opt_grad)
     loss_type: str = "opt_grad"
-    # fixed per-timestep loss weighting evaluated as a function of t
-    # ("beta08", "gaussian", "uniform"; used by AnyFlow). None keeps the
-    # adaptive norm_method weighting above. Only applies to loss_type="l2".
+    # optional fixed per-timestep loss weighting evaluated as a function of t
+    # ("beta08", "gaussian", "uniform"; used by AnyFlow). Multiplies the
+    # adaptive norm_method weight above; None disables it.
     weight_type: Optional[str] = None
     # prediction-side guidance fusion scale (AnyFlow guidance distillation):
     # the conditional output is trained to be the guided flow directly via
@@ -114,7 +115,7 @@ class ModelConfig(BaseModelConfig):
     cond_dropout_prob: Optional[float] = None
 
     # list of condition keys that do not drop
-    cond_keys_no_dropout: List[str] = []
+    cond_keys_no_dropout: List[str] = attrs.field(factory=list)
 
     # guidance t start
     guidance_t_start: float = 0.0

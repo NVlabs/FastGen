@@ -54,6 +54,7 @@ from fastgen.methods.consistency_model.mean_flow import MeanFlowModel
 from fastgen.methods.distribution_matching.dmd2 import DMD2Model
 from fastgen.utils import basic_utils, expand_like
 from fastgen.utils.basic_utils import convert_cfg_to_dict
+from fastgen.utils.distributed import world_size
 import fastgen.utils.logging_utils as logger
 
 
@@ -125,7 +126,7 @@ class AnyFlowModel(DMD2Model):
     def _broadcast_choice(self, high: int) -> int:
         """Pick an index in [0, high) on rank 0 and broadcast it."""
         idx = torch.randint(0, high, (1,), device=self.device, dtype=torch.long)
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if world_size() > 1:
             torch.distributed.broadcast(idx, src=0)
         return int(idx.item())
 
@@ -243,7 +244,7 @@ class AnyFlowModel(DMD2Model):
                 # Reference cotrain_forward_kl: every generator update also
                 # runs the full Stage-2 bidirection (flow-map) loss on the
                 # real batch.
-                t_mf, r_mf, is_diffusion = self._sample_t_r_buckets(real_data.shape[0])
+                t_mf, r_mf, r_eq_t_mask = self._sample_t_r_buckets(real_data.shape[0])
                 mf_outputs = self._compute_mf_loss(
                     real_data=real_data,
                     t=t_mf,
@@ -252,11 +253,9 @@ class AnyFlowModel(DMD2Model):
                     condition=condition,
                     neg_condition=neg_condition,
                 )
-                bidirection_loss = self._reduce_mf_loss(mf_outputs[0], is_diffusion)
+                bidirection_loss = self._reduce_mf_loss(mf_outputs[0], r_eq_t_mask)
                 loss_map["bidirection_loss"] = bidirection_loss
-                loss_map["total_loss"] = (
-                    loss_map["total_loss"] + self.config.cotrain_pretrain_weight * bidirection_loss
-                )
+                loss_map["total_loss"] = loss_map["total_loss"] + self.config.cotrain_pretrain_weight * bidirection_loss
             return loss_map, outputs
 
         return self._fake_score_discriminator_update_step(

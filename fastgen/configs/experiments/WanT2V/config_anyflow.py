@@ -45,7 +45,10 @@ def create_config():
     # ------ AnyFlow loss: MeanFlow l2 with fixed beta08 weighting ------
     config.model.loss_config.use_cd = False
     config.model.loss_config.loss_type = "l2"
+    # Fixed beta08 per-timestep weighting on the per-element mean loss, no
+    # adaptive normalization — matching the reference train_bidirection.
     config.model.loss_config.weight_type = "beta08"
+    config.model.loss_config.norm_method = None
     config.model.loss_config.use_jvp_finite_diff = True
     config.model.loss_config.jvp_finite_diff_eps = 5e-3
     # Rebalance the non-diffusion (flow-map / consistency) sample losses to
