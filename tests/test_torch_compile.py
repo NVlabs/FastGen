@@ -32,7 +32,10 @@ def sft_model_compiled():
     instance.cond_keys_no_dropout = []
     instance.guidance_scale = None
     model = SFTModel(instance)
-    # Compilation is applied by the trainer after DDP/FSDP wrapping; emulate that here.
+    # Mirror the trainer order: on_train_begin() moves parameters to device/dtype and
+    # initialises preprocessors; apply_torch_compile() must come after so that
+    # preprocessors exist and are on the right device when compiled.
+    model.on_train_begin()
     model.apply_torch_compile()
     return model
 
@@ -52,6 +55,7 @@ def sft_model_not_compiled():
     instance.cond_keys_no_dropout = []
     instance.guidance_scale = None
     model = SFTModel(instance)
+    model.on_train_begin()
     model.apply_torch_compile()
     return model
 
@@ -71,6 +75,7 @@ def dmd2_model_compiled():
     instance.input_shape = [3, 8, 8]
     instance.torch_compile_mode = "default"
     model = DMD2Model(instance)
+    model.on_train_begin()
     model.apply_torch_compile()
     return model
 
@@ -90,6 +95,7 @@ def dmd2_model_not_compiled():
     instance.input_shape = [3, 8, 8]
     instance.torch_compile_mode = None
     model = DMD2Model(instance)
+    model.on_train_begin()
     model.apply_torch_compile()
     return model
 
@@ -122,6 +128,7 @@ def test_dmd2_compile_disabled(dmd2_model_not_compiled):
     assert not _is_compiled(dmd2_model_not_compiled.teacher)
     assert not _is_compiled(dmd2_model_not_compiled.fake_score)
     assert not _is_compiled(dmd2_model_not_compiled.discriminator)
+
 
 def test_compile_excludes_ema(sft_model_not_compiled):
     # EMA networks live in model_dict but are weight-averaged copies that are not run
@@ -160,7 +167,6 @@ def test_compile_discovers_preprocessor_submodules(sft_model_not_compiled):
 
 def test_sft_compiled_train_step(sft_model_compiled):
     model = sft_model_compiled
-    model.on_train_begin()
     model.init_optimizers()
 
     batch_size = 1
@@ -179,7 +185,6 @@ def test_sft_compiled_train_step(sft_model_compiled):
 
 def test_dmd2_compiled_train_step(dmd2_model_compiled):
     model = dmd2_model_compiled
-    model.on_train_begin()
     model.init_optimizers()
 
     batch_size = 1
