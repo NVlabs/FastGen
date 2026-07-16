@@ -11,20 +11,35 @@ plain ints (for a concrete sub-net) or `torch.Tensor` (for the soft expected
 value produced by `soft_probs @ candidate_list_tensor`, giving a
 differentiable budget-loss term).
 
-Wan-scope drops:
+The formula is exact against `diffusers.WanTransformer3DModel` for both the
+1.3B (1,418,996,800) and 14B (14,288,491,584) reference configs at full
+width. Every parameter tensor of the full model is accounted for.
+
+Wan-scope drops relative to Megatron:
   - No Mamba, no MoE → drops `mamba_*`, `moe_*` inputs, `flex_hetero_mamba`
-    / `flex_hetero_moe_expert` branches, `moe_active` vs `moe_all` distinction,
-    and returns a single count (not the `(all, active)` tuple).
+    / `flex_hetero_moe_expert` branches, `moe_active` vs `moe_all`
+    distinction, and returns a single count (not the `(all, active)` tuple).
   - No hybrid layer-pattern string → iterates `range(num_layers)` directly.
-  - No GQA → drops `kv_channels` + `num_query_groups` split; uses `head_dim`
-    such that `num_attention_heads * head_dim = hidden_size` at full width.
+  - No GQA → drops `kv_channels` + `num_query_groups` split.
+  - No top-level `final_layernorm` (Wan does not have one).
 
 Wan additions (no Megatron analog):
-  - `text_encoder_dim` — attn2 cross-attention K/V input width.
+  - `text_encoder_dim` — dim of the frozen text encoder's output; enters
+    ONLY through `condition_embedder.text_embedder.linear_1`, not through
+    `attn2.to_k`/`to_v`, because text is projected to `hidden_size` by
+    `text_embedder` before the transformer blocks see it.
   - `in_channels` / `out_channels` / `patch_dim` — patch-embed + proj-out.
   - `time_freq_dim` — sinusoidal-embedding intermediate.
-  - Cross-attention block per WanTransformerBlock.
-  - AdaLN modulation table `[6, hidden]` per block.
+  - `time_proj` (h → 6·h) inside condition_embedder for AdaLN modulation.
+  - Cross-attention block (`attn2`) per WanTransformerBlock.
+  - Per-block `scale_shift_table` `[6, h]` + top-level `scale_shift_table`
+    `[2, h]` for AdaLN.
+  - All linear layers carry biases (attn Q/K/V/out, ffn fc1/fc2,
+    condition_embedder linears, patch_embedding, proj_out).
+  - `norm2` inside each block is affine (from `cross_attn_norm=True`);
+    `norm1` and `norm3` are parameter-free.
+  - `norm_q` / `norm_k` inside each attention module are `hidden`-sized
+    (rms_norm_across_heads), not `head_dim`-sized.
 """
 
 from __future__ import annotations
@@ -53,73 +68,89 @@ def get_num_parameters(
 ) -> ScalarOrTensor:
 
     norm_multiplier = 1
+    h = hidden_size
 
-    # Wan input / output boilerplate. Megatron LLMs have `embedding` +
-    # `final_layernorm` + `output_layer` here; Wan has patch-embed on the
-    # input side and a projection back to patch space on the output side,
-    # plus condition-embedder projections that scale with hidden_size.
-    patch_embed = in_channels * patch_dim * hidden_size
-    time_embed = time_freq_dim * hidden_size + hidden_size * hidden_size
-    text_embed = text_encoder_dim * hidden_size + hidden_size * hidden_size
-    final_layernorm = hidden_size * 1
-    proj_out = hidden_size * (patch_dim * out_channels)
+    # ── Top-level (not per-block) ─────────────────────────────────────
+    # Wan replaces Megatron's `embedding + final_layernorm + output_layer`
+    # with a patch-embed on the input, a condition-embedder that scales
+    # with hidden_size, and a proj-out to patch space. There is no
+    # top-level LayerNorm in Wan.
 
+    # patch_embedding: Conv3d(in_channels, hidden, kernel=patch_size)
+    patch_embed = in_channels * patch_dim * h + h
+
+    # condition_embedder.text_embedder: text_encoder_dim → h → h
+    text_embed = (text_encoder_dim * h + h) + (h * h + h)
+
+    # condition_embedder.time_embedder: freq_dim → h → h
+    time_embed = (time_freq_dim * h + h) + (h * h + h)
+
+    # condition_embedder.time_proj: h → 6·h for AdaLN modulation
+    time_proj = h * (6 * h) + 6 * h
+
+    # Top-level scale_shift_table [2, h]
+    top_scale_shift = 2 * h
+
+    # proj_out: h → patch_dim · out_channels
+    proj_out = h * (patch_dim * out_channels) + (patch_dim * out_channels)
+
+    # ── Hetero-FFN detection (mirrors Megatron) ───────────────────────
     if isinstance(ffn_hidden_size, int):
         flex_hetero_ffn = False
     else:
         flex_hetero_ffn = ffn_hidden_size.shape[0] != 1
 
-    # FFN (mirrors Megatron's `moe_all`/`moe_active`, collapsed to a single
-    # value because Wan has no MoE).
+    # ── FFN block ─────────────────────────────────────────────────────
+    # Mirrors Megatron's `moe_all` structure, collapsed to a single value
+    # because Wan has no MoE. Wan's `WanTransformerBlock.ffn` is a diffusers
+    # `FeedForward` with `net.0` (linear+GELU) + `net.2` (linear), both
+    # with biases.
 
     if flex_hetero_ffn:
         ffn_all = []
         for i in range(ffn_hidden_size.shape[0]):
-            pre_mlp_ln = norm_multiplier * hidden_size
-            linear_fc1 = ffn_hidden_size[i] * hidden_size
-            linear_fc2 = ffn_hidden_size[i] * hidden_size
-            ffn_all.append(pre_mlp_ln + linear_fc1 + linear_fc2)
+            linear_fc1 = ffn_hidden_size[i] * h + ffn_hidden_size[i]  # weight + bias
+            linear_fc2 = h * ffn_hidden_size[i] + h                    # weight + bias
+            ffn_all.append(linear_fc1 + linear_fc2)
     else:
-        pre_mlp_ln = norm_multiplier * hidden_size
-        linear_fc1 = ffn_hidden_size * hidden_size
-        linear_fc2 = ffn_hidden_size * hidden_size
-        ffn_all = pre_mlp_ln + linear_fc1 + linear_fc2
+        linear_fc1 = ffn_hidden_size * h + ffn_hidden_size
+        linear_fc2 = h * ffn_hidden_size + h
+        ffn_all = linear_fc1 + linear_fc2
 
-    # ATT (self-attention — `attn1`). Wan uses full attention with
-    # `num_attention_heads * head_dim = hidden_size`, so we compute
-    # `linear_qkv = 3 * num_attention_heads * head_dim * hidden_size` directly
-    # rather than the `(num_heads + 2*num_query_groups) * kv_channels * hidden`
-    # GQA-aware formula Megatron uses.
+    # ── ATT block ─────────────────────────────────────────────────────
+    # attn1 (self-attn) and attn2 (cross-attn) have identical parameter
+    # shapes: four hidden×hidden linears (Q/K/V/out) each with bias, plus
+    # two hidden-sized RMSNorm weights (norm_q, norm_k). Wan does full
+    # attention with `num_attention_heads * head_dim = h`, no GQA — so
+    # Megatron's `(num_heads + 2*num_query_groups) * kv_channels * h`
+    # collapses to `4 * h * h`. Cross-attn K/V input is `h` too (not
+    # `text_encoder_dim`), because `text_embedder` above already projected
+    # the text encoder output to `h`.
+    linear_qkv_out_weight = 4 * h * h
+    linear_qkv_out_bias = 4 * h
+    norm_qk = 2 * h
+    att = linear_qkv_out_weight + linear_qkv_out_bias + norm_qk
 
-    input_ln = norm_multiplier * hidden_size
-    linear_proj = num_attention_heads * head_dim * hidden_size
-    linear_qkv = 3 * num_attention_heads * head_dim * hidden_size
-    att = input_ln + linear_proj + linear_qkv
+    # ── Norms + AdaLN scale-shift ─────────────────────────────────────
+    # Only `norm2` is affine (from `cross_attn_norm=True`); `norm1` and
+    # `norm3` are parameter-free LayerNorms.
+    norm2 = 2 * norm_multiplier * h
 
-    # CROSS-ATT (`attn2`) — new relative to Megatron.
-    # `linear_q` and `linear_out` both project on the video-side hidden;
-    # `linear_k` and `linear_v` project from the frozen text-encoder output.
+    # Per-block scale_shift_table [6, h]
+    adaln = 6 * h
 
-    input_ln_cross = norm_multiplier * hidden_size
-    linear_q_cross = num_attention_heads * head_dim * hidden_size
-    linear_proj_cross = num_attention_heads * head_dim * hidden_size
-    linear_kv_cross = 2 * text_encoder_dim * hidden_size
-    cross = input_ln_cross + linear_q_cross + linear_proj_cross + linear_kv_cross
-
-    # AdaLN modulation `scale_shift_table` `[6, hidden]` per block.
-    adaln = 6 * hidden_size
-
-    # Per-block loop mirrors Megatron's `for i, c in enumerate(hybrid_pattern):`
-    # but Wan has no pattern — every block is the same type. Optional
+    # ── Per-block loop ────────────────────────────────────────────────
+    # Mirrors Megatron's `for i, c in enumerate(hybrid_pattern):` but Wan
+    # has no pattern — every block is the same type. Optional
     # `layer_skip_probs[i]` weights each block's contribution by
     # `(1 - skip_prob)` (the "phantom" skip axis).
 
     all_params = 0
     for i in range(num_layers):
         if flex_hetero_ffn:
-            block = att + cross + adaln + ffn_all[i]
+            block = 2 * att + norm2 + adaln + ffn_all[i]
         else:
-            block = att + cross + adaln + ffn_all
+            block = 2 * att + norm2 + adaln + ffn_all
 
         if layer_skip_probs is not None:
             block = block * (1 - layer_skip_probs[i])
@@ -128,9 +159,10 @@ def get_num_parameters(
 
     return (
         patch_embed
-        + time_embed
         + text_embed
-        + all_params
-        + final_layernorm
+        + time_embed
+        + time_proj
+        + top_scale_shift
         + proj_out
+        + all_params
     )
