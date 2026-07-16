@@ -6,6 +6,40 @@ into FastGen, targeting Wan diffusion transformers.
 - Reference paper: <https://arxiv.org/pdf/2511.16664>
 - Reference implementation: `Megatron-LM/megatron/elastification/`
 
+## Design principle: mirror the Megatron reference
+
+Match Megatron-LM's `elastification/` module 1:1 wherever practical — attribute
+names, method names, `__init__` ordering, method-body structure, config field
+names. The intent is frictionless side-by-side comparison for debugging and
+code review.
+
+Only deviate when Megatron requires machinery FastGen doesn't have (pipeline /
+tensor parallelism, TransformerEngine parallel linears, `MegatronModule`,
+`get_args()` globals, `hybrid_layer_pattern`, ModelOpt distillation), or when a
+scope reduction from this plan applies (no Mamba/MoE/memory-mode/heterogeneous
+Mamba). Every deviation is called out in an inline comment; parallels are not.
+
+### Known Megatron quirks
+
+Reference behaviors that look like bugs. Fixed here when they'd break
+default configurations; noted for later verification against Megatron's
+actual training scripts.
+
+- **`FlextronRouter.mlp_forward` unbound `scale` — FIXED here, needs
+  Megatron-side verification.** When `linear_scaler_start` /
+  `linear_scaler_end` / `train_iters` are `None` (scaler disabled),
+  Megatron's `mlp_forward` still references a local `scale` variable that
+  was never assigned → `NameError` on the first forward. The only safe
+  config that avoids all `scale` references is
+  `normalize_router_logits=True` **and** `len(mlp_int_list) <= 1` (no MLP
+  elasticity). Every other config either requires the scaler to be
+  enabled or hits the NameError. Our port defaults `scale = 1.0` when
+  `self.scaler is None` so the `scale * ...` multiplications become
+  no-ops. **TODO:** double-check whether Megatron's actual training runs
+  always enable the scaler (via `--linear-scaler-start` / `--linear-scaler-end`
+  CLI args) — if so, the "bug" is dormant in their production configs and
+  our default-1.0 fix is a strict superset of the reference behavior.
+
 ## 1. Locked-in decisions for this port
 
 | Area | Decision | Rationale |
@@ -68,8 +102,8 @@ fastgen/methods/elastification/
 ├── __init__.py                       # exports ElastificationModel
 ├── PLAN.md                           # this file
 ├── README.md                         # end-user doc: search space, phases, inference
-├── config.py                         # ElastConfig (attrs dataclass) + validation
-├── router.py                         # ElasticRouter (Gumbel-softmax, DP-seeded, tau decay)
+├── config.py                         # FlextronConfig (attrs dataclass) + validation
+├── router.py                         # FlextronRouter (Gumbel-softmax, DP-seeded, tau decay)
 ├── budget_utils.py                   # analytical Wan param count on soft router outputs
 ├── hooks/
 │   ├── __init__.py                   # apply_elasticity_to_wan(net, cfg)
@@ -140,7 +174,7 @@ the smaller search space (no Mamba, no MoE, no per-block heterogeneity, no TP ro
 
 ```python
 @attrs.define(slots=False)
-class ElastConfig:
+class FlextronConfig:
     # ── Search space ──────────────────────────────────
     emb_int_list: List[int] = []                  # e.g. [5120, 3840, 2560, 1280]
     mlp_int_list: List[int] = []                  # e.g. [13824, 10368, 6912, 3456]
@@ -190,11 +224,11 @@ class ElastConfig:
 
 ### `router.py`
 
-`ElasticRouter(nn.Module)`. Same shape as Megatron's `FlextronRouter` stripped of tensor-parallel
+`FlextronRouter(nn.Module)`. Same shape as Megatron's `FlextronRouter` stripped of tensor-parallel
 linear layers (FastGen uses DDP/FSDP, not TP). Just two `nn.Linear` layers per axis. Preserves:
 
 - Gumbel-softmax with `tau = tau_init * tau_decay^iteration`
-- DP-seeded Gumbel noise so all data-parallel ranks pick the same choice per step
+- DP-seeded Gumbel noise: seed is `base_seed + (dp_rank + fwd_count * dp_size) % router_gbs + iteration * 1000`, so each (rank, micro-step, iteration) triple draws distinct noise. Different DP ranks and different grad-accum micro-steps sample *different* sub-architectures at the same target budget — one training step covers `dp_size × grad_accum_rounds` distinct samples of the discrete choice space, increasing gradient-signal diversity per update. Deterministic across reruns.
 - Budget one-hot lookup + linear interpolation for intermediate budgets
 - `forward(budget) → dict[str, (soft_probs, chosen_int)]` per axis
 - 3 axes: `mlp`, `emb`, `layer_skip`
@@ -246,7 +280,7 @@ Orchestrator. Modeled on Megatron's `FlextronModelManager`.
 
 - `__init__(net, cfg)`:
   - Store net + cfg
-  - Build `ElasticRouter`
+  - Build `FlextronRouter`
   - Call `apply_elasticity_to_wan(net, cfg)` → store hook managers
   - Pre-compute full-model param count for budget-loss normalization
   - Optional: warn if any `emb_int_list` entry is not a multiple of `head_dim` (soft warning; not enforced)
@@ -321,7 +355,7 @@ Recipe:
 
 `scripts/inference/run_elastification_inference.py`:
 
-1. Parse args + ElastConfig
+1. Parse args + FlextronConfig
 2. Instantiate `ElastificationModel` from config
 3. Load ckpt
 4. Pin `override_selected_budget` and `is_eval`
