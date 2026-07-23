@@ -1135,7 +1135,8 @@ class CosmosPredict2(FastGenNetwork):
                 shape (B, C, T, H, W). If provided, enables video2world mode.
             num_conditioning_frames: Number of frames to use for conditioning (default 1).
             conditional_frame_timestep: Timestep value for conditioning frames (default 0.0).
-                Use 0.0 to indicate clean frames with no noise.
+                Use 0.0 to indicate clean frames with no noise, or a negative value
+                to disable the special conditioning-frame timestep.
             denoise_replace_gt_frames: Whether to replace velocity for conditioning frames
                 with analytical velocity (noise - gt_frames). Default True.
 
@@ -1222,30 +1223,40 @@ class CosmosPredict2(FastGenNetwork):
                 v2w_condition = {"conditioning_latents": conditioning_latents, "condition_mask": condition_mask}
                 model_input = self.preserve_conditioning(latents, v2w_condition)
 
-                # Per-frame timesteps: conditioning frames get special timestep if enabled
-                B, _, T, _, _ = latents.shape
-                if conditional_frame_timestep >= 0:
-                    t_expanded = t.unsqueeze(1).expand(B, T)
-                    mask_B_T = condition_mask[:, 0, :, 0, 0]
-                    t_per_frame = conditional_frame_timestep * mask_B_T + t_expanded * (1 - mask_B_T)
-                else:
-                    t_per_frame = t
-
                 # Wrap condition with mask for forward() to use
-                cond_with_mask = {"text_embeds": condition, "condition_mask": condition_mask}
-                neg_cond_with_mask = {"text_embeds": neg_condition, "condition_mask": condition_mask}
+                cond_with_mask = {
+                    "text_embeds": condition,
+                    "conditioning_latents": conditioning_latents,
+                    "condition_mask": condition_mask,
+                }
+                neg_cond_with_mask = {
+                    "text_embeds": neg_condition,
+                    "conditioning_latents": conditioning_latents,
+                    "condition_mask": condition_mask,
+                }
             else:
                 model_input = latents
-                t_per_frame = t
                 cond_with_mask = condition
                 neg_cond_with_mask = neg_condition
 
             # Forward pass
-            velocity_pred = self(model_input, t_per_frame, cond_with_mask, fps=fps)
+            velocity_pred = self(
+                model_input,
+                t,
+                cond_with_mask,
+                fps=fps,
+                conditional_frame_timestep=conditional_frame_timestep,
+            )
 
             # Classifier-free guidance
             if guidance_scale > 1.0:
-                velocity_uncond = self(model_input, t_per_frame, neg_cond_with_mask, fps=fps)
+                velocity_uncond = self(
+                    model_input,
+                    t,
+                    neg_cond_with_mask,
+                    fps=fps,
+                    conditional_frame_timestep=conditional_frame_timestep,
+                )
                 velocity_pred = velocity_uncond + guidance_scale * (velocity_pred - velocity_uncond)
 
             # Replace velocity for conditioning frames with analytical velocity: v = noise - x0
@@ -1278,6 +1289,7 @@ class CosmosPredict2(FastGenNetwork):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         skip_layers: Optional[List[int]] = None,
+        conditional_frame_timestep: float = 0.0,
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -1304,6 +1316,9 @@ class CosmosPredict2(FastGenNetwork):
             fps: Frames per second tensor
             padding_mask: Padding mask tensor
             skip_layers: List of block indices to skip during forward pass
+            conditional_frame_timestep: Timestep value for conditioning frames (default 0.0).
+                Use 0.0 to indicate clean frames with no noise, or a negative value
+                to disable the special conditioning-frame timestep.
 
         Returns:
             Depending on the arguments:
@@ -1340,6 +1355,8 @@ class CosmosPredict2(FastGenNetwork):
 
         # Video2world training: replace input frames with conditioning latents
         model_input = x_t
+        transformer_t = t
+        conversion_t = t
         if conditioning_latents is not None and condition_mask is not None:
             B, C, T, H, W = x_t.shape
             # Expand condition_mask to channel dimension
@@ -1353,9 +1370,27 @@ class CosmosPredict2(FastGenNetwork):
             # Replace conditioning frames
             model_input = conditioning_latents_full * condition_mask_C + x_t * (1 - condition_mask_C)
 
+            # Normalize to per-frame timesteps. Conditioning frames use the special
+            # timestep when enabled; a negative value preserves the original timestep.
+            if t.ndim == 1:
+                t_expanded = t.unsqueeze(1).expand(B, T)
+            elif t.ndim == 2:
+                t_expanded = t.expand(B, T)
+            else:
+                raise ValueError(f"Expected t with rank 1 or 2, got shape {tuple(t.shape)}")
+
+            mask_B_T = condition_mask[:, 0, :, 0, 0].to(t.dtype)  # (B, T)
+            if conditional_frame_timestep >= 0:
+                transformer_t = t_expanded * (1 - mask_B_T) + conditional_frame_timestep * mask_B_T
+            else:
+                transformer_t = t_expanded
+
+            # Reshape for convert_model_output broadcasting against (B, C, T, H, W)
+            conversion_t = transformer_t.reshape(B, 1, T, 1, 1)
+
         model_outputs = self.transformer(
             x_B_C_T_H_W=model_input,
-            timesteps_B_T=t,
+            timesteps_B_T=transformer_t,
             crossattn_emb=text_embeds,
             fps=fps,
             padding_mask=padding_mask,
@@ -1385,7 +1420,7 @@ class CosmosPredict2(FastGenNetwork):
         if len(feature_indices) == 0:
             assert isinstance(out, torch.Tensor)
             out = self.noise_scheduler.convert_model_output(
-                model_input, out, t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
+                model_input, out, conversion_t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
             )
             # Video2world training: replace x0 prediction for conditioning frames
             if conditioning_latents is not None and condition_mask is not None and fwd_pred_type == "x0":
@@ -1393,7 +1428,7 @@ class CosmosPredict2(FastGenNetwork):
         else:
             assert isinstance(out, list)
             out[0] = self.noise_scheduler.convert_model_output(
-                model_input, out[0], t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
+                model_input, out[0], conversion_t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
             )
             # Video2world training: replace x0 prediction for conditioning frames
             if conditioning_latents is not None and condition_mask is not None and fwd_pred_type == "x0":

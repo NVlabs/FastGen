@@ -689,6 +689,8 @@ def main(args, config: BaseConfig):
                 "precision_amp": model.precision_amp_infer,
                 "fps": torch.full((noise.shape[0],), float(args.fps), device=noise.device),
             }
+            if getattr(model.net, "is_video2world", False):
+                teacher_kwargs["conditional_frame_timestep"] = args.conditional_frame_timestep
             if config.model.skip_layers is not None:
                 teacher_kwargs["skip_layers"] = config.model.skip_layers
 
