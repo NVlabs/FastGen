@@ -1379,8 +1379,8 @@ class CosmosPredict2(FastGenNetwork):
             else:
                 raise ValueError(f"Expected t with rank 1 or 2, got shape {tuple(t.shape)}")
 
-            mask_B_T = condition_mask[:, 0, :, 0, 0].to(t.dtype)  # (B, T)
             if conditional_frame_timestep >= 0:
+                mask_B_T = condition_mask[:, 0, :, 0, 0].to(t.dtype)  # (B, T)
                 transformer_t = t_expanded * (1 - mask_B_T) + conditional_frame_timestep * mask_B_T
             else:
                 transformer_t = t_expanded
