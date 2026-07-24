@@ -17,8 +17,8 @@ def create_config():
     # Small resolution for testing: 320x176 video -> 40x22 latent, 93 frames -> 24 latent
     # Full 720p: [16, 24, 88, 160] (1280x704 @ 93 frames)
     # config.model.input_shape = [16, 24, 22, 40]  # cthw - 256p (320x176 video)
-    config.model.input_shape = [16, 24, 60, 104]  # cthw - 480p, 93 frames
-    # config.model.input_shape = [16, 24, 88, 160]  # cthw - full 720p, 93 frames
+    # config.model.input_shape = [16, 24, 60, 104]  # cthw - 480p, 93 frames
+    config.model.input_shape = [16, 24, 88, 160]  # cthw - full 720p, 93 frames
 
     # Network and discriminator for 14B
     config.model.net = CosmosPredict2_14B_Config

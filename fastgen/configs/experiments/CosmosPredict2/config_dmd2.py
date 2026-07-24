@@ -28,8 +28,8 @@ def create_config():
     # Small resolution for testing: 320x176 video -> 40x22 latent, 93 frames -> 24 latent
     # Full 720p: [16, 24, 88, 160] (1280x704 @ 93 frames)
     # config.model.input_shape = [16, 24, 22, 40]  # cthw - 256p (320x176 video)
-    config.model.input_shape = [16, 24, 60, 104]  # cthw - 480p, 93 frames
-    # config.model.input_shape = [16, 24, 88, 160]  # cthw - full 720p, 93 frames
+    # config.model.input_shape = [16, 24, 60, 104]  # cthw - 480p, 93 frames
+    config.model.input_shape = [16, 24, 88, 160]  # cthw - full 720p, 93 frames
 
     # Network and discriminator
     config.model.net = CosmosPredict2_2B_Config
@@ -44,7 +44,8 @@ def create_config():
     config.model.gan_use_same_t_noise = True
     config.model.fake_score_pred_type = "x0"
     config.model.student_sample_type = "ode"
-    config.model.guidance_scale = 3.0
+    # Official 2B DMD2 teacher guidance scale
+    config.model.guidance_scale = 4.0
     config.model.pretrained_model_path = f"{CKPT_ROOT_DIR}/cosmos_predict2/Cosmos-Predict2.5-2B/base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt"
 
     # Timestep sampling

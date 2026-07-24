@@ -51,55 +51,6 @@ import fastgen.utils.logging_utils as logger
 from fastgen.utils.basic_utils import str2bool
 
 
-_COSMOS_KARRAS_SIGMA_MAX = 200.0
-_COSMOS_KARRAS_SIGMA_MIN = 0.01
-_COSMOS_KARRAS_RHO = 7.0
-
-
-def _build_cosmos_predict2_karras_schedule(
-    num_steps: int,
-    num_train_timesteps: int,
-    device: Union[torch.device, str],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build the Karras sigma/timestep schedule used by official Cosmos Predict2.5 inference."""
-    if num_steps <= 0:
-        raise ValueError(f"num_steps must be positive, got {num_steps}")
-
-    ramp = torch.arange(num_steps + 1, dtype=torch.float64) / num_steps
-    min_inv_rho = _COSMOS_KARRAS_SIGMA_MIN ** (1 / _COSMOS_KARRAS_RHO)
-    max_inv_rho = _COSMOS_KARRAS_SIGMA_MAX ** (1 / _COSMOS_KARRAS_RHO)
-    sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** _COSMOS_KARRAS_RHO
-    sigmas = sigmas / (1 + sigmas)
-
-    timesteps = (sigmas * num_train_timesteps).to(device=device, dtype=torch.int64)
-    sigmas = torch.cat([sigmas, sigmas.new_zeros(1)]).to(dtype=torch.float32)
-    return sigmas, timesteps
-
-
-def _reset_unipc_scheduler_state(scheduler: UniPCMultistepScheduler) -> None:
-    scheduler.model_outputs = [None] * scheduler.config.solver_order
-    scheduler.lower_order_nums = 0
-    scheduler.last_sample = None
-    scheduler._step_index = None
-    scheduler._begin_index = None
-
-
-def _apply_cosmos_predict2_karras_schedule(
-    scheduler: UniPCMultistepScheduler,
-    num_steps: int,
-    device: Union[torch.device, str],
-) -> None:
-    sigmas, timesteps = _build_cosmos_predict2_karras_schedule(
-        num_steps=num_steps,
-        num_train_timesteps=scheduler.config.num_train_timesteps,
-        device=device,
-    )
-    scheduler.sigmas = sigmas
-    scheduler.timesteps = timesteps
-    scheduler.num_inference_steps = len(timesteps)
-    _reset_unipc_scheduler_state(scheduler)
-
-
 # ---------------------- DiT Network -----------------------
 
 
@@ -816,7 +767,7 @@ class CosmosPredict2(FastGenNetwork):
         use_wan_fp32_strategy: bool = True,
         # FPS for temporal position embeddings
         fps: float = 24.0,
-        use_karras_sigma_schedule: bool = True,
+        rope_enable_fps_modulation: bool = True,
         # Video2world (image-to-video) mode settings
         is_video2world: bool = False,
         num_conditioning_frames: int = 1,
@@ -857,6 +808,7 @@ class CosmosPredict2(FastGenNetwork):
             rope_h_extrapolation_ratio=rope_h_extrapolation_ratio,
             rope_w_extrapolation_ratio=rope_w_extrapolation_ratio,
             rope_t_extrapolation_ratio=rope_t_extrapolation_ratio,
+            rope_enable_fps_modulation=rope_enable_fps_modulation,
             use_wan_fp32_strategy=use_wan_fp32_strategy,
         )
 
@@ -873,9 +825,6 @@ class CosmosPredict2(FastGenNetwork):
 
         # Default FPS for temporal position embeddings
         self.fps = fps
-
-        # Match official Cosmos Predict2.5 SFT inference schedule by default.
-        self.use_karras_sigma_schedule = use_karras_sigma_schedule
 
         # Initialize the sample scheduler for inference later (otherwise it causes issues with Meta init)
         self.sample_scheduler = None
@@ -1156,9 +1105,8 @@ class CosmosPredict2(FastGenNetwork):
         fps: Optional[torch.Tensor] = None,
         conditioning_latents: Optional[torch.Tensor] = None,
         num_conditioning_frames: int = 1,
-        conditional_frame_timestep: float = 0.0,
+        conditional_frame_timestep: float = 1e-4,
         denoise_replace_gt_frames: bool = True,
-        use_karras_sigma_schedule: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Multistep sampling using the FlowUniPC method.
@@ -1179,46 +1127,43 @@ class CosmosPredict2(FastGenNetwork):
             noise: The noisy latents to start from, shape (B, C, T, H, W).
             condition: The conditioning embeddings.
             neg_condition: The negative/unconditional embeddings for CFG.
-            guidance_scale: Classifier-free guidance scale. Values > 1.0 enable CFG.
-            num_steps: The number of sampling steps.
-            shift: Noise schedule shift parameter.
+            guidance_scale: Conventional classifier-free guidance scale.
+                Values greater than 1.0 enable CFG.
+            num_steps: Number of intervals in the official Karras schedule.
+                The sampler evaluates ``num_steps + 1`` timesteps.
+            shift: Retained for scheduler API compatibility. The official
+                Karras path uses fixed sigma bounds and does not apply flow shift.
             skip_layers: List of transformer layers to skip (for skip-layer guidance).
             skip_layers_start_percent: Percentage of steps before starting to skip layers.
             fps: Frames per second tensor for temporal conditioning.
             conditioning_latents: Latent frames to condition on for video2world mode,
                 shape (B, C, T, H, W). If provided, enables video2world mode.
             num_conditioning_frames: Number of frames to use for conditioning (default 1).
-            conditional_frame_timestep: Timestep value for conditioning frames (default 0.0).
-                Use 0.0 to indicate clean frames with no noise, or a negative value
-                to disable the special conditioning-frame timestep.
             denoise_replace_gt_frames: Whether to replace velocity for conditioning frames
                 with analytical velocity (noise - gt_frames). Default True.
-            use_karras_sigma_schedule: Whether to use the official Cosmos Predict2.5
-                Karras sigma schedule for SFT inference. Defaults to self.use_karras_sigma_schedule.
 
         Returns:
             The denoised sample tensor.
         """
         assert self.schedule_type == "rf", f"{self.schedule_type} is not supported"
-        if use_karras_sigma_schedule is None:
-            use_karras_sigma_schedule = self.use_karras_sigma_schedule
 
-        # Set timesteps with shift parameter (matching official Cosmos inference)
+        # Match official Cosmos Predict2.5 inference. Diffusers uses the
+        # configured sigma bounds for its Karras conversion; the official
+        # `num_steps` denotes intervals, hence `num_steps + 1` ramp points.
         if self.sample_scheduler is None:
             self.sample_scheduler = UniPCMultistepScheduler(
                 num_train_timesteps=1000,
                 prediction_type="flow_prediction",
                 use_flow_sigmas=True,
                 flow_shift=shift,
+                use_karras_sigmas=True,
+                sigma_min=0.01,
+                sigma_max=200.0,
             )
-        else:
-            self.sample_scheduler.config.flow_shift = shift
-        self.sample_scheduler.set_timesteps(num_inference_steps=num_steps, device=noise.device)
-        if use_karras_sigma_schedule:
-            _apply_cosmos_predict2_karras_schedule(self.sample_scheduler, num_steps=num_steps, device=noise.device)
+        self.sample_scheduler.set_timesteps(num_inference_steps=num_steps + 1, device=noise.device)
         timesteps = self.sample_scheduler.timesteps
 
-        # Initialize latents with proper scaling based on the initial timestep
+        # Initialize latents using the FastGen noise-schedule convention.
         t_init = timesteps[0] / self.sample_scheduler.config.num_train_timesteps
         latents = self.noise_scheduler.latents(noise=noise, t_init=t_init)
 
@@ -1271,7 +1216,7 @@ class CosmosPredict2(FastGenNetwork):
             # Store initial noise for velocity replacement
             initial_noise = latents.clone()
 
-        for idx, timestep in tqdm(enumerate(timesteps), total=len(timesteps), desc="Sampling"):
+        for timestep in tqdm(timesteps, total=len(timesteps), desc="Sampling"):
             # Normalize timestep to [0, 1] range
             t = (timestep / self.sample_scheduler.config.num_train_timesteps).expand(latents.shape[0])
             t = self.noise_scheduler.safe_clamp(t, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t).to(
@@ -1324,14 +1269,10 @@ class CosmosPredict2(FastGenNetwork):
                 gt_velocity = initial_noise - conditioning_latents_full
                 velocity_pred = gt_velocity * condition_mask_C + velocity_pred * (1 - condition_mask_C)
 
-            # Scheduler step (use model_input for video2world since that's what velocity was computed on)
-            sample_input = model_input if video2world_mode else latents
-            latents = self.sample_scheduler.step(velocity_pred, timestep, sample_input, return_dict=False)[0]
-
-            # Preserve conditioning frames after each step to prevent numerical drift
-            if video2world_mode:
-                v2w_condition = {"conditioning_latents": conditioning_latents, "condition_mask": condition_mask}
-                latents = self.preserve_conditioning(latents, v2w_condition)
+            # Only the DiT input receives clean conditioning frames. UniPC must
+            # evolve the original latent state; the analytical conditioning-frame
+            # velocity above drives those frames from their initial noise to x0.
+            latents = self.sample_scheduler.step(velocity_pred, timestep, latents, return_dict=False)[0]
 
         return latents
 
@@ -1376,9 +1317,10 @@ class CosmosPredict2(FastGenNetwork):
             fps: Frames per second tensor
             padding_mask: Padding mask tensor
             skip_layers: List of block indices to skip during forward pass
-            conditional_frame_timestep: Timestep value for conditioning frames (default 0.0).
-                Use 0.0 to indicate clean frames with no noise, or a negative value
-                to disable the special conditioning-frame timestep.
+            conditional_frame_timestep: Normalized timestep for conditioning frames.
+                ``forward()`` defaults to 0.0; ``sample()`` passes 1e-4, equivalent
+                to the official raw timestep 0.1 after its 0.001 network scale.
+                A negative value disables the special conditioning-frame timestep.
 
         Returns:
             Depending on the arguments:

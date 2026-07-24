@@ -14,34 +14,29 @@ Examples:
     # T2V: eval teacher only (Wan)
     PYTHONPATH=$(pwd) FASTGEN_OUTPUT_ROOT='FASTGEN_OUTPUT' torchrun --nproc_per_node=1 --standalone \\
         scripts/inference/video_model_inference.py --do_student_sampling False \\
-        --num_steps 50 --fps 16 --neg_prompt_file scripts/inference/prompts/negative_prompt.txt \\
         --config fastgen/configs/experiments/WanT2V/config_dmd2.py \\
         - trainer.seed=1 trainer.ddp=True model.guidance_scale=5.0 log_config.name=wan_t2v_inference
 
     # I2V: image-to-video (Wan I2V)
     PYTHONPATH=$(pwd) FASTGEN_OUTPUT_ROOT='FASTGEN_OUTPUT' torchrun --nproc_per_node=1 --standalone \\
         scripts/inference/video_model_inference.py --do_student_sampling False \\
-        --num_steps 50 --fps 16 --neg_prompt_file scripts/inference/prompts/negative_prompt.txt \\
         --input_image_file scripts/inference/prompts/source_image_paths.txt \\
-        --config fastgen/configs/experiments/WanI2V/config_dmd2_wan22_5b.py \\
+        --config fastgen/configs/experiments/WanI2V/config_dmd2_14b.py \\
         - trainer.seed=1 trainer.ddp=True model.guidance_scale=5.0 log_config.name=wan_i2v_inference
 
     # V2V: video-to-video with VACE
     PYTHONPATH=$(pwd) FASTGEN_OUTPUT_ROOT='FASTGEN_OUTPUT' torchrun --nproc_per_node=1 --standalone \\
         scripts/inference/video_model_inference.py --do_student_sampling False \\
-        --num_steps 50 --fps 16 --neg_prompt_file scripts/inference/prompts/negative_prompt.txt \\
         --source_video_file scripts/inference/prompts/source_video_paths.txt \\
         --config fastgen/configs/experiments/WanV2V/config_sft.py \\
         - trainer.seed=1 trainer.ddp=True model.guidance_scale=5.0 log_config.name=vace_wan_inference
 
     # Video2World: Cosmos Predict2
     PYTHONPATH=$(pwd) FASTGEN_OUTPUT_ROOT='FASTGEN_OUTPUT' torchrun --nproc_per_node=1 --standalone \\
-        scripts/inference/video_model_inference.py --do_student_sampling False --num_steps 35 --fps 24 \\
+        scripts/inference/video_model_inference.py --do_student_sampling False --num_steps 35 \\
         --neg_prompt_file scripts/inference/prompts/negative_prompt_cosmos.txt \\
-        --input_image_file scripts/inference/prompts/source_image_paths.txt --num_conditioning_frames 1 \\
-        --config fastgen/configs/experiments/CosmosPredict2/config_sft.py \\
-        - trainer.seed=1 trainer.ddp=True model.guidance_scale=5.0 model.net.is_video2world=True \\
-        model.input_shape="[16, 24, 88, 160]" log_config.name=cosmos_v2w_inference
+        --config fastgen/configs/experiments/CosmosPredict2/config_sft_v2w.py \\
+        - trainer.ddp=True log_config.name=cosmos_v2w_inference
 
     # Eval with skip-layer guidance (SLG)
     PYTHONPATH=$(pwd) FASTGEN_OUTPUT_ROOT='FASTGEN_OUTPUT' torchrun --nproc_per_node=1 --standalone \\
@@ -725,7 +720,8 @@ if __name__ == "__main__":
         "--fps",
         default=16,
         type=int,
-        help="Frames per second for saved video and model temporal encoding (default: 16, matches Wan base_fps)",
+        help="Frames per second for saved video and model temporal encoding "
+        "(default: 16, matching Wan and Cosmos-Predict2.5 metadata)",
     )
     parser.add_argument(
         "--save_high_quality",
@@ -805,7 +801,7 @@ if __name__ == "__main__":
         "--num_conditioning_frames",
         type=int,
         default=1,
-        help="Number of latent frames to condition on for I2V mode (default: 1).",
+        help="Number of latent frames to condition on for I2V/Video2World mode (default: 1).",
     )
 
     args = parse_args(parser)

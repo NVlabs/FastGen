@@ -82,12 +82,9 @@ python scripts/inference/video_model_inference.py \
 ### Video2World (Cosmos)
 ```bash
 python scripts/inference/video_model_inference.py \
-    --config fastgen/configs/experiments/CosmosPredict2/config_sft.py \
-    --do_student_sampling False --num_steps 35 --fps 24 \
-    --neg_prompt_file scripts/inference/prompts/negative_prompt_cosmos.txt \
-    --input_image_file scripts/inference/prompts/source_image_paths.txt \
-    --num_conditioning_frames 1 \
-    - model.guidance_scale=5.0 model.net.is_video2world=True model.input_shape="[16, 24, 88, 160]"
+    --config fastgen/configs/experiments/CosmosPredict2/config_sft_v2w.py \
+    --do_student_sampling False --num_steps 35 \
+    --neg_prompt_file scripts/inference/prompts/negative_prompt_cosmos.txt
 ```
 
 ### Causal / Autoregressive
