@@ -27,7 +27,6 @@ def create_config():
     # Small resolution for testing: 320x176 video -> 40x22 latent, 21 frames -> 6 latent
     # Full 720p: [16, 24, 88, 160] (1280x704 @ 93 frames)
     # config.model.input_shape = [16, 24, 24, 40]  # cthw - 256p
-    # config.model.input_shape = [16, 21, 60, 104]  # cthw - 480p, 81 frames
     # config.model.input_shape = [16, 24, 60, 104]  # cthw - 480p
     config.model.input_shape = [16, 24, 88, 160]  # cthw - full 720p
 

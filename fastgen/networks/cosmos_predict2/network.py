@@ -1136,6 +1136,8 @@ class CosmosPredict2(FastGenNetwork):
             conditioning_latents: Latent frames to condition on for video2world mode,
                 shape (B, C, T, H, W). If provided, enables video2world mode.
             num_conditioning_frames: Number of frames to use for conditioning (default 1).
+            conditional_frame_timestep: Normalized conditioning-frame timestep
+                forwarded to ``forward()`` (default 1e-4).
             denoise_replace_gt_frames: Whether to replace velocity for conditioning frames
                 with analytical velocity (noise - gt_frames). Default True.
 
@@ -1265,9 +1267,7 @@ class CosmosPredict2(FastGenNetwork):
                 gt_velocity = initial_noise - conditioning_latents_full
                 velocity_pred = gt_velocity * condition_mask_C + velocity_pred * (1 - condition_mask_C)
 
-            # Only the DiT input receives clean conditioning frames. UniPC must
-            # evolve the original latent state; the analytical conditioning-frame
-            # velocity above drives those frames from their initial noise to x0.
+            # Keep clean frames in the DiT input while UniPC evolves raw latents.
             latents = self.sample_scheduler.step(velocity_pred, timestep, latents, return_dict=False)[0]
 
         return latents
