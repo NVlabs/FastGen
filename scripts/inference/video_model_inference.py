@@ -720,8 +720,7 @@ if __name__ == "__main__":
         "--fps",
         default=16,
         type=int,
-        help="Frames per second for saved video and model temporal encoding "
-        "(default: 16, matching Wan and Cosmos-Predict2.5 metadata)",
+        help="Frames per second for saved video and model temporal encoding (default: 16)",
     )
     parser.add_argument(
         "--save_high_quality",

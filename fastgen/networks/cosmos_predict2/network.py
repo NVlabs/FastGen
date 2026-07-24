@@ -1099,7 +1099,6 @@ class CosmosPredict2(FastGenNetwork):
         neg_condition: Optional[Any] = None,
         guidance_scale: Optional[float] = 5.0,
         num_steps: int = 50,
-        shift: float = 5.0,  # Cosmos default
         skip_layers: Optional[List[int]] = None,
         skip_layers_start_percent: float = 0.0,
         fps: Optional[torch.Tensor] = None,
@@ -1131,8 +1130,6 @@ class CosmosPredict2(FastGenNetwork):
                 Values greater than 1.0 enable CFG.
             num_steps: Number of intervals in the official Karras schedule.
                 The sampler evaluates ``num_steps + 1`` timesteps.
-            shift: Retained for scheduler API compatibility. The official
-                Karras path uses fixed sigma bounds and does not apply flow shift.
             skip_layers: List of transformer layers to skip (for skip-layer guidance).
             skip_layers_start_percent: Percentage of steps before starting to skip layers.
             fps: Frames per second tensor for temporal conditioning.
@@ -1155,7 +1152,6 @@ class CosmosPredict2(FastGenNetwork):
                 num_train_timesteps=1000,
                 prediction_type="flow_prediction",
                 use_flow_sigmas=True,
-                flow_shift=shift,
                 use_karras_sigmas=True,
                 sigma_min=0.01,
                 sigma_max=200.0,
@@ -1163,7 +1159,7 @@ class CosmosPredict2(FastGenNetwork):
         self.sample_scheduler.set_timesteps(num_inference_steps=num_steps + 1, device=noise.device)
         timesteps = self.sample_scheduler.timesteps
 
-        # Initialize latents using the FastGen noise-schedule convention.
+        # Initialize latents with proper scaling based on the initial timestep
         t_init = timesteps[0] / self.sample_scheduler.config.num_train_timesteps
         latents = self.noise_scheduler.latents(noise=noise, t_init=t_init)
 
