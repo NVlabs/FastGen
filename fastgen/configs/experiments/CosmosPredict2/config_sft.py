@@ -14,7 +14,7 @@ def create_config():
     config.trainer.logging_iter = 100
     config.trainer.save_ckpt_iter = 500
 
-    config.model.net_optimizer.lr = 1e-5
+    config.model.net_optimizer.lr = 5e-6
 
     config.model.sample_t_cfg.time_dist_type = "uniform"
     config.model.sample_t_cfg.min_t = 0.001
