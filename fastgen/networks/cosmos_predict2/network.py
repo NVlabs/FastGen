@@ -767,6 +767,7 @@ class CosmosPredict2(FastGenNetwork):
         use_wan_fp32_strategy: bool = True,
         # FPS for temporal position embeddings
         fps: float = 24.0,
+        rope_enable_fps_modulation: bool = True,
         # Video2world (image-to-video) mode settings
         is_video2world: bool = False,
         num_conditioning_frames: int = 1,
@@ -807,6 +808,7 @@ class CosmosPredict2(FastGenNetwork):
             rope_h_extrapolation_ratio=rope_h_extrapolation_ratio,
             rope_w_extrapolation_ratio=rope_w_extrapolation_ratio,
             rope_t_extrapolation_ratio=rope_t_extrapolation_ratio,
+            rope_enable_fps_modulation=rope_enable_fps_modulation,
             use_wan_fp32_strategy=use_wan_fp32_strategy,
         )
 
@@ -1097,13 +1099,12 @@ class CosmosPredict2(FastGenNetwork):
         neg_condition: Optional[Any] = None,
         guidance_scale: Optional[float] = 5.0,
         num_steps: int = 50,
-        shift: float = 5.0,  # Cosmos default
         skip_layers: Optional[List[int]] = None,
         skip_layers_start_percent: float = 0.0,
         fps: Optional[torch.Tensor] = None,
         conditioning_latents: Optional[torch.Tensor] = None,
         num_conditioning_frames: int = 1,
-        conditional_frame_timestep: float = 0.0,
+        conditional_frame_timestep: float = 1e-4,
         denoise_replace_gt_frames: bool = True,
         **kwargs,
     ) -> torch.Tensor:
@@ -1125,18 +1126,18 @@ class CosmosPredict2(FastGenNetwork):
             noise: The noisy latents to start from, shape (B, C, T, H, W).
             condition: The conditioning embeddings.
             neg_condition: The negative/unconditional embeddings for CFG.
-            guidance_scale: Classifier-free guidance scale. Values > 1.0 enable CFG.
-            num_steps: The number of sampling steps.
-            shift: Noise schedule shift parameter.
+            guidance_scale: Conventional classifier-free guidance scale.
+                Values greater than 1.0 enable CFG.
+            num_steps: Number of intervals in the official Karras schedule.
+                The sampler evaluates ``num_steps + 1`` timesteps.
             skip_layers: List of transformer layers to skip (for skip-layer guidance).
             skip_layers_start_percent: Percentage of steps before starting to skip layers.
             fps: Frames per second tensor for temporal conditioning.
             conditioning_latents: Latent frames to condition on for video2world mode,
                 shape (B, C, T, H, W). If provided, enables video2world mode.
             num_conditioning_frames: Number of frames to use for conditioning (default 1).
-            conditional_frame_timestep: Timestep value for conditioning frames (default 0.0).
-                Use 0.0 to indicate clean frames with no noise, or a negative value
-                to disable the special conditioning-frame timestep.
+            conditional_frame_timestep: Normalized conditioning-frame timestep
+                forwarded to ``forward()`` (default 1e-4).
             denoise_replace_gt_frames: Whether to replace velocity for conditioning frames
                 with analytical velocity (noise - gt_frames). Default True.
 
@@ -1145,17 +1146,19 @@ class CosmosPredict2(FastGenNetwork):
         """
         assert self.schedule_type == "rf", f"{self.schedule_type} is not supported"
 
-        # Set timesteps with shift parameter (matching official Cosmos inference)
+        # Match official Cosmos Predict2.5 inference. Diffusers uses the
+        # configured sigma bounds for its Karras conversion; the official
+        # `num_steps` denotes intervals, hence `num_steps + 1` ramp points.
         if self.sample_scheduler is None:
             self.sample_scheduler = UniPCMultistepScheduler(
                 num_train_timesteps=1000,
                 prediction_type="flow_prediction",
                 use_flow_sigmas=True,
-                flow_shift=shift,
+                use_karras_sigmas=True,
+                sigma_min=0.01,
+                sigma_max=200.0,
             )
-        else:
-            self.sample_scheduler.config.flow_shift = shift
-        self.sample_scheduler.set_timesteps(num_inference_steps=num_steps, device=noise.device)
+        self.sample_scheduler.set_timesteps(num_inference_steps=num_steps + 1, device=noise.device)
         timesteps = self.sample_scheduler.timesteps
 
         # Initialize latents with proper scaling based on the initial timestep
@@ -1211,7 +1214,7 @@ class CosmosPredict2(FastGenNetwork):
             # Store initial noise for velocity replacement
             initial_noise = latents.clone()
 
-        for idx, timestep in tqdm(enumerate(timesteps), total=num_steps, desc="Sampling"):
+        for timestep in tqdm(timesteps, total=len(timesteps), desc="Sampling"):
             # Normalize timestep to [0, 1] range
             t = (timestep / self.sample_scheduler.config.num_train_timesteps).expand(latents.shape[0])
             t = self.noise_scheduler.safe_clamp(t, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t).to(
@@ -1264,14 +1267,8 @@ class CosmosPredict2(FastGenNetwork):
                 gt_velocity = initial_noise - conditioning_latents_full
                 velocity_pred = gt_velocity * condition_mask_C + velocity_pred * (1 - condition_mask_C)
 
-            # Scheduler step (use model_input for video2world since that's what velocity was computed on)
-            sample_input = model_input if video2world_mode else latents
-            latents = self.sample_scheduler.step(velocity_pred, timestep, sample_input, return_dict=False)[0]
-
-            # Preserve conditioning frames after each step to prevent numerical drift
-            if video2world_mode:
-                v2w_condition = {"conditioning_latents": conditioning_latents, "condition_mask": condition_mask}
-                latents = self.preserve_conditioning(latents, v2w_condition)
+            # Keep clean frames in the DiT input while UniPC evolves raw latents.
+            latents = self.sample_scheduler.step(velocity_pred, timestep, latents, return_dict=False)[0]
 
         return latents
 
@@ -1316,9 +1313,10 @@ class CosmosPredict2(FastGenNetwork):
             fps: Frames per second tensor
             padding_mask: Padding mask tensor
             skip_layers: List of block indices to skip during forward pass
-            conditional_frame_timestep: Timestep value for conditioning frames (default 0.0).
-                Use 0.0 to indicate clean frames with no noise, or a negative value
-                to disable the special conditioning-frame timestep.
+            conditional_frame_timestep: Normalized timestep for conditioning frames.
+                ``forward()`` defaults to 0.0; ``sample()`` passes 1e-4, equivalent
+                to the official raw timestep 0.1 after its 0.001 network scale.
+                A negative value disables the special conditioning-frame timestep.
 
         Returns:
             Depending on the arguments:

@@ -14,7 +14,7 @@ def create_config():
     config.trainer.logging_iter = 100
     config.trainer.save_ckpt_iter = 500
 
-    config.model.net_optimizer.lr = 1e-5
+    config.model.net_optimizer.lr = 5e-6
 
     config.model.sample_t_cfg.time_dist_type = "uniform"
     config.model.sample_t_cfg.min_t = 0.001
@@ -27,13 +27,13 @@ def create_config():
     # Small resolution for testing: 320x176 video -> 40x22 latent, 21 frames -> 6 latent
     # Full 720p: [16, 24, 88, 160] (1280x704 @ 93 frames)
     # config.model.input_shape = [16, 24, 24, 40]  # cthw - 256p
-    # config.model.input_shape = [16, 21, 60, 104]  # cthw - 480p, 81 frames
-    config.model.input_shape = [16, 24, 60, 104]  # cthw - 480p
-    # config.model.input_shape = [16, 24, 88, 160]  # cthw - full 720p
+    # config.model.input_shape = [16, 24, 60, 104]  # cthw - 480p
+    config.model.input_shape = [16, 24, 88, 160]  # cthw - full 720p
 
     config.model.net = CosmosPredict2_2B_Config
     config.model.pretrained_model_path = f"{CKPT_ROOT_DIR}/cosmos_predict2/Cosmos-Predict2.5-2B/base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt"
-    config.model.guidance_scale = 3.0
+    # Official post-trained 2B/14B inference uses guidance scale 7
+    config.model.guidance_scale = 5.0
     config.model.student_sample_steps = 35
 
     config.dataloader_train = VideoLoaderConfig

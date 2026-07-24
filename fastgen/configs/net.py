@@ -277,7 +277,10 @@ CosmosPredict2_2B_Config: DictConfig = L(CosmosPredict2)(
     num_blocks=28,
     num_heads=16,
     sac_config=L(SACConfig)(mode=CheckpointMode.BLOCK_WISE),
-    fps=24,
+    # Checkpoint-specific override: the released post-trained 2B model uses
+    # 16 FPS with temporal RoPE FPS modulation disabled.
+    fps=16,
+    rope_enable_fps_modulation=False,
     is_video2world=False,
     num_conditioning_frames=1,
     enable_logvar_linear=False,  # Enable logvar_linear for sCM-like models
