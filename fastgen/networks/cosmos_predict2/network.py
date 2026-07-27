@@ -1212,14 +1212,17 @@ class CosmosPredict2(FastGenNetwork):
             )
 
             # Store initial noise for velocity replacement
-            initial_noise = latents.clone()
+            initial_noise = noise
 
-        for timestep in tqdm(timesteps, total=len(timesteps), desc="Sampling"):
+        total_steps = len(timesteps)
+        for step_idx, timestep in enumerate(tqdm(timesteps, total=total_steps, desc="Sampling")):
             # Normalize timestep to [0, 1] range
             t = (timestep / self.sample_scheduler.config.num_train_timesteps).expand(latents.shape[0])
             t = self.noise_scheduler.safe_clamp(t, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t).to(
                 latents.dtype
             )
+
+            active_skip_layers = skip_layers if (step_idx / total_steps) >= skip_layers_start_percent else None
 
             if video2world_mode:
                 # Replace conditioning frames with clean latents using preserve_conditioning
@@ -1249,6 +1252,7 @@ class CosmosPredict2(FastGenNetwork):
                 cond_with_mask,
                 fps=fps,
                 conditional_frame_timestep=conditional_frame_timestep,
+                skip_layers=active_skip_layers,
             )
 
             # Classifier-free guidance
@@ -1259,6 +1263,7 @@ class CosmosPredict2(FastGenNetwork):
                     neg_cond_with_mask,
                     fps=fps,
                     conditional_frame_timestep=conditional_frame_timestep,
+                    skip_layers=active_skip_layers,
                 )
                 velocity_pred = velocity_uncond + guidance_scale * (velocity_pred - velocity_uncond)
 
