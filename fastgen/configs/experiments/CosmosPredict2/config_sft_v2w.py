@@ -16,7 +16,7 @@ def create_config():
     config.model.net.is_video2world = True
     config.model.net.num_conditioning_frames = 1
     # Official post-trained Video2World inference uses guidance scale 8
-    config.model.guidance_scale = 5.0
+    config.model.guidance_scale = 8.0
 
     config.log_config.group = "cosmos_predict2_sft_v2w"
 
