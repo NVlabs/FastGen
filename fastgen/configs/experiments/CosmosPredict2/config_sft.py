@@ -33,7 +33,7 @@ def create_config():
     config.model.net = CosmosPredict2_2B_Config
     config.model.pretrained_model_path = f"{CKPT_ROOT_DIR}/cosmos_predict2/Cosmos-Predict2.5-2B/base/post-trained/81edfebe-bd6a-4039-8c1d-737df1a790bf_ema_bf16.pt"
     # Official post-trained 2B/14B inference uses guidance scale 7
-    config.model.guidance_scale = 5.0
+    config.model.guidance_scale = 7.0
     config.model.student_sample_steps = 35
 
     config.dataloader_train = VideoLoaderConfig
