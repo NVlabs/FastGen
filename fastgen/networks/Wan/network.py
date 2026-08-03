@@ -920,7 +920,7 @@ class Wan(FastGenNetwork):
         num_steps: int = 50,
         shift: float = 5.0,
         skip_layers: Optional[List[int]] = None,
-        skip_layers_start_percent: float = 0.0,
+        skip_layers_start_fraction: float = 0.0,
         **kwargs,
     ) -> torch.Tensor:
         """Multistep sample using the UniPC method
@@ -933,7 +933,8 @@ class Wan(FastGenNetwork):
             num_steps (int): The number of sampling steps.
             shift (float): Noise schedule shift parameter. Affects temporal dynamics.
             skip_layers (Optional[List[int]]): List of transformer layers to skip (used by SLG) during sampling.
-            skip_layers_start_percent (float): The percentage of the sampling steps to start skipping layers.
+            skip_layers_start_fraction (float): Fraction in [0, 1] of the sampling steps to complete
+                before skip-layer guidance becomes active.
 
         Returns:
             torch.Tensor: The sample output.
@@ -949,7 +950,7 @@ class Wan(FastGenNetwork):
         latents = self.noise_scheduler.latents(noise=noise, t_init=t_init)
 
         # main sampling loop
-        for idx, timestep in tqdm(enumerate(timesteps), total=num_steps - 1):
+        for idx, timestep in enumerate(tqdm(timesteps)):
             t = (timestep / self.unipc_scheduler.config.num_train_timesteps).expand(latents.shape[0])
             t = self.noise_scheduler.safe_clamp(t, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t).to(
                 latents.dtype
@@ -974,7 +975,7 @@ class Wan(FastGenNetwork):
                     return_features_early=False,
                     feature_indices={},
                     return_logvar=False,
-                    skip_layers=skip_layers if idx >= skip_layers_start_percent * num_steps else None,
+                    skip_layers=skip_layers if idx >= skip_layers_start_fraction * num_steps else None,
                 )
                 flow_pred = flow_uncond + guidance_scale * (flow_pred - flow_uncond)
 

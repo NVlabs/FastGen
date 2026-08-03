@@ -13,10 +13,12 @@ This module contains the main network classes:
 """
 
 from typing import Any, Dict, List, Optional, Set, Tuple, Union, Mapping
+import inspect
 import os
 from tqdm.auto import tqdm
 from einops import rearrange
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,6 +54,44 @@ from fastgen.utils.basic_utils import str2bool
 
 
 # ---------------------- DiT Network -----------------------
+
+
+class FlowKarrasUniPCScheduler(UniPCMultistepScheduler):
+    """UniPC whose sigmas follow the official Cosmos Predict2.5 Karras ramp.
+
+    A Karras schedule over ``[sigma_min, sigma_max]`` mapped into flow-matching
+    units by ``sigma / (sigma + 1)``. Built here rather than through diffusers'
+    ``use_karras_sigmas``, which only gained that conversion in 0.37.0.
+    """
+
+    # Hardcoded in diffusers' _convert_to_karras; left unconfigurable to match.
+    _rho: float = 7.0
+
+    def __init__(self, *args, sigma_min: float = 0.01, sigma_max: float = 200.0, **kwargs):
+        # diffusers >= 0.37 declares these itself. Forward them there so they are not
+        # recorded in the config's `_use_default_values`, which `from_config` discards;
+        # register them ourselves on older versions that lack the parameters.
+        base_params = inspect.signature(UniPCMultistepScheduler.__init__).parameters
+        forwarded = {k: v for k, v in (("sigma_min", sigma_min), ("sigma_max", sigma_max)) if k in base_params}
+        super().__init__(*args, **forwarded, **kwargs)
+        if not forwarded:
+            self.register_to_config(sigma_min=sigma_min, sigma_max=sigma_max)
+
+    def set_timesteps(
+        self, num_inference_steps: Optional[int] = None, device: Union[str, torch.device] = None, **kwargs
+    ):
+        if kwargs.get("sigmas") is not None:
+            raise ValueError("FlowKarrasUniPCScheduler builds its own ramp; an explicit `sigmas` is unsupported.")
+        assert num_inference_steps is not None, "num_inference_steps is required"
+        super().set_timesteps(num_inference_steps=num_inference_steps, device=device, **kwargs)
+        ramp = np.linspace(0.0, 1.0, num_inference_steps)
+        min_inv_rho = self.config.sigma_min ** (1 / self._rho)
+        max_inv_rho = self.config.sigma_max ** (1 / self._rho)
+        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self._rho
+        sigmas = sigmas / (sigmas + 1)
+        # sigmas stay on CPU to avoid per-step host/device traffic, as in diffusers.
+        self.sigmas = torch.from_numpy(np.concatenate([sigmas, [0.0]]).astype(np.float32))
+        self.timesteps = torch.from_numpy(sigmas * self.config.num_train_timesteps).to(device=device, dtype=torch.int64)
 
 
 class CosmosPredict2DiT(nn.Module):
@@ -1100,7 +1140,7 @@ class CosmosPredict2(FastGenNetwork):
         guidance_scale: Optional[float] = 5.0,
         num_steps: int = 50,
         skip_layers: Optional[List[int]] = None,
-        skip_layers_start_percent: float = 0.0,
+        skip_layers_start_fraction: float = 0.0,
         fps: Optional[torch.Tensor] = None,
         conditioning_latents: Optional[torch.Tensor] = None,
         num_conditioning_frames: int = 1,
@@ -1131,7 +1171,8 @@ class CosmosPredict2(FastGenNetwork):
             num_steps: Number of intervals in the official Karras schedule.
                 The sampler evaluates ``num_steps + 1`` timesteps.
             skip_layers: List of transformer layers to skip (for skip-layer guidance).
-            skip_layers_start_percent: Percentage of steps before starting to skip layers.
+            skip_layers_start_fraction: Fraction in [0, 1] of the sampling steps to complete
+                before skip-layer guidance becomes active.
             fps: Frames per second tensor for temporal conditioning.
             conditioning_latents: Latent frames to condition on for video2world mode,
                 shape (B, C, T, H, W). If provided, enables video2world mode.
@@ -1146,15 +1187,14 @@ class CosmosPredict2(FastGenNetwork):
         """
         assert self.schedule_type == "rf", f"{self.schedule_type} is not supported"
 
-        # Match official Cosmos Predict2.5 inference. Diffusers uses the
-        # configured sigma bounds for its Karras conversion; the official
-        # `num_steps` denotes intervals, hence `num_steps + 1` ramp points.
+        # Match official Cosmos Predict2.5 inference: a Karras ramp over [0.01, 200] in
+        # flow-matching units, and `num_steps` denotes intervals, hence `num_steps + 1`
+        # ramp points.
         if self.sample_scheduler is None:
-            self.sample_scheduler = UniPCMultistepScheduler(
+            self.sample_scheduler = FlowKarrasUniPCScheduler(
                 num_train_timesteps=1000,
                 prediction_type="flow_prediction",
                 use_flow_sigmas=True,
-                use_karras_sigmas=True,
                 sigma_min=0.01,
                 sigma_max=200.0,
             )
@@ -1189,7 +1229,7 @@ class CosmosPredict2(FastGenNetwork):
         conditioning_latents_full = None
         condition_mask = None
         condition_mask_C = None
-        initial_noise = None
+        initial_latents = None
 
         if video2world_mode:
             B, C, T, H, W = latents.shape
@@ -1211,18 +1251,15 @@ class CosmosPredict2(FastGenNetwork):
                 latents, v2w_condition
             )
 
-            # Store initial noise for velocity replacement
-            initial_noise = noise
+            # Store the initial latents for velocity replacement
+            initial_latents = latents.clone()
 
-        total_steps = len(timesteps)
-        for step_idx, timestep in enumerate(tqdm(timesteps, total=total_steps, desc="Sampling")):
+        for step_idx, timestep in enumerate(tqdm(timesteps, desc="Sampling")):
             # Normalize timestep to [0, 1] range
             t = (timestep / self.sample_scheduler.config.num_train_timesteps).expand(latents.shape[0])
             t = self.noise_scheduler.safe_clamp(t, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t).to(
                 latents.dtype
             )
-
-            active_skip_layers = skip_layers if (step_idx / total_steps) >= skip_layers_start_percent else None
 
             if video2world_mode:
                 # Replace conditioning frames with clean latents using preserve_conditioning
@@ -1252,7 +1289,6 @@ class CosmosPredict2(FastGenNetwork):
                 cond_with_mask,
                 fps=fps,
                 conditional_frame_timestep=conditional_frame_timestep,
-                skip_layers=active_skip_layers,
             )
 
             # Classifier-free guidance
@@ -1263,13 +1299,14 @@ class CosmosPredict2(FastGenNetwork):
                     neg_cond_with_mask,
                     fps=fps,
                     conditional_frame_timestep=conditional_frame_timestep,
-                    skip_layers=active_skip_layers,
+                    skip_layers=skip_layers if step_idx >= skip_layers_start_fraction * len(timesteps) else None,
                 )
                 velocity_pred = velocity_uncond + guidance_scale * (velocity_pred - velocity_uncond)
 
-            # Replace velocity for conditioning frames with analytical velocity: v = noise - x0
+            # Replace velocity for conditioning frames with the constant velocity that carries
+            # the initial latents onto the conditioning frames over the interval [0, t_init].
             if video2world_mode and denoise_replace_gt_frames:
-                gt_velocity = initial_noise - conditioning_latents_full
+                gt_velocity = (initial_latents - conditioning_latents_full) / t_init
                 velocity_pred = gt_velocity * condition_mask_C + velocity_pred * (1 - condition_mask_C)
 
             # Keep clean frames in the DiT input while UniPC evolves raw latents.
