@@ -924,7 +924,7 @@ class CausalVACEWan(CausalFastGenNetwork, VACEWan):
             self.unipc_scheduler.config.flow_shift = shift
             self.unipc_scheduler.set_timesteps(num_inference_steps=sample_steps, device=noise.device)
             timesteps = self.unipc_scheduler.timesteps
-            for timestep in tqdm(timesteps, total=sample_steps - 1):
+            for timestep in tqdm(timesteps):
                 t = (timestep / time_rescale_factor).expand(batch_size)
                 x_cur = x_next
                 flow_pred = self(
