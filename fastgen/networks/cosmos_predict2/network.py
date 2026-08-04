@@ -431,6 +431,11 @@ class CosmosPredict2DiT(nn.Module):
             - [output, features]: If feature_indices is non-empty
             - (output, logvar): If return_logvar=True
         """
+        if feature_indices is None:
+            feature_indices = set()
+        if return_features_early and len(feature_indices) == 0:
+            return []
+
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
             fps=fps,
@@ -1007,8 +1012,8 @@ class CosmosPredict2(FastGenNetwork):
                         nn.init.zeros_(m.bias)
 
         # Reinitialize RoPE buffers (non-persistent buffers must be recomputed)
-        if hasattr(self.transformer, "rope_embedder") and self.transformer.rope_embedder is not None:
-            rope = self.transformer.rope_embedder
+        if hasattr(self.transformer, "pos_embedder") and self.transformer.pos_embedder is not None:
+            rope = self.transformer.pos_embedder
             device = next(rope.buffers()).device
 
             # Recompute the sequence buffer
@@ -1327,7 +1332,7 @@ class CosmosPredict2(FastGenNetwork):
             - ([output, features], logvar): If both features and logvar requested
         """
         if feature_indices is None:
-            feature_indices = {}
+            feature_indices = set()
         if return_features_early and len(feature_indices) == 0:
             # Exit immediately if user requested this.
             return []
