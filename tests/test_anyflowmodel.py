@@ -537,7 +537,9 @@ def test_fuse_r_embedding_additive_unchanged():
     r_proj = fake.r_embedder.time_proj(fake.r_embedder.act_fn(remb)).unflatten(1, (6, -1))
     assert torch.allclose(out_temb, temb + remb)
     assert torch.allclose(out_proj, timestep_proj + r_proj)
-    assert torch.allclose(out_r_proj, r_proj)
+    # r is already folded into the two above, and without encoder_depth the
+    # blocks have nothing to switch to.
+    assert out_r_proj is None
 
 
 @pytest.mark.parametrize("prefix", ["", "transformer."])

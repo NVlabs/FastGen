@@ -84,7 +84,7 @@ Learns average velocity between trajectory points: `x_r = x_t - (t-r) · u(x_t, 
 - `sample_t_cfg.flow_matching_ratio`: Fraction of the batch with `r = t` (flow matching loss)
 
 
-**Configs:** [`EDM/config_mf_cifar10.py`](../../configs/experiments/EDM/config_mf_cifar10.py), [`DiT/config_mf_b.py`](../../configs/experiments/DiT/config_mf_b.py), [`DiT/config_mf_xl.py`](../../configs/experiments/DiT/config_mf_xl.py), [`WanT2V/config_mf.py`](../../configs/experiments/WanT2V/config_mf.py)
+**Configs:** [`EDM/config_mf_cifar10.py`](../../configs/experiments/EDM/config_mf_cifar10.py), [`DiT/config_mf_b.py`](../../configs/experiments/DiT/config_mf_b.py), [`DiT/config_mf_xl.py`](../../configs/experiments/DiT/config_mf_xl.py), [`WanT2V/config_mf.py`](../../configs/experiments/WanT2V/config_mf.py), [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py) (Stage 1 of [AnyFlow](../distribution_matching/README.md#anyflow))
 
 
 **Expected results:**

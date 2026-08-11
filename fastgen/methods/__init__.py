@@ -15,7 +15,7 @@ from fastgen.methods.consistency_model.TCM import TCMModel as TCMModel
 from fastgen.methods.consistency_model.sCM import SCMModel as SCMModel
 from fastgen.methods.consistency_model.mean_flow import MeanFlowModel as MeanFlowModel
 
-# AnyFlow reuses MeanFlow's student sample loop, so it must come after.
+# AnyFlow pulls in mean_flow, so it must come after the CM import above
 from fastgen.methods.distribution_matching.anyflow import AnyFlowModel as AnyFlowModel
 
 from fastgen.methods.fine_tuning.sft import SFTModel as SFTModel

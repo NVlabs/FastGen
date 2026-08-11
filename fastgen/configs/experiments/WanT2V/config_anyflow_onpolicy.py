@@ -47,6 +47,8 @@ def create_config():
     # and the reference builds them without the flow-map pathway at all.
     config.model.teacher = copy.deepcopy(Wan_1_3B_Config)
     config.model.teacher.r_timestep = False
+    config.model.teacher.min_t = config.model.net.min_t
+    config.model.teacher.max_t = config.model.net.max_t
 
     # Student init comes from the Stage 1 trainer checkpoint via
     # trainer.checkpointer.pretrained_ckpt_path (see the module docstring);

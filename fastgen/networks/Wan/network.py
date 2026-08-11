@@ -284,24 +284,17 @@ def _fuse_r_embedding(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Combine the t- and r-time embeddings into the final timestep projection.
 
-    * ``additive`` (MeanFlow default, ``r_embedder.fusion_mode`` absent or "additive"):
-      ``r_timestep_proj = r_embedder.time_proj(r_embedder.act_fn(remb))`` is added to
-      ``timestep_proj`` and ``remb`` is added to ``temb``. T2V dual-stream variants
-      (``encoder_depth`` set) instead replace ``temb`` with ``remb`` and leave
-      ``timestep_proj`` alone.
+    * ``additive``: project each embedding separately and sum — ``temb + remb``,
+      ``timestep_proj + r_embedder.time_proj(...)``.
+    * ``gated``: interpolate first, ``(1-g)·temb + g·remb``, then project the
+      blend through the condition_embedder's own ``time_proj`` — shared with the
+      t-only path, so ``Wan.__init__`` drops the unused ``r_embedder.time_proj``
+      rather than let it drift during training.
 
-    * ``gated`` (opt-in): convex-combine the two embeddings *before* the
-      projection — ``rt_emb = (1-g)·temb + g·remb`` then
-      ``timestep_proj = condition_embedder.time_proj(act_fn(rt_emb))``. The
-      projection is the condition_embedder's own, i.e. SHARED with the t-only
-      path; ``Wan.__init__`` therefore drops the redundant
-      ``r_embedder.time_proj`` in gated mode so it cannot silently drift away
-      from the shared one during training. With ``encoder_depth``
-      set, the first ``encoder_depth`` blocks keep the t-only ``timestep_proj``
-      and the remaining blocks switch to the gated projection (mirroring additive).
-
-    Returns ``(temb, timestep_proj, r_timestep_proj)`` where ``r_timestep_proj``
-    is ``None`` when the r-information is already folded into ``timestep_proj``.
+    Returns ``(temb, timestep_proj, r_timestep_proj)``: ``temb`` [B, D] modulates
+    the output head (``scale_shift_table + temb``), ``timestep_proj`` [B, 6, D] is
+    the AdaLN modulation every block consumes, and ``r_timestep_proj`` is what the
+    blocks switch to at ``encoder_depth`` — ``None`` when there is no switch.
     """
     fusion = getattr(self.r_embedder, "fusion_mode", "additive")
 
@@ -318,7 +311,7 @@ def _fuse_r_embedding(
     r_ts_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(remb))
     r_ts_proj = unflatten_timestep_proj(r_ts_proj, rs_seq_len)
     if self.encoder_depth is None:
-        return temb + remb, timestep_proj + r_ts_proj, r_ts_proj
+        return temb + remb, timestep_proj + r_ts_proj, None
     return remb, timestep_proj, r_ts_proj
 
 
@@ -1139,14 +1132,6 @@ class Wan(FastGenNetwork):
             assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
 
         condition = torch.stack(condition, dim=0) if isinstance(condition, list) else condition
-
-        # A gated-fusion flow-map network always consumes the r-pathway (the
-        # fusion happens inside the shared time projection), so r=None has no
-        # in-distribution meaning for it. Default to r=t, i.e. the
-        # instantaneous velocity u(x_t, t, t). Additive-fusion (MeanFlow)
-        # networks keep the skip-r-pathway behavior.
-        if r is None and getattr(self.transformer.r_embedder, "fusion_mode", None) == "gated":
-            r = t
 
         timestep_mask = torch.ones_like(x_t[:, 0])  # shape: [batch_size, num_latent_frames, H, W]
         timestep = self._compute_timestep_inputs(t, timestep_mask)

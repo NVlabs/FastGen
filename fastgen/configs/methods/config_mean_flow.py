@@ -35,7 +35,7 @@ class SampleTConfig(BaseSampleTConfig):
 
     # fraction of the batch with r = t (pure flow matching); the rest keeps
     # the randomly sampled r, minus the consistency fraction below
-    flow_matching_ratio: float = 1.0
+    flow_matching_ratio: float = 0.25
 
     # fraction of the batch forced to r = 0 (consistency-to-clean, used by
     # AnyFlow; 0.0 keeps the original MeanFlow behavior)
@@ -83,17 +83,16 @@ class LossConfig:
     # loss type (choice between l2 and opt_grad)
     loss_type: str = "opt_grad"
     # optional fixed per-timestep loss weighting evaluated as a function of t
-    # ("beta08", "gaussian", "uniform"; used by AnyFlow). Multiplies the
-    # adaptive norm_method weight above; None disables it.
+    # ("beta08", "gaussian", "uniform"). Multiplies the adaptive norm_method 
+    # weight above; None disables it.
     weight_type: Optional[str] = None
     # prediction-side guidance fusion scale (AnyFlow guidance distillation):
     # the conditional output is trained to be the guided flow directly via
-    # (u_cond + (g-1) * u_uncond) / g against the raw data velocity, with
-    # plain text dropout (cond_dropout_prob). None keeps MeanFlow's
-    # target-side guidance (guidance_scale, eq. 19).
+    # (u_cond + (g-1) * u_uncond) / g against the raw data velocity. None 
+    # keeps MeanFlow's target-side guidance (guidance_scale).
     guidance_fuse_scale: Optional[float] = None
     # rebalance the flow-map / consistency (r < t) sample losses to the global
-    # flow-matching (r = t) loss mean via a detached per-sample factor (AnyFlow)
+    # flow-matching (r = t) loss mean via a detached per-sample factor
     rebalance_to_flow_matching: bool = False
 
 
