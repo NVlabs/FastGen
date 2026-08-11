@@ -81,7 +81,7 @@ Learns average velocity between trajectory points: `x_r = x_t - (t-r) · u(x_t, 
 - `loss_config.use_cd`: Use consistency distillation (requires teacher; `guidance_scale` controls CFG for the teacher)
 - `loss_config.use_jvp_finite_diff`: Use finite difference for JVP (e.g., for compatibility with Flash Attention and FSDP)
 - `sample_t_cfg`, `sample_r_cfg`: Configs of the distributions for sampling `t` and `r`
-- `sample_t_cfg.r_sample_ratio`: Ratio for flow matching loss
+- `sample_t_cfg.flow_matching_ratio`: Fraction of the batch with `r = t` (flow matching loss)
 
 
 **Configs:** [`EDM/config_mf_cifar10.py`](../../configs/experiments/EDM/config_mf_cifar10.py), [`DiT/config_mf_b.py`](../../configs/experiments/DiT/config_mf_b.py), [`DiT/config_mf_xl.py`](../../configs/experiments/DiT/config_mf_xl.py), [`WanT2V/config_mf.py`](../../configs/experiments/WanT2V/config_mf.py)

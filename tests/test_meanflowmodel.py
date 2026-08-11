@@ -49,7 +49,7 @@ def test_single_train_step_update(get_model_data):
     # Run the training step; cifar10 default config
     assert model.config.sample_t_cfg.train_p_mean == -0.6
     assert model.config.sample_t_cfg.train_p_std == 1.6
-    assert model.config.sample_t_cfg.r_sample_ratio == 0.75
+    assert model.config.sample_t_cfg.flow_matching_ratio == 0.25
 
     norm_method, *norm_args = model.config.loss_config.norm_method.split("_")
     assert norm_method == "poly"

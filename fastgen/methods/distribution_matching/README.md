@@ -87,34 +87,25 @@ DMD2 extended for causal video generation with autoregressive chunk-by-chunk pro
 
 ## AnyFlow
 
-**File:** [`anyflow.py`](anyflow.py) | **Reference:** AnyFlow — any-step video diffusion framework on flow maps
+**File:** [`anyflow.py`](anyflow.py) | **Reference:** [Gu et al., 2026](https://arxiv.org/abs/2605.13724)
 
-Single model that supports arbitrary inference NFE by learning a flow map `u_θ(x_t, t, r)` (average velocity from `t` back to `r`). Trained in two stages:
+DMD2 with a flow-map student `u_θ(x_t, t, r)` (average velocity from `t` back to `r`), supporting arbitrary inference NFE. The student generates by rolling out the flow map from pure noise with the NFE sampled per iteration and gradients through all segments, and co-trains the flow-map loss at every update. Requires a Stage-1 flow-map pretrain, which uses the MeanFlow objective with AnyFlow's hyperparameters and runs directly on [`MeanFlowModel`](../consistency_model/mean_flow.py).
 
-1. **Pretrain** — the MeanFlow objective with AnyFlow's hyperparameters, run directly on [`MeanFlowModel`](../consistency_model/mean_flow.py): finite-difference JVP, a fixed `beta08` per-timestep loss weight (`loss_config.weight_type`), prediction-side guidance fusion (`loss_config.guidance_fuse_scale` — the conditional output learns the guided flow directly), global rebalancing of the flow-map / consistency sample losses to the diffusion-loss mean (`loss_config.rebalance_to_diffusion`), shifted timestep sampling, and a `sample_t_cfg.consistency_ratio` fraction of the batch pinned to `r = 0`. There is no AnyFlow-specific pretrain code.
-2. **On-policy** — distribution-matching distillation on top of the pretrained flow-map weights ([`anyflow.py`](anyflow.py)). DMD2 with the reference's three deviations: the student generates via a flow-map rollout compressed to at most three forwards — jump `t_0 → t_g`, fine step `t_g → t_{g+1}`, jump to 0 — with the NFE sampled per iteration from `student_sample_steps_list` and gradient through all segments (`gen_data_from_net`); the student always starts from pure noise at `max_t` (`_generate_noise_and_time`); and every student update co-trains the Stage-2 flow-map loss (`cotrain_pretrain_weight`). There is no adversarial loss (the reference "discriminator" is the fake score network). The teacher / fake_score are flow-map networks queried at the instantaneous velocity `r = t` (the network-level default for gated-fusion Wan when `r` is not passed).
+**Key Parameters (Stage 2, on-policy):**
+- `student_sample_steps_list`: Rollout NFEs sampled per iteration
+- `cotrain_pretrain_weight`: Weight of the co-trained Stage-1 flow-map loss
+- `guidance_scale`: CFG scale for teacher, applied as `cond + (g-1)·(cond - uncond)`
+- Requires a Stage-1 pretrained checkpoint via `trainer.checkpointer.pretrained_ckpt_path`
+- See also the key parameters of DMD2 above
 
-**Key Parameters (on-policy):**
-- `student_sample_steps_list`: rollout NFEs sampled per iteration (reference: `[2, 4, 8, 16, 50]`)
-- `cotrain_pretrain_weight`: weight of the co-trained Stage-2 flow-map loss (reference: 1)
-- `guidance_scale`: real-score CFG; FastGen applies `cond + (g-1)·(cond - uncond)`, so the reference's strength 3 is `g=4`
-- See also key parameters of DMD2 above
+**Key Parameters (Stage 1, on MeanFlow):**
+- `loss_config.weight_type`: Fixed per-timestep loss weight (`beta08`, `gaussian`, `uniform`)
+- `loss_config.guidance_fuse_scale`: Prediction-side guidance fusion, i.e., the conditional output learns the guided flow directly (with `cond_dropout_prob` for text dropout)
+- `loss_config.rebalance_to_flow_matching`: Rescale the `r < t` losses to the global flow-matching (`r = t`) loss mean
+- `sample_t_cfg`: Shifted timestep sampling (`time_dist_type="shifted"`, `shift=5` for Wan video) and the batch fraction pinned to `r = 0` (`consistency_ratio`)
+- See also the key parameters of [MeanFlow](../consistency_model/README.md#meanflow)
 
-**Key Parameters (pretrain, on MeanFlow):**
-- `loss_config.weight_type`: `beta08` | `gaussian` | `uniform` fixed per-timestep loss weight
-- `loss_config.guidance_fuse_scale` + `cond_dropout_prob`: prediction-side guidance distillation with text dropout
-- `loss_config.rebalance_to_diffusion`: rescale non-diffusion losses to the global diffusion-loss mean
-- `loss_config.use_jvp_finite_diff` / `loss_config.jvp_finite_diff_eps`: central-difference step δ
-- `sample_t_cfg.r_sample_ratio` / `sample_t_cfg.consistency_ratio`: per-batch fraction with sampled `r` / `r = 0`
-- `sample_t_cfg.time_dist_type="shifted"`, `sample_t_cfg.shift`: shifted timestep sampling (5.0 for Wan video)
-
-**Backbone requirement:** the student network must accept a secondary timestep `r` (Wan with `r_timestep=True`). When loading the published AnyFlow HF checkpoints, set `r_embedder_fusion="gated"` and `time_cond_type="abs"` on the Wan constructor — this routes the t/r mix through `Wan/network.py::_fuse_r_embedding`'s gated branch (shared with MeanFlow's additive default) so the released weights reproduce bit-for-bit. `Wan.load_state_dict` remaps the AnyFlow checkpoint layout (`condition_embedder.delta_embedder.*`) automatically; note that loading the HF folder via `model_id_or_local_path` goes through diffusers' `from_pretrained`, which silently drops the `delta_embedder` weights — load the transformer state dict through `Wan.load_state_dict` (or call `remap_anyflow_keys` yourself) instead.
-
-**Note:** correctness of the port is established via forward-parity and single-step training-step parity against the AnyFlow reference (see PR #25 discussion). End-to-end convergence-scale validation on the paper's training corpus is deferred to a follow-up.
-
-**Configs:**
-- [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py) — Stage 2 pretrain (6k iter, lr=5e-5, shift=5, beta08, paper-aligned)
-- [`WanT2V/config_anyflow_onpolicy.py`](../../configs/experiments/WanT2V/config_anyflow_onpolicy.py) — Stage 3 on-policy distillation (1.2k iter, lr=2e-6, no adversarial loss; full-rank fine-tune of a Stage 2 pretrain ckpt — the paper's rank-256 LoRA variant awaits a PEFT path in FastGen)
+**Configs:** [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py) (Stage 1 pretrain), [`WanT2V/config_anyflow_onpolicy.py`](../../configs/experiments/WanT2V/config_anyflow_onpolicy.py) (Stage 2 on-policy distillation, full-rank fine-tune of a Stage 1 checkpoint)
 
 ---
 

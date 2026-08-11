@@ -33,12 +33,18 @@ class SampleTConfig(BaseSampleTConfig):
     train_p_mean: float = -1.1
     train_p_std: float = 2.0
 
-    # ratio for randomly sampling r
-    r_sample_ratio: float = 0.0
+    # fraction of the batch with r = t (pure flow matching); the rest keeps
+    # the randomly sampled r, minus the consistency fraction below
+    flow_matching_ratio: float = 1.0
 
-    # fraction of the batch forced to r = min_t (consistency-to-clean,
-    # used by AnyFlow; 0.0 keeps the original MeanFlow behavior)
+    # fraction of the batch forced to r = 0 (consistency-to-clean, used by
+    # AnyFlow; 0.0 keeps the original MeanFlow behavior)
     consistency_ratio: float = 0.0
+
+    # how samples are assigned to the two buckets above: False draws each
+    # sample's bucket independently, True partitions the global batch by rank
+    # index so the bucket sizes are exact every iteration (used by AnyFlow)
+    deterministic_buckets: bool = False
 
 
 @attrs.define(slots=False)
@@ -86,9 +92,9 @@ class LossConfig:
     # plain text dropout (cond_dropout_prob). None keeps MeanFlow's
     # target-side guidance (guidance_scale, eq. 19).
     guidance_fuse_scale: Optional[float] = None
-    # rebalance non-diffusion (r < t) sample losses to the global
-    # diffusion-loss mean via a detached per-sample factor (AnyFlow)
-    rebalance_to_diffusion: bool = False
+    # rebalance the flow-map / consistency (r < t) sample losses to the global
+    # flow-matching (r = t) loss mean via a detached per-sample factor (AnyFlow)
+    rebalance_to_flow_matching: bool = False
 
 
 @attrs.define(slots=False)

@@ -31,6 +31,7 @@ from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_la
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from fastgen.networks.network import FastGenNetwork
+from fastgen.networks.Wan.utils import convert_wan_official_state_dict, remap_anyflow_keys
 from fastgen.networks.noise_schedule import NET_PRED_TYPES
 
 from fastgen.utils.basic_utils import prompt_clean, str2bool
@@ -283,21 +284,21 @@ def _fuse_r_embedding(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Combine the t- and r-time embeddings into the final timestep projection.
 
-    Two fusion modes share the same ``r_embedder.time_proj`` / ``act_fn`` modules:
-
     * ``additive`` (MeanFlow default, ``r_embedder.fusion_mode`` absent or "additive"):
-      ``r_timestep_proj = time_proj(act_fn(remb))`` is added to ``timestep_proj``
-      and ``remb`` is added to ``temb``. T2V dual-stream variants (``encoder_depth``
-      set) instead replace ``temb`` with ``remb`` and leave ``timestep_proj`` alone.
+      ``r_timestep_proj = r_embedder.time_proj(r_embedder.act_fn(remb))`` is added to
+      ``timestep_proj`` and ``remb`` is added to ``temb``. T2V dual-stream variants
+      (``encoder_depth`` set) instead replace ``temb`` with ``remb`` and leave
+      ``timestep_proj`` alone.
 
-    * ``gated`` (AnyFlow, opt-in): convex-combine the two embeddings *before* the
-      shared projection — ``rt_emb = (1-g)·temb + g·remb`` then
-      ``timestep_proj = time_proj(act_fn(rt_emb))``. This matches the
-      ``WanTwoTimeTextImageEmbedding.forward_timestep`` path in the AnyFlow
-      reference and is required to reproduce the published HF checkpoint
-      forward bit-for-bit. With ``encoder_depth`` set, the first
-      ``encoder_depth`` blocks keep the t-only ``timestep_proj`` and the
-      remaining blocks switch to the gated projection (mirroring additive).
+    * ``gated`` (opt-in): convex-combine the two embeddings *before* the
+      projection — ``rt_emb = (1-g)·temb + g·remb`` then
+      ``timestep_proj = condition_embedder.time_proj(act_fn(rt_emb))``. The
+      projection is the condition_embedder's own, i.e. SHARED with the t-only
+      path; ``Wan.__init__`` therefore drops the redundant
+      ``r_embedder.time_proj`` in gated mode so it cannot silently drift away
+      from the shared one during training. With ``encoder_depth``
+      set, the first ``encoder_depth`` blocks keep the t-only ``timestep_proj``
+      and the remaining blocks switch to the gated projection (mirroring additive).
 
     Returns ``(temb, timestep_proj, r_timestep_proj)`` where ``r_timestep_proj``
     is ``None`` when the r-information is already folded into ``timestep_proj``.
@@ -307,7 +308,7 @@ def _fuse_r_embedding(
     if fusion == "gated":
         gate = self.r_embedder.gate_value
         rt_emb = (1 - gate) * temb + gate * remb
-        rt_ts_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(rt_emb))
+        rt_ts_proj = self.condition_embedder.time_proj(self.condition_embedder.act_fn(rt_emb))
         rt_ts_proj = unflatten_timestep_proj(rt_ts_proj, rs_seq_len)
         if self.encoder_depth is None:
             return rt_emb, rt_ts_proj, None
@@ -462,50 +463,6 @@ def classify_forward_block_forward(
             return hidden_states, features
 
     return hidden_states, features
-
-
-def remap_anyflow_keys(state_dict: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Remap an AnyFlow HF release state_dict to FastGen's Wan layout.
-
-    AnyFlow's ``FAR_Wan_Transformer3DModel`` stores the r-pathway inside the
-    main ``condition_embedder`` as ``delta_embedder``, and uses ONE shared
-    ``time_proj`` for both t and (t, r). FastGen exposes a separate top-level
-    ``r_embedder`` with its own ``time_embedder`` + ``time_proj``. The two
-    layouts are functionally equivalent (FastGen's ``r_embedder.time_proj``
-    starts as a deepcopy of ``condition_embedder.time_proj`` per
-    :meth:`Wan.init_embedder`), so we just rename / duplicate the tensors.
-
-    The function is a no-op when no ``condition_embedder.delta_embedder.*``
-    keys are present, so it's safe to call unconditionally. Keys with or
-    without the ``transformer.`` module prefix are both handled.
-    """
-    delta_marker = "condition_embedder.delta_embedder."
-    delta_keys = [k for k in state_dict if delta_marker in k]
-    if not delta_keys:
-        return state_dict
-
-    new_sd = dict(state_dict)
-    prefixes = set()
-    for k in delta_keys:
-        # [transformer.]condition_embedder.delta_embedder.linear_1.weight
-        #   -> [transformer.]r_embedder.time_embedder.linear_1.weight
-        prefix, _, suffix = k.partition(delta_marker)
-        prefixes.add(prefix)
-        new_sd[f"{prefix}r_embedder.time_embedder.{suffix}"] = new_sd.pop(k)
-    # AnyFlow's gated fusion shares the final time_proj. FastGen has a
-    # separate r_embedder.time_proj that substitutes for the shared one when
-    # fusion="gated"; copy the weights so the two projections start identical.
-    for prefix in prefixes:
-        for sub in ("weight", "bias"):
-            src = f"{prefix}condition_embedder.time_proj.{sub}"
-            dst = f"{prefix}r_embedder.time_proj.{sub}"
-            if src in new_sd and dst not in new_sd:
-                new_sd[dst] = new_sd[src].clone()
-    logger.info(
-        f"remap_anyflow_keys: rewrote {len(delta_keys)} delta_embedder tensors "
-        "and duplicated time_proj weights into r_embedder."
-    )
-    return new_sd
 
 
 class WanTextEncoder:
@@ -696,24 +653,24 @@ class Wan(FastGenNetwork):
         self.transformer.time_cond_type = time_cond_type
         if r_timestep:
             logger.info(f"Initializing r embedder with {r_embedder_init}")
-            self.transformer.r_embedder = self.init_embedder(r_embedder_init)
-            # Stash fusion config on the r_embedder module so the (method-bound)
-            # forward override can branch on it without changing its signature.
-            if r_embedder_fusion not in ("additive", "gated"):
-                raise ValueError(f"r_embedder_fusion must be 'additive' or 'gated', got {r_embedder_fusion!r}")
-            self.transformer.r_embedder.fusion_mode = r_embedder_fusion
-            # Plain float (not a buffer) so FSDP's reset_parameters does not
-            # need to re-materialize it after meta-device init.
-            self.transformer.r_embedder.gate_value = float(r_embedder_gate_value)
-            logger.info(
-                f"r_embedder fusion={r_embedder_fusion}"
-                + (f" gate_value={r_embedder_gate_value}" if r_embedder_fusion == "gated" else "")
+            self.transformer.r_embedder = self.init_embedder(
+                r_embedder_init, r_embedder_fusion, r_embedder_gate_value
             )
         else:
             self.transformer.r_embedder = None
 
         # core functionality to override forward function and other methods in the transformer
         self.override_transformer_forward(inner_dim=inner_dim)
+
+        # Only the base Wan forward routes the r-embedding through
+        # _fuse_r_embedding (installed just above); the causal / VACE variants
+        # install their own (additive-only) classify_forward_prepare, where
+        # "gated" would be silently ignored.
+        if r_timestep and r_embedder_fusion == "gated" and not hasattr(self.transformer, "_fuse_r_embedding"):
+            raise ValueError(
+                f"r_embedder_fusion='gated' is not supported by {type(self).__name__} "
+                "(its transformer forward does not implement gated t/r fusion)."
+            )
 
         # Use lazy initialization as this wont work in a meta context when doing FSDP2.
         self._unipc_scheduler = None
@@ -890,17 +847,44 @@ class Wan(FastGenNetwork):
         name = model_path_or_id[idx_start:].split("/")[0]
         return f"Wan-AI/{name}"
 
-    def init_embedder(self, embedder_init: str) -> None:
+    def init_embedder(
+        self,
+        embedder_init: str,
+        r_embedder_fusion: str = "additive",
+        r_embedder_gate_value: float = 0.25,
+    ) -> torch.nn.Module:
+        """Build the r-embedder and stash its fusion config on the module.
+
+        The fusion settings live on the module (not on `self`) so the
+        method-bound forward override can branch on them without changing its
+        signature. They are set before the meta-device early return so both
+        paths carry them.
+
+        For gated fusion the r_embedder's own `time_proj` / `act_fn` are dropped
+        here (the fused embedding goes through the condition_embedder's shared
+        projection instead). Whether the transformer's forward actually supports
+        gated fusion can only be checked after `override_transformer_forward`
+        installs `_fuse_r_embedding`, so that check lives in `__init__`.
+        """
         embedder = copy.deepcopy(self.transformer.condition_embedder)
         del embedder.text_embedder
+
+        if r_embedder_fusion not in ("additive", "gated"):
+            raise ValueError(f"r_embedder_fusion must be 'additive' or 'gated', got {r_embedder_fusion!r}")
+        embedder.fusion_mode = r_embedder_fusion
+        # Plain float (not a buffer) so FSDP's reset_parameters does not need to
+        # re-materialize it after meta-device init.
+        embedder.gate_value = float(r_embedder_gate_value)
+        logger.info(
+            f"r_embedder fusion={r_embedder_fusion}"
+            + (f" gate_value={r_embedder_gate_value}" if r_embedder_fusion == "gated" else "")
+        )
 
         # Skip initialization if using meta device (weights will be broadcast via FSDP)
         if self._is_in_meta_context():
             logger.info("Skipping r_embedder initialization on meta device (will receive weights via FSDP sync)")
-            return embedder
-
         # zero init the r_embedder
-        if embedder_init == "zero":
+        elif embedder_init == "zero":
             for param in embedder.parameters():
                 param.data.zero_()
         elif embedder_init == "random":
@@ -925,6 +909,15 @@ class Wan(FastGenNetwork):
             pass
         else:
             raise ValueError(f"Invalid embedder_init: {embedder_init}")
+
+        if r_embedder_fusion == "gated":
+            # The gated path projects the fused (t, r) embedding through the
+            # condition_embedder's own time_proj, shared with the t-only path.
+            # Drop the r_embedder's copy so it cannot linger as an untrained
+            # dead parameter. Done after the init branches above because
+            # "random" initializes time_proj.
+            del embedder.time_proj
+            del embedder.act_fn
         return embedder
 
     def override_transformer_forward(self, inner_dim: int) -> None:
@@ -1090,86 +1083,11 @@ class Wan(FastGenNetwork):
         i.e., {'generator': state_dict}.
         """
         if self._use_wan_official_sinusoidal and not any(k.startswith("transformer.") for k in state_dict.keys()):
-            # Handle original Wan checkpoint formats
-            # Pick the source state dict (adjust these keys to your file)
-            state = None
-            for k in ["generator", "state_dict", "model", "module", "net", None]:
-                if k is None:
-                    # fallback: assume loaded object IS the state_dict
-                    if isinstance(state_dict, dict) and all(isinstance(v, torch.Tensor) for v in state_dict.values()):
-                        state = state_dict
-                    break
-                if isinstance(state_dict, dict) and k in state_dict and isinstance(state_dict[k], dict):
-                    state = state_dict[k]
-                    break
-            assert state is not None, "Could not find a state_dict in checkpoint."
-            logger.info(f"Loading original Wan checkpoint formats from key: {k}")
+            state_dict = convert_wan_official_state_dict(state_dict)
 
-            # Rename mapping as list of tuples (order matters for the norm swap)
-            rename_mapping = [
-                ("time_embedding.0", "condition_embedder.time_embedder.linear_1"),
-                ("time_embedding.2", "condition_embedder.time_embedder.linear_2"),
-                ("text_embedding.0", "condition_embedder.text_embedder.linear_1"),
-                ("text_embedding.2", "condition_embedder.text_embedder.linear_2"),
-                ("time_projection.1", "condition_embedder.time_proj"),
-                ("head.modulation", "scale_shift_table"),
-                ("head.head", "proj_out"),
-                ("modulation", "scale_shift_table"),
-                ("ffn.0", "ffn.net.0.proj"),
-                ("ffn.2", "ffn.net.2"),
-                # swap norm names: norm1, norm3, norm2 -> norm1, norm2, norm3
-                ("norm2", "norm__placeholder"),
-                ("norm3", "norm2"),
-                ("norm__placeholder", "norm3"),
-                # I2V extras
-                ("img_emb.proj.0", "condition_embedder.image_embedder.norm1"),
-                ("img_emb.proj.1", "condition_embedder.image_embedder.ff.net.0.proj"),
-                ("img_emb.proj.3", "condition_embedder.image_embedder.ff.net.2"),
-                ("img_emb.proj.4", "condition_embedder.image_embedder.norm2"),
-                ("img_emb.emb_pos", "condition_embedder.image_embedder.pos_embed"),
-                # attention parts
-                ("self_attn.q", "attn1.to_q"),
-                ("self_attn.k", "attn1.to_k"),
-                ("self_attn.v", "attn1.to_v"),
-                ("self_attn.o", "attn1.to_out.0"),
-                ("self_attn.norm_q", "attn1.norm_q"),
-                ("self_attn.norm_k", "attn1.norm_k"),
-                ("cross_attn.q", "attn2.to_q"),
-                ("cross_attn.k", "attn2.to_k"),
-                ("cross_attn.v", "attn2.to_v"),
-                ("cross_attn.o", "attn2.to_out.0"),
-                ("cross_attn.norm_q", "attn2.norm_q"),
-                ("cross_attn.norm_k", "attn2.norm_k"),
-                ("attn2.to_k_img", "attn2.add_k_proj"),
-                ("attn2.to_v_img", "attn2.add_v_proj"),
-                ("attn2.norm_k_img", "attn2.norm_added_k"),
-            ]
-
-            # Convert keys
-            def rename_key(k: str) -> str:
-                # strip common prefixes if present
-                for prefix in ["model.", "module.", "transformer."]:
-                    if k.startswith(prefix):
-                        k = k[len(prefix) :]
-                # apply replacements in the specified order
-                for old, new in rename_mapping:
-                    if old in k:
-                        k = k.replace(old, new)
-                return k
-
-            new_state = {}
-            for k, v in state.items():
-                # optional: skip buffer-like positional/freq params if not needed
-                # if "freqs" in k:
-                #     continue
-                new_k = rename_key(k)
-                # Add 'transformer.' prefix since the model expects it
-                new_k = f"transformer.{new_k}"
-                new_state[new_k] = v
-            state_dict = new_state
-
-        # AnyFlow HF releases store the r-pathway as condition_embedder.delta_embedder;
-        # remap to FastGen's r_embedder layout (no-op for all other checkpoints).
+        # Some third-party checkpoints store the r-pathway as
+        # condition_embedder.delta_embedder; remap to FastGen's r_embedder
+        # layout (no-op for all other checkpoints).
         state_dict = remap_anyflow_keys(state_dict)
 
         return super().load_state_dict(state_dict, **kwargs)
@@ -1225,9 +1143,8 @@ class Wan(FastGenNetwork):
         # A gated-fusion flow-map network always consumes the r-pathway (the
         # fusion happens inside the shared time projection), so r=None has no
         # in-distribution meaning for it. Default to r=t, i.e. the
-        # instantaneous velocity u(x_t, t, t) — this is how the AnyFlow
-        # reference queries its real/fake score models. Additive-fusion
-        # (MeanFlow) networks keep the skip-r-pathway behavior.
+        # instantaneous velocity u(x_t, t, t). Additive-fusion (MeanFlow)
+        # networks keep the skip-r-pathway behavior.
         if r is None and getattr(self.transformer.r_embedder, "fusion_mode", None) == "gated":
             r = t
 

@@ -1,15 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Config schema for the AnyFlow on-policy method (paper Stage 3).
+"""Config schema for the AnyFlow on-policy method (paper Stage 2).
 
 AnyFlow's on-policy stage is DMD2 with a flow-map student that generates via
-a multi-step rollout-with-gradient, so the config is the DMD2 model config
-unchanged. The flow-map pretrain stage (paper Stage 2) is MeanFlow with
+a multi-step rollout-with-gradient, so the config is based on the DMD2 model
+config. The flow-map pretrain stage (paper Stage 1) is MeanFlow with
 AnyFlow's hyperparameters — see ``configs/experiments/WanT2V/config_anyflow.py``.
 """
 
 from typing import List, Optional
+
+from typing import Optional
 
 import attrs
 from omegaconf import DictConfig
@@ -26,7 +28,7 @@ from fastgen.configs.config import BaseConfig
 from fastgen.configs.methods.config_dmd2 import ModelConfig as DMD2ModelConfig
 from fastgen.configs.methods.config_mean_flow import (
     LossConfig as MeanFlowLossConfig,
-    SampleRConfig,
+    SampleRConfig as MeanFlowSampleRConfig,
     SampleTConfig as MeanFlowSampleTConfig,
 )
 from fastgen.methods import AnyFlowModel
@@ -37,7 +39,7 @@ from fastgen.utils import LazyCall as L
 class ModelConfig(DMD2ModelConfig):
     """AnyFlow on-policy model config — DMD2 plus the rollout / cotrain knobs.
 
-    The MeanFlow loss / sampling configs drive the co-trained Stage-2
+    The MeanFlow loss / sampling configs drive the co-trained Stage-1
     flow-map loss inside the student update (the reference's
     ``cotrain_forward_kl``).
     """
@@ -45,10 +47,10 @@ class ModelConfig(DMD2ModelConfig):
     # MeanFlow-style (t, r) sampling for the co-trained flow-map loss; the
     # extra fields are ignored by the DMD2 noising-time sampling.
     sample_t_cfg: MeanFlowSampleTConfig = attrs.field(factory=MeanFlowSampleTConfig)
-    sample_r_cfg: SampleRConfig = attrs.field(factory=SampleRConfig)
+    sample_r_cfg: MeanFlowSampleRConfig = attrs.field(factory=MeanFlowSampleRConfig)
     loss_config: MeanFlowLossConfig = attrs.field(factory=MeanFlowLossConfig)
 
-    # Weight of the co-trained Stage-2 flow-map loss in the student update.
+    # Weight of the co-trained Stage-1 flow-map loss in the student update.
     # The reference runs it at weight 1 (cotrain_forward_kl: True); 0 disables.
     cotrain_pretrain_weight: float = 1.0
 

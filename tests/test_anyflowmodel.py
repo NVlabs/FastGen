@@ -5,8 +5,8 @@
 
 The pretrain stage is MeanFlow with AnyFlow's hyperparameters (fixed
 per-timestep loss weighting, finite-difference JVP, consistency bucket), so
-the pretrain tests drive :class:`MeanFlowModel` directly. The on-policy tests
-exercise :class:`AnyFlowModel` (DMD2 with a multi-step rollout-with-gradient
+the pretrain tests drive ``MeanFlowModel`` directly. The on-policy tests
+exercise ``AnyFlowModel`` (DMD2 with a multi-step rollout-with-gradient
 student). Both run on the tiny EDM backbone with ``r_timestep=True`` and
 ``schedule_type=rf`` so they execute on CPU without pretrained weights.
 """
@@ -24,8 +24,10 @@ from fastgen.methods import AnyFlowModel, MeanFlowModel
 from fastgen.utils.test_utils import check_grad_zero
 
 
-def _build_pretrain_model(weight_type="beta08", consistency_ratio=0.25, r_sample_ratio=0.5):
-    """MeanFlow configured the AnyFlow way (paper Stage 2)."""
+def _build_pretrain_model(
+    weight_type="beta08", consistency_ratio=0.25, flow_matching_ratio=0.5, deterministic_buckets=True
+):
+    """MeanFlow configured the AnyFlow way (paper Stage 1)."""
     gc.collect()
     instance = MeanFlowModelConfig()
 
@@ -39,8 +41,9 @@ def _build_pretrain_model(weight_type="beta08", consistency_ratio=0.25, r_sample
     instance.sample_t_cfg.shift = 5.0
     instance.sample_t_cfg.min_t = 0.001
     instance.sample_t_cfg.max_t = 0.999
-    instance.sample_t_cfg.r_sample_ratio = r_sample_ratio
+    instance.sample_t_cfg.flow_matching_ratio = flow_matching_ratio
     instance.sample_t_cfg.consistency_ratio = consistency_ratio
+    instance.sample_t_cfg.deterministic_buckets = deterministic_buckets
 
     opts = ["-", "img_resolution=2", "channel_mult=[1]", "channel_mult_noise=1", "r_timestep=True", "+schedule_type=rf"]
     instance.net = override_config_with_opts(instance.net, opts)
@@ -61,7 +64,11 @@ def _build_onpolicy_model():
     gc.collect()
     instance = AnyFlowModelConfig()
 
-    opts = ["-", "img_resolution=8", "channel_mult=[1]", "channel_mult_noise=1", "r_timestep=True", "+schedule_type=rf"]
+    base_opts = ["-", "img_resolution=8", "channel_mult=[1]", "channel_mult_noise=1", "+schedule_type=rf"]
+    # Teacher / fake score are PLAIN single-timestep nets, as in the reference
+    # and in config_anyflow_onpolicy.py; only the student carries the r pathway.
+    instance.teacher = override_config_with_opts(AnyFlowModelConfig().net, list(base_opts))
+    opts = base_opts[:1] + ["r_timestep=True"] + base_opts[1:]
     instance.net = override_config_with_opts(instance.net, opts)
     opts_disc = ["-", "feature_indices=[0]", "all_res=[8]", "in_channels=128"]
     instance.discriminator = override_config_with_opts(instance.discriminator, opts_disc)
@@ -77,8 +84,9 @@ def _build_onpolicy_model():
     instance.sample_t_cfg.time_dist_type = "uniform"
     instance.sample_t_cfg.min_t = 0.001
     instance.sample_t_cfg.max_t = 0.999
-    instance.sample_t_cfg.r_sample_ratio = 0.5
+    instance.sample_t_cfg.flow_matching_ratio = 0.5
     instance.sample_t_cfg.consistency_ratio = 0.25
+    instance.sample_t_cfg.deterministic_buckets = True
     instance.loss_config.loss_type = "l2"
     instance.loss_config.weight_type = "uniform"
     instance.loss_config.norm_method = None
@@ -154,16 +162,16 @@ def test_pretrain_finite_difference_falls_back_at_boundaries():
 def test_pretrain_consistency_bucket_pins_r_to_zero():
     """With consistency_ratio=1.0 (and no flow-matching head), every sample's
     r must be pinned to 0 (consistency to clean data, as in the reference)."""
-    model = _build_pretrain_model(consistency_ratio=1.0, r_sample_ratio=1.0)
+    model = _build_pretrain_model(consistency_ratio=1.0, flow_matching_ratio=0.0)
     _t, r, r_eq_t_mask = model._sample_t_r_buckets(4)
     assert not r_eq_t_mask.any()
     assert torch.allclose(r.float(), torch.zeros_like(r.float()))
 
 
 def test_pretrain_bucket_partition_is_deterministic():
-    """With consistency_ratio > 0, buckets follow the reference's deterministic
-    global partition: diffusion head, consistency middle, random-pair tail."""
-    model = _build_pretrain_model(consistency_ratio=0.25, r_sample_ratio=0.5)
+    """With deterministic_buckets, both buckets follow the reference's global
+    partition: flow-matching head, consistency middle, random-pair tail."""
+    model = _build_pretrain_model(consistency_ratio=0.25, flow_matching_ratio=0.5, deterministic_buckets=True)
     batch_size = 8
     t, r, r_eq_t_mask = model._sample_t_r_buckets(batch_size)
 
@@ -177,17 +185,41 @@ def test_pretrain_bucket_partition_is_deterministic():
     )
 
 
-def test_pretrain_rebalance_to_diffusion():
-    """With rebalancing on, each non-diffusion loss is rescaled to the
-    diffusion-loss mean by a detached per-sample factor."""
+def test_pretrain_bucket_partition_is_stochastic():
+    """Without deterministic_buckets the same two ratios drive binomial bucket
+    SIZES: the layout is still head/middle/tail, but the sizes vary per call
+    and average to the configured fractions."""
+    model = _build_pretrain_model(consistency_ratio=0.25, flow_matching_ratio=0.5, deterministic_buckets=False)
+    torch.manual_seed(0)
+    batch_size = 4096
+    t, r, r_eq_t_mask = model._sample_t_r_buckets(batch_size)
+
+    # min_t = 0.001, so only the consistency bucket can carry r == 0.
+    is_consistency = r == 0
+    assert not (r_eq_t_mask & is_consistency).any()
+    assert torch.equal(r[r_eq_t_mask], t[r_eq_t_mask])
+    assert abs(r_eq_t_mask.float().mean().item() - 0.5) < 0.05
+    assert abs(is_consistency.float().mean().item() - 0.25) < 0.05
+    # Prefix layout, same as the deterministic policy.
+    n_flow_matching = int(r_eq_t_mask.sum())
+    assert r_eq_t_mask[:n_flow_matching].all() and not r_eq_t_mask[n_flow_matching:].any()
+
+    # The sizes are what varies, unlike the deterministic policy.
+    sizes = {int(model._sample_t_r_buckets(64)[2].sum()) for _ in range(20)}
+    assert len(sizes) > 1, f"stochastic bucket sizes should vary, got {sizes}"
+
+
+def test_pretrain_rebalance_to_flow_matching():
+    """With rebalancing on, each r < t loss is rescaled to the flow-matching
+    loss mean by a detached per-sample factor."""
     model = _build_pretrain_model()
-    model.loss_config.rebalance_to_diffusion = True
+    model.loss_config.rebalance_to_flow_matching = True
 
     mf_loss = torch.tensor([2.0, 4.0, 10.0, 100.0], dtype=torch.float64, requires_grad=True)
     r_eq_t_mask = torch.tensor([True, True, False, False])
     loss = model._reduce_mf_loss(mf_loss, r_eq_t_mask)
 
-    # diffusion mean = 3.0; each non-diffusion sample becomes ~3.0.
+    # flow-matching mean = 3.0; each r < t sample becomes ~3.0.
     expected = (2.0 + 4.0 + 3.0 * (10.0 / 10.00001) + 3.0 * (100.0 / 100.00001)) / 4.0
     assert abs(loss.item() - expected) < 1e-3
     loss.backward()
@@ -199,7 +231,7 @@ def test_pretrain_rebalance_all_flow_matching_batch():
     the rebalance branch (the collective inside must run on every rank) and
     reduce to the plain mean."""
     model = _build_pretrain_model()
-    model.loss_config.rebalance_to_diffusion = True
+    model.loss_config.rebalance_to_flow_matching = True
 
     mf_loss = torch.tensor([2.0, 4.0], dtype=torch.float64)
     r_eq_t_mask = torch.tensor([True, True])
@@ -227,10 +259,11 @@ def test_timestep_weight_function(weight_type):
     """The fixed per-timestep weight is a direct function of t: non-negative,
     finite, and normalized like the reference scheduler."""
     model = _build_pretrain_model(weight_type=weight_type)
-    model._timestep_weight_scale = None  # force re-derivation for this weight_type
 
+    # The fixture sets norm_method=None, so _compute_weight on a ones tensor is
+    # exactly the fixed per-timestep weight w(t).
     t = torch.linspace(0.0, 1.0, 101, dtype=torch.float64)
-    w = model._get_timestep_weight(t)
+    w = model._compute_weight(torch.ones_like(t), t)
     assert torch.all(w >= 0), f"{weight_type} weights must be non-negative"
     assert torch.isfinite(w).all()
 
@@ -238,12 +271,14 @@ def test_timestep_weight_function(weight_type):
         # Uniform normalizes to exactly 1.0 over the reference grid.
         assert torch.allclose(w, torch.ones_like(w))
 
-    # The normalization matches the reference set_timesteps grid (1000 points,
-    # t=0 excluded): sum over the shifted grid == 1000.
+    # The weight has mean one over the network's discrete training timesteps
+    # (t=0 excluded), which at the default num_steps=1000 is the reference's
+    # set_timesteps grid: sum over the shifted grid == num_steps.
+    num_steps = model.net.noise_scheduler.num_steps
     shift = model.sample_t_cfg.shift
-    grid = torch.linspace(1.0, 0.0, 1001, dtype=torch.float64)[:-1]
+    grid = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)[:-1]
     grid = shift * grid / (1 + (shift - 1) * grid)
-    assert abs(model._get_timestep_weight(grid).sum().item() - 1000.0) < 1e-6
+    assert abs(model._compute_weight(torch.ones_like(grid), grid).sum().item() - num_steps) < 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +292,7 @@ def test_onpolicy_student_update_step():
     loss_map, outputs = model.single_train_step(data, 0)  # iteration 0 -> student update
     assert "total_loss" in loss_map
     assert "vsd_loss" in loss_map
-    # The co-trained Stage-2 flow-map loss is part of every student update.
+    # The co-trained Stage-1 flow-map loss is part of every student update.
     assert "bidirection_loss" in loss_map
     assert torch.isfinite(loss_map["total_loss"]).all()
     assert "gen_rand" in outputs
@@ -269,6 +304,26 @@ def test_onpolicy_cotrain_can_be_disabled():
     data = _make_data(model, img_resolution=8)
     loss_map, _ = model.single_train_step(data, 0)
     assert "bidirection_loss" not in loss_map
+
+
+def test_onpolicy_student_starts_from_pure_noise():
+    """The rollout is on-policy: the student starts from pure noise at max_t.
+
+    DMD2's multi-step branch would hand back real data noised to a random entry
+    of `t_list`, which `gen_data_from_net` would then roll out as if it sat at
+    `t_list[0]` — both off-policy and a latent/timestep mismatch.
+    """
+    model = _build_onpolicy_model()
+    torch.manual_seed(0)
+    real = torch.randn(8, 3, 8, 8, device=model.device, dtype=model.precision)
+    input_student, t_student, _, _ = model._generate_noise_and_time(real, iteration=0)
+
+    max_t = float(model.net.noise_scheduler.max_t)
+    assert torch.allclose(t_student.float(), torch.full_like(t_student.float(), max_t))
+    # Pure noise carries no signal from the batch it was drawn alongside; the
+    # off-policy failure mode correlates at ~0.7 (1/sqrt(192) ~ 0.07 by chance).
+    cos = torch.nn.functional.cosine_similarity(input_student.flatten(1).float(), real.flatten(1).float())
+    assert cos.abs().max() < 0.35, f"student input correlates with real data: {cos.tolist()}"
 
 
 def test_onpolicy_rollout_compresses_to_three_forwards():
@@ -361,12 +416,21 @@ def test_onpolicy_optimizer_step():
 
 
 def _make_fake_fusion_self(fusion_mode, gate_value=0.25, encoder_depth=None, dim=4, proj_dim=12):
+    condition_embedder = torch.nn.Module()
+    condition_embedder.time_proj = torch.nn.Linear(dim, proj_dim)
+    condition_embedder.act_fn = torch.nn.SiLU()
+
     r_embedder = torch.nn.Module()
-    r_embedder.time_proj = torch.nn.Linear(dim, proj_dim)
-    r_embedder.act_fn = torch.nn.SiLU()
     r_embedder.fusion_mode = fusion_mode
     r_embedder.gate_value = gate_value
-    return types.SimpleNamespace(r_embedder=r_embedder, encoder_depth=encoder_depth)
+    if fusion_mode == "additive":
+        # Gated fusion reuses condition_embedder.time_proj, so Wan.__init__
+        # drops these from the r_embedder in that mode.
+        r_embedder.time_proj = torch.nn.Linear(dim, proj_dim)
+        r_embedder.act_fn = torch.nn.SiLU()
+    return types.SimpleNamespace(
+        r_embedder=r_embedder, condition_embedder=condition_embedder, encoder_depth=encoder_depth
+    )
 
 
 def test_fuse_r_embedding_gated():
@@ -382,10 +446,62 @@ def test_fuse_r_embedding_gated():
 
     gate = fake.r_embedder.gate_value
     rt_emb = (1 - gate) * temb + gate * remb
-    expected = fake.r_embedder.time_proj(fake.r_embedder.act_fn(rt_emb)).unflatten(1, (6, -1))
+    # The gated projection goes through the SHARED condition_embedder.time_proj.
+    expected = fake.condition_embedder.time_proj(fake.condition_embedder.act_fn(rt_emb)).unflatten(1, (6, -1))
     assert torch.allclose(out_temb, rt_emb)
     assert torch.allclose(out_proj, expected)
     assert out_r_proj is None
+    assert not hasattr(fake.r_embedder, "time_proj")
+
+
+def test_validation_t_list_matches_shift():
+    """The hardcoded validation schedule must equal the shifted grid.
+
+    `config_anyflow_onpolicy.py` writes `sample_t_cfg.t_list` out as a constant
+    instead of deriving it at runtime, so nothing detects it going stale if
+    `shift` or `student_sample_steps` changes. Recompute it here from those two
+    settings and compare.
+
+    Left as None, DMD2 hands `generator_fn` the noise scheduler's UNSHIFTED
+    `linspace(max_t, 0, N+1)`, which is far off-policy for a shift=5 model --
+    asserted below so the constant cannot silently degrade to that.
+    """
+    import fastgen.configs.experiments.WanT2V.config_anyflow_onpolicy as mod
+
+    cfg = mod.create_config()
+    shift = float(cfg.model.sample_t_cfg.shift)
+    n = int(cfg.model.student_sample_steps)
+    max_t = float(cfg.model.net.max_t)  # the bound `_rollout_t_list` clamps to
+
+    grid = [1.0 - i / n for i in range(n + 1)]
+    expected = [min(shift * x / (1 + (shift - 1) * x), max_t) for x in grid]
+
+    t_list = list(cfg.model.sample_t_cfg.t_list)
+    assert len(t_list) == n + 1, t_list
+    assert all(abs(a - b) < 1e-9 for a, b in zip(t_list, expected)), (t_list, expected)
+    assert t_list[0] == max_t and t_list[-1] == 0.0
+
+    # and it must not be the unshifted fallback DMD2 would use for None
+    unshifted = [max_t * (1.0 - i / n) for i in range(n + 1)]
+    assert not all(abs(a - b) < 1e-6 for a, b in zip(t_list, unshifted))
+
+
+def test_fuse_r_embedding_gated_trains_the_shared_time_proj():
+    """The gated projection must flow gradient into condition_embedder.time_proj.
+
+    A private r_embedder.time_proj would leave the condition_embedder's copy
+    without gradient (a dead parameter under DDP/FSDP) while the two silently
+    drift apart, breaking round-trips to the AnyFlow checkpoint layout.
+    """
+    from fastgen.networks.Wan.network import _fuse_r_embedding
+
+    torch.manual_seed(0)
+    fake = _make_fake_fusion_self("gated")
+    _, out_proj, _ = _fuse_r_embedding(fake, torch.randn(2, 4), torch.randn(2, 6, 2), torch.randn(2, 4), None)
+    out_proj.sum().backward()
+
+    grad = fake.condition_embedder.time_proj.weight.grad
+    assert grad is not None and torch.any(grad != 0)
 
 
 def test_fuse_r_embedding_gated_respects_encoder_depth():
@@ -426,7 +542,7 @@ def test_fuse_r_embedding_additive_unchanged():
 
 @pytest.mark.parametrize("prefix", ["", "transformer."])
 def test_remap_anyflow_keys(prefix):
-    from fastgen.networks.Wan.network import remap_anyflow_keys
+    from fastgen.networks.Wan.utils import remap_anyflow_keys
 
     sd = {
         f"{prefix}condition_embedder.delta_embedder.linear_1.weight": torch.randn(2, 2),
@@ -438,15 +554,34 @@ def test_remap_anyflow_keys(prefix):
 
     assert f"{prefix}r_embedder.time_embedder.linear_1.weight" in out
     assert f"{prefix}condition_embedder.delta_embedder.linear_1.weight" not in out
-    # The shared time_proj is duplicated into the r_embedder.
-    assert torch.equal(out[f"{prefix}r_embedder.time_proj.weight"], sd[f"{prefix}condition_embedder.time_proj.weight"])
-    assert torch.equal(out[f"{prefix}r_embedder.time_proj.bias"], sd[f"{prefix}condition_embedder.time_proj.bias"])
+    # time_proj stays shared on the condition_embedder — no r_embedder copy.
+    assert f"{prefix}r_embedder.time_proj.weight" not in out
+    assert torch.equal(
+        out[f"{prefix}condition_embedder.time_proj.weight"], sd[f"{prefix}condition_embedder.time_proj.weight"]
+    )
     # Unrelated keys untouched.
     assert torch.equal(out[f"{prefix}blocks.0.attn1.to_q.weight"], sd[f"{prefix}blocks.0.attn1.to_q.weight"])
 
 
 def test_remap_anyflow_keys_noop_without_delta_keys():
-    from fastgen.networks.Wan.network import remap_anyflow_keys
+    from fastgen.networks.Wan.utils import remap_anyflow_keys
 
     sd = {"transformer.blocks.0.attn1.to_q.weight": torch.randn(2, 2)}
     assert remap_anyflow_keys(sd) is sd
+
+
+def test_rollout_uses_the_flow_map_sample_loop():
+    """`gen_data_from_net` must resolve to FlowMapLossMixin's loop, not the base one.
+
+    `AnyFlowModel(FlowMapLossMixin, DMD2Model)` picks it purely by MRO order.
+    `FastGenModel._student_sample_loop` is an x0-prediction loop that never
+    passes `r`, and it accepts the same arguments -- so swapping the base order
+    would silently turn the flow-map rollout (jump / fine step / jump) into a
+    plain diffusion sampler instead of raising.
+    """
+    from fastgen.methods import AnyFlowModel
+    from fastgen.methods.consistency_model.mean_flow import FlowMapLossMixin
+
+    assert (
+        AnyFlowModel._student_sample_loop.__func__ is FlowMapLossMixin._student_sample_loop.__func__
+    ), "AnyFlowModel must inherit the flow-map sample loop; check the base-class order"

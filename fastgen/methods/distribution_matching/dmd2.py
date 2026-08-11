@@ -76,14 +76,31 @@ class DMD2Model(FastGenModel):
             if self.config.gan_loss_weight_gen > 0:
                 self.discriminator.train().requires_grad_(True)
 
+    def _sample_noising_time(self, batch_size: int, iteration: Optional[int] = None) -> torch.Tensor:
+        """Draw the noising time `t` for whichever branch this iteration runs.
+
+        The generator and fake-score updates alternate and need not noise from
+        the same density. Unset `fake_score_sample_t_cfg` means both use
+        `sample_t_cfg`.
+        """
+        t_cfg = self.config.sample_t_cfg
+        is_fake_score_step = iteration is not None and iteration % self.config.student_update_freq != 0
+        if is_fake_score_step and getattr(self.config, "fake_score_sample_t_cfg", None) is not None:
+            t_cfg = self.config.fake_score_sample_t_cfg
+        return self.net.noise_scheduler.sample_t(
+            batch_size, **convert_cfg_to_dict(t_cfg), device=self.device
+        )
+
     def _generate_noise_and_time(
-        self, real_data: torch.Tensor
+        self, real_data: torch.Tensor, iteration: Optional[int] = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate random noises and time step
 
         Args:
-            batch_size: Batch size
             real_data: Real data tensor for dtype/device reference
+            iteration: Current training iteration, used only to tell a generator
+                update from a fake-score one so `fake_score_sample_t_cfg` can
+                apply on the latter. `None` always uses `sample_t_cfg`.
 
         Returns:
             rand_z_max: Random noise used by the student
@@ -115,9 +132,7 @@ class DMD2Model(FastGenModel):
             )
             input_student = self.net.noise_scheduler.forward_process(real_data, eps_student, t_student)
 
-        t = self.net.noise_scheduler.sample_t(
-            batch_size, **convert_cfg_to_dict(self.config.sample_t_cfg), device=self.device
-        )
+        t = self._sample_noising_time(batch_size, iteration)
         eps = torch.randn_like(real_data, device=self.device, dtype=real_data.dtype)
         return input_student, t_student, t, eps
 
@@ -442,7 +457,7 @@ class DMD2Model(FastGenModel):
         self._setup_grad_requirements(iteration)
 
         # Generate noise and time steps
-        input_student, t_student, t, eps = self._generate_noise_and_time(real_data)
+        input_student, t_student, t, eps = self._generate_noise_and_time(real_data, iteration=iteration)
 
         # Choose between student update or fake_score/discriminator update
         if iteration % self.config.student_update_freq == 0:

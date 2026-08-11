@@ -58,10 +58,17 @@ def create_config():
     config.model.net.r_embedder_init = "zero"
     config.model.net.norm_temb = False
 
+    # The consistency-distillation teacher (use_cd=True) is only ever queried for
+    # the instantaneous velocity, without r, so give it the plain architecture.
+    # Deriving it from `net` would allocate, zero-init and keep on device an
+    # r_embedder that is never invoked.
+    config.model.teacher = copy.deepcopy(Wan_1_3B_Config)
+    config.model.teacher.r_timestep = False
+
     # we use simple diffusion version: 0.73 = 0.5 * log((21 * 60 * 104)/(64 * 64)) - 0.1
     config.model.enable_preprocessors = False
     config.model.sample_t_cfg.time_dist_type = "logitnormal"
-    config.model.sample_t_cfg.r_sample_ratio = 1.0
+    config.model.sample_t_cfg.flow_matching_ratio = 0.0
     config.model.sample_t_cfg.train_p_mean = -0.8
     config.model.sample_t_cfg.train_p_std = 1.6
     config.model.sample_t_cfg.min_t = 0.001
