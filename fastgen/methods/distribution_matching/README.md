@@ -89,23 +89,15 @@ DMD2 extended for causal video generation with autoregressive chunk-by-chunk pro
 
 **File:** [`anyflow.py`](anyflow.py) | **Reference:** [Gu et al., 2026](https://arxiv.org/abs/2605.13724)
 
-DMD2 with a flow-map student `u_θ(x_t, t, r)` (average velocity from `t` back to `r`), supporting arbitrary inference NFE. The student generates by rolling out the flow map from pure noise with the NFE sampled per iteration and gradients through all segments, and co-trains the flow-map loss at every update. Requires a Stage-1 flow-map pretrain, which uses the MeanFlow objective with AnyFlow's hyperparameters and runs directly on [`MeanFlowModel`](../consistency_model/mean_flow.py).
+DMD2 with a flow-map student `u(x_t, t, r)` (mean velocity from `t` back to `r`), supporting arbitrary inference NFE. The student generates by rolling out the flow map from pure noise with the NFE sampled per iteration and gradients through all segments, and co-trains the flow-map loss at every update. Requires a Stage-1 flow-map pretrain, which runs directly on [`MeanFlowModel`](../consistency_model/mean_flow.py) using AnyFlow's hyperparameters.
 
-**Key Parameters (Stage 2, on-policy):**
+**Key Parameters (Stage 2):**
 - `student_sample_steps_list`: Rollout NFEs sampled per iteration
 - `cotrain_pretrain_weight`: Weight of the co-trained Stage-1 flow-map loss
-- `guidance_scale`: CFG scale for teacher, applied as `cond + (g-1)·(cond - uncond)`
 - Requires a Stage-1 pretrained checkpoint via `trainer.checkpointer.pretrained_ckpt_path`
-- See also the key parameters of DMD2 above
+- See also the key parameters of DMD2 above (and the key parameters of [MeanFlow](../consistency_model/README.md#meanflow) for Stage 1)
 
-**Key Parameters (Stage 1, on MeanFlow):**
-- `loss_config.weight_type`: Fixed per-timestep loss weight (`beta08`, `gaussian`, `uniform`)
-- `loss_config.guidance_fuse_scale`: Prediction-side guidance fusion, i.e., the conditional output learns the guided flow directly (with `cond_dropout_prob` for text dropout)
-- `loss_config.rebalance_to_flow_matching`: Rescale the `r < t` losses to the global flow-matching (`r = t`) loss mean
-- `sample_t_cfg`: Shifted timestep sampling (`time_dist_type="shifted"`, `shift=5` for Wan video) and the batch fraction pinned to `r = 0` (`consistency_ratio`)
-- See also the key parameters of [MeanFlow](../consistency_model/README.md#meanflow)
-
-**Configs:** [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py) (Stage 1 pretrain), [`WanT2V/config_anyflow_onpolicy.py`](../../configs/experiments/WanT2V/config_anyflow_onpolicy.py) (Stage 2 on-policy distillation, full-rank fine-tune of a Stage 1 checkpoint)
+**Configs:** [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py) (Stage 1 pretrain), [`WanT2V/config_anyflow_onpolicy.py`](../../configs/experiments/WanT2V/config_anyflow_onpolicy.py) (Stage 2 on-policy distillation)
 
 ---
 

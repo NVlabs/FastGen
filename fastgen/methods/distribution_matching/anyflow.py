@@ -42,16 +42,6 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
     FastGenModel's default x0-prediction loop never passes ``r``.
     """
 
-    @torch.no_grad()
-    def _get_velocity(self, x, z, t, condition=None, neg_condition=None):
-        """Raw data velocity for the co-trained flow-map loss.
-
-        Note that AnyFlow guides on the prediction side using
-        ``loss_config.guidance_fuse_scale`` applied in ``_compute_mf_loss``.
-        """
-        del neg_condition
-        return condition, self.net.noise_scheduler.cond_velocity(x=x, eps=z, t=t)
-
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self.config = config

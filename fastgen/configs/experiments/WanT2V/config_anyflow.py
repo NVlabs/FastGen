@@ -67,7 +67,7 @@ def create_config():
     # learns the guided flow directly. guidance_scale stays None — MeanFlow's
     # target-side eq. 19 fusion is a different mechanism.
     config.model.guidance_scale = None
-    config.model.loss_config.guidance_fuse_scale = 3.0
+    config.model.guidance_fuse_scale = 3.0
     config.model.cond_dropout_prob = 0.1
 
     # ------ (t, r) sampling: shifted uniform pairs + AnyFlow buckets ------

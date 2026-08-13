@@ -59,12 +59,23 @@ class ModelConfig(DMD2ModelConfig):
     # the fixed student_sample_steps.
     student_sample_steps_list: Optional[List[int]] = None
 
+    # Prediction-side guidance fusion for the co-trained flow-map loss; see
+    # `config_mean_flow.ModelConfig`.
+    guidance_fuse_scale: Optional[float] = None
+
     # Text dropout for the co-trained flow-map loss (reference drop_text_ratio).
     cond_dropout_prob: Optional[float] = None
     cond_keys_no_dropout: List[str] = attrs.field(factory=list)
 
     # Precision for autocast in the co-trained loss JVP (None = training precision).
     precision_amp_jvp: str | None = None
+
+    # MeanFlow's target-side guidance knobs. AnyFlow typixcally guides on the 
+    # PREDICTION side (`guidance_fuse_scale`), so these stay at their
+    # no-op defaults
+    guidance_mixture_ratio: Optional[float] = None
+    guidance_t_start: float = 0.0
+    guidance_t_end: float = 1.0
 
 
 @attrs.define(slots=False)

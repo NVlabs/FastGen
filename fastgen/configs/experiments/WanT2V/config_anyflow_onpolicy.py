@@ -112,7 +112,7 @@ def create_config():
     config.model.loss_config.use_jvp_finite_diff = True
     config.model.loss_config.jvp_finite_diff_eps = 5e-3
     config.model.loss_config.rebalance_to_flow_matching = True
-    config.model.loss_config.guidance_fuse_scale = 3.0
+    config.model.guidance_fuse_scale = 3.0
     config.model.cond_dropout_prob = 0.1
     config.model.precision_amp_jvp = "float32"
     config.model.sample_t_cfg.flow_matching_ratio = 0.5

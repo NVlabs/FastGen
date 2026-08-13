@@ -243,7 +243,7 @@ def test_pretrain_prediction_side_guidance_fusion():
     """The AnyFlow guidance-distillation branch (guidance_fuse_scale) must run
     end to end and keep gradients on the fused prediction."""
     model = _build_pretrain_model()
-    model.loss_config.guidance_fuse_scale = 3.0
+    model.config.guidance_fuse_scale = 3.0
     model.config.cond_dropout_prob = 0.5
     data = _make_data(model, batch_size=2)
 

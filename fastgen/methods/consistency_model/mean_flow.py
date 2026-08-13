@@ -125,6 +125,90 @@ class FlowMapLossMixin:
             return condition, keep
         raise TypeError(f"Unsupported condition type: {type(condition)}")
 
+    @torch.no_grad()
+    def _get_velocity(
+        self,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        t: torch.Tensor,
+        condition: Optional[Any] = None,
+        neg_condition: Optional[Any] = None,
+    ) -> Tuple[Any, torch.Tensor]:
+        """Regression target for the flow-map loss, plus the condition it was built from.
+
+        Two independent choices:
+
+        * ``loss_config.use_cd`` picks the target SOURCE -- the teacher, or the
+          conditional data velocity.
+        * ``guidance_fuse_scale`` guides the *prediction* in
+          ``_compute_mf_loss``, so the target needs no guidance of its own and we only
+          drop the condition. Otherwise we guide the target too: through the teacher, or
+          -- without one -- by the net's own cond/uncond pass.
+        """
+        fuse_scale = self.config.guidance_fuse_scale
+        if fuse_scale is not None:
+            assert fuse_scale > 0, f"guidance_fuse_scale must be > 0, got {fuse_scale} (None disables fusion)"
+            condition, _ = self._drop_condition(condition, neg_condition)
+
+        x_t = self.net.noise_scheduler.forward_process(x, z, t)
+
+        if self.loss_config.use_cd:
+            dxt_dt = self.teacher(x_t, t, condition=condition, fwd_pred_type="flow")
+            # Under fusion the target stays unguided, or it would be guided twice.
+            if self.config.guidance_scale is not None and fuse_scale is None:
+                guidance_scale = torch.where(
+                    ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
+                    self.config.guidance_scale,
+                    1.0,
+                )
+                guidance_scale = expand_like(guidance_scale, x_t).to(dtype=x_t.dtype)
+                neg_dxt_dt = self.teacher(x_t, t, condition=neg_condition, fwd_pred_type="flow")
+                dxt_dt = dxt_dt + (guidance_scale - 1.0) * (dxt_dt - neg_dxt_dt)
+        else:
+            dxt_dt = self.net.noise_scheduler.cond_velocity(x=x, eps=z, t=t)
+
+            # unconditional score estimation from meanflow eq (19). Skipped under
+            # prediction-side fusion: that is this same guidance, moved onto the
+            # prediction, and the dropout it needs already ran above.
+            if fuse_scale is None and (
+                self.config.guidance_scale is not None or self.config.guidance_mixture_ratio is not None
+            ):
+                # Turn off dropout
+                self.net.eval()
+                neg_dxt_dt = self.net(x_t, t, r=t, condition=neg_condition, fwd_pred_type="flow")
+                guidance_scale = self.config.guidance_scale or 1.0
+                guidance_scale = torch.where(
+                    ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
+                    guidance_scale,
+                    1.0,
+                )
+                guidance_scale = expand_like(guidance_scale, x_t).to(dtype=x_t.dtype)
+
+                if self.config.guidance_mixture_ratio is None:
+                    guided_dxt_dt = neg_dxt_dt + guidance_scale * (dxt_dt - neg_dxt_dt)
+                else:
+                    guidance_mixture_ratio = torch.where(
+                        ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
+                        self.config.guidance_mixture_ratio,
+                        0.0,
+                    )
+                    guidance_mixture_ratio = expand_like(guidance_mixture_ratio, x_t).to(dtype=x_t.dtype)
+                    cond_dxt_dt = self.net(x_t, t, r=t, condition=condition, fwd_pred_type="flow")
+                    guided_dxt_dt = (
+                        guidance_scale * dxt_dt
+                        + (1.0 - guidance_scale - guidance_mixture_ratio) * neg_dxt_dt
+                        + guidance_mixture_ratio * cond_dxt_dt
+                    )
+
+                self.net.train()
+                condition, keep = self._drop_condition(condition, neg_condition)
+                if keep is not None:
+                    # Same subset: a kept sample is conditional + guided, a
+                    # dropped one unconditional + unguided.
+                    dxt_dt = torch.where(expand_like(keep, dxt_dt), guided_dxt_dt, dxt_dt)
+
+        return condition, dxt_dt
+
     def _estimate_jvp_finite_difference(
         self,
         net_wrapper: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
@@ -489,50 +573,34 @@ class FlowMapLossMixin:
         z = torch.randn_like(real_data)
         x_t = self.net.noise_scheduler.forward_process(real_data, z, t)
 
-        guidance_fuse_scale = getattr(self.loss_config, "guidance_fuse_scale", None)
-        if guidance_fuse_scale is not None:
-            # Guidance distillation fused on the PREDICTION side: the
-            # conditional output is trained to be the guided flow directly.
-            # The regression target stays the raw data velocity, the
-            # unconditional branch is queried at the SAME (t, r) flow-map
-            # slice, and the effective prediction is
-            # (u_cond + (g - 1) * u_uncond) / g. Text dropout replaces the
-            # condition with neg_condition for a random subset beforehand.
-            g = float(guidance_fuse_scale)
-            assert g > 0, f"guidance_fuse_scale must be > 0, got {g} (set it to None to disable guidance fusion)"
-            assert (
-                neg_condition is not None
-            ), "guidance_fuse_scale requires neg_condition: the unconditional branch is queried at the same (t, r)"
-            condition, _ = self._drop_condition(condition, neg_condition)
-            dxt_dt = self.net.noise_scheduler.cond_velocity(x=real_data, eps=z, t=t)
-            torch.clear_autocast_cache()
-            # dF/dt of the fused prediction: finite difference of the
-            # conditional output divided by g (the unconditional derivative is
-            # dropped).
-            u_theta_jvp = self._jvp(x_t, t, r, dxt_dt, condition=condition) / g
-            assert not u_theta_jvp.requires_grad, "u_theta_jvp should not require gradients"
+        condition, dxt_dt = self._get_velocity(real_data, z, t, condition=condition, neg_condition=neg_condition)
+        # prevent JVP to use cached conversions (which can break the computational graph) that were created in the no_grad context of _get_velocity
+        torch.clear_autocast_cache()
+        u_theta_jvp = self._jvp(x_t, t, r, dxt_dt, condition=condition)
+        assert not u_theta_jvp.requires_grad, "u_theta_jvp should not require gradients"
 
-            assert x_t.dtype == real_data.dtype, f"x_t.dtype: {x_t.dtype}, real_data.dtype: {real_data.dtype}"
-            u_theta = self.net(x_t, t, r=r, condition=condition, fwd_pred_type="flow")
+        # additional forward pass to get u_theta with gradient; see also https://github.com/Gsunshine/py-meanflow?tab=readme-ov-file#note-on-jvp
+        assert x_t.dtype == real_data.dtype, f"x_t.dtype: {x_t.dtype}, real_data.dtype: {real_data.dtype}"
+        u_theta = self.net(
+            x_t,
+            t,
+            r=r,
+            condition=condition,
+            fwd_pred_type="flow",
+        )
+
+        guidance_fuse_scale = self.config.guidance_fuse_scale
+        if guidance_fuse_scale is not None:
+            # Guidance distillation on the PREDICTION side (see `_get_velocity`): the
+            # conditional output learns the guided flow directly, so only the prediction
+            # changes. The uncond branch is queried at the SAME (t, r) flow-map slice,
+            # giving (u_cond + (g - 1) * u_uncond) / g; dF/dt is then the conditional
+            # finite difference over g, with the unconditional derivative dropped.
+            u_theta_jvp = u_theta_jvp / guidance_fuse_scale
             with torch.no_grad():
                 u_uncond = self.net(x_t, t, r=r, condition=neg_condition, fwd_pred_type="flow")
-            u_theta = (u_theta + (g - 1.0) * u_uncond) / g
-        else:
-            condition, dxt_dt = self._get_velocity(real_data, z, t, condition=condition, neg_condition=neg_condition)
-            # prevent JVP to use cached conversions (which can break the computational graph) that were created in the no_grad context of _get_velocity
-            torch.clear_autocast_cache()
-            u_theta_jvp = self._jvp(x_t, t, r, dxt_dt, condition=condition)
-            assert not u_theta_jvp.requires_grad, "u_theta_jvp should not require gradients"
+            u_theta = (u_theta + (guidance_fuse_scale - 1.0) * u_uncond) / guidance_fuse_scale
 
-            # additional forward pass to get u_theta with gradient; see also https://github.com/Gsunshine/py-meanflow?tab=readme-ov-file#note-on-jvp
-            assert x_t.dtype == real_data.dtype, f"x_t.dtype: {x_t.dtype}, real_data.dtype: {real_data.dtype}"
-            u_theta = self.net(
-                x_t,
-                t,
-                r=r,
-                condition=condition,
-                fwd_pred_type="flow",
-            )
         mf_loss, tangent, loss_weight, warmup_weight = self._mf_pred_to_loss(
             u_theta=u_theta, u_theta_jvp=u_theta_jvp, x_t=x_t, dxt_dt=dxt_dt, t=t, r=r, iteration=iteration
         )
@@ -563,69 +631,6 @@ class MeanFlowModel(FlowMapLossMixin, CMModel):
         super().__init__(config)
         self.config = config
         self._init_flow_map_loss()
-
-    @torch.no_grad()
-    def _get_velocity(
-        self,
-        x: torch.Tensor,
-        z: torch.Tensor,
-        t: torch.Tensor,
-        condition: Optional[torch.Tensor] = None,
-        neg_condition: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_t = self.net.noise_scheduler.forward_process(x, z, t)
-
-        if self.loss_config.use_cd:
-            dxt_dt = self.teacher(x_t, t, condition=condition, fwd_pred_type="flow")
-            if self.config.guidance_scale is not None:
-                guidance_scale = torch.where(
-                    ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
-                    self.config.guidance_scale,
-                    1.0,
-                )
-                guidance_scale = expand_like(guidance_scale, x_t).to(dtype=x_t.dtype)
-                neg_dxt_dt = self.teacher(x_t, t, condition=neg_condition, fwd_pred_type="flow")
-                dxt_dt = dxt_dt + (guidance_scale - 1.0) * (dxt_dt - neg_dxt_dt)
-        else:
-            dxt_dt = self.net.noise_scheduler.cond_velocity(x=x, eps=z, t=t)
-
-            # unconditional score estimation from meanflow eq (19)
-            if self.config.guidance_scale is not None or self.config.guidance_mixture_ratio is not None:
-                # Turn off dropout
-                self.net.eval()
-                neg_dxt_dt = self.net(x_t, t, r=t, condition=neg_condition, fwd_pred_type="flow")
-                guidance_scale = self.config.guidance_scale or 1.0
-                guidance_scale = torch.where(
-                    ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
-                    guidance_scale,
-                    1.0,
-                )
-                guidance_scale = expand_like(guidance_scale, x_t).to(dtype=x_t.dtype)
-
-                if self.config.guidance_mixture_ratio is None:
-                    guided_dxt_dt = neg_dxt_dt + guidance_scale * (dxt_dt - neg_dxt_dt)
-                else:
-                    guidance_mixture_ratio = torch.where(
-                        ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
-                        self.config.guidance_mixture_ratio,
-                        0.0,
-                    )
-                    guidance_mixture_ratio = expand_like(guidance_mixture_ratio, x_t).to(dtype=x_t.dtype)
-                    cond_dxt_dt = self.net(x_t, t, r=t, condition=condition, fwd_pred_type="flow")
-                    guided_dxt_dt = (
-                        guidance_scale * dxt_dt
-                        + (1.0 - guidance_scale - guidance_mixture_ratio) * neg_dxt_dt
-                        + guidance_mixture_ratio * cond_dxt_dt
-                    )
-
-                self.net.train()
-                condition, keep = self._drop_condition(condition, neg_condition)
-                if keep is not None:
-                    # Same subset: a kept sample is conditional + guided, a
-                    # dropped one unconditional + unguided.
-                    dxt_dt = torch.where(expand_like(keep, dxt_dt), guided_dxt_dt, dxt_dt)
-
-        return condition, dxt_dt
 
     def single_train_step(
         self, data: Dict[str, Any], iteration: int

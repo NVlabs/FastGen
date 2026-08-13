@@ -86,11 +86,6 @@ class LossConfig:
     # ("beta08", "gaussian", "uniform"). Multiplies the adaptive norm_method 
     # weight above; None disables it.
     weight_type: Optional[str] = None
-    # prediction-side guidance fusion scale (AnyFlow guidance distillation):
-    # the conditional output is trained to be the guided flow directly via
-    # (u_cond + (g-1) * u_uncond) / g against the raw data velocity. None 
-    # keeps MeanFlow's target-side guidance (guidance_scale).
-    guidance_fuse_scale: Optional[float] = None
     # rebalance the flow-map / consistency (r < t) sample losses to the global
     # flow-matching (r = t) loss mean via a detached per-sample factor
     rebalance_to_flow_matching: bool = False
@@ -115,6 +110,12 @@ class ModelConfig(BaseModelConfig):
 
     # optimizer
     net_optimizer: DictConfig = attrs.field(factory=lambda: copy.deepcopy(RAdamOptimizerConfig))
+
+    # prediction-side guidance fusion scale (AnyFlow guidance distillation):
+    # the conditional output is trained to be the guided flow directly via
+    # (u_cond + (g-1) * u_uncond) / g against the raw data velocity. None
+    # keeps MeanFlow's target-side guidance (guidance_scale).
+    guidance_fuse_scale: Optional[float] = None
 
     # condition dropout probability
     cond_dropout_prob: Optional[float] = None
