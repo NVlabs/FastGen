@@ -83,7 +83,7 @@ class LossConfig:
     # loss type (choice between l2 and opt_grad)
     loss_type: str = "opt_grad"
     # optional fixed per-timestep loss weighting evaluated as a function of t
-    # ("beta08", "gaussian", "uniform"). Multiplies the adaptive norm_method 
+    # ("beta08", "gaussian", "uniform"). Multiplies the adaptive norm_method
     # weight above; None disables it.
     weight_type: Optional[str] = None
     # rebalance the flow-map / consistency (r < t) sample losses to the global

@@ -4,8 +4,8 @@
 """AnyFlow flow-map pretrain config on Wan-1.3B T2V (paper Stage 1).
 
 AnyFlow's pretrain objective is MeanFlow's with a fixed ``beta08`` per-timestep
-weighting, a finite-difference JVP, shifted timestep sampling, and a 
-``consistency_ratio`` fraction of the batch pinned to ``r = 0`` — so this config 
+weighting, a finite-difference JVP, shifted timestep sampling, and a
+``consistency_ratio`` fraction of the batch pinned to ``r = 0`` — so this config
 runs``MeanFlowModel`` directly. The values below mirror the reference recipe
 ``train_wan1b_student_shift5_81f_480p_lr5e-5_6k_b32.yml``.
 Known deviations from the reference: full-rank fine-tuning instead of the paper's
@@ -103,7 +103,7 @@ def create_config():
     config.model.sample_t_cfg.t_list = [1.0, 0.9375, 0.8333333333333334, 0.625, 0.0]
 
     # ------ data / trainer ------
-    config.dataloader_train = VideoLoaderConfig
+    config.dataloader_train = copy.deepcopy(VideoLoaderConfig)
     config.dataloader_train.img_size = (config.model.input_shape[-1] * 8, config.model.input_shape[-2] * 8)
     config.dataloader_train.sequence_length = (config.model.input_shape[1] - 1) * 4 + 1
     config.dataloader_train.batch_size = 1

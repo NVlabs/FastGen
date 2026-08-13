@@ -11,8 +11,6 @@ AnyFlow's hyperparameters — see ``configs/experiments/WanT2V/config_anyflow.py
 
 from typing import List, Optional
 
-from typing import Optional
-
 import attrs
 from omegaconf import DictConfig
 
@@ -61,6 +59,11 @@ class ModelConfig(DMD2ModelConfig):
 
     # Prediction-side guidance fusion for the co-trained flow-map loss; see
     # `config_mean_flow.ModelConfig`.
+    #
+    # Deviates from the AnyFlow reference, which divides dF/dt by g for the whole
+    # batch. We divide only on samples that kept their condition: a dropped sample's
+    # fused prediction is plain `u_uncond`, so an ungated 1/g would regress it onto
+    # a different fixed point.
     guidance_fuse_scale: Optional[float] = None
 
     # Text dropout for the co-trained flow-map loss (reference drop_text_ratio).
@@ -70,7 +73,7 @@ class ModelConfig(DMD2ModelConfig):
     # Precision for autocast in the co-trained loss JVP (None = training precision).
     precision_amp_jvp: str | None = None
 
-    # MeanFlow's target-side guidance knobs. AnyFlow typixcally guides on the 
+    # MeanFlow's target-side guidance knobs. AnyFlow typically guides on the
     # PREDICTION side (`guidance_fuse_scale`), so these stay at their
     # no-op defaults
     guidance_mixture_ratio: Optional[float] = None

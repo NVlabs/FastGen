@@ -692,9 +692,7 @@ def _test_qwen_image_impl(rank: int, world_size: int) -> Dict:
     from fastgen.configs.net import QwenImageConfig
 
     set_env_vars()
-    return _generic_fsdp_test_impl(
-        rank, world_size, QwenImageConfig, generate_qwen_image_inputs, apply_checkpointing=True
-    )
+    return _generic_fsdp_test_impl(world_size, QwenImageConfig, generate_qwen_image_inputs, apply_checkpointing=True)
 
 
 # =============================================================================

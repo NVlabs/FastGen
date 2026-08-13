@@ -129,6 +129,13 @@ def remap_anyflow_keys(state_dict: Mapping[str, Any]) -> Mapping[str, Any]:
         # [transformer.]condition_embedder.delta_embedder.linear_1.weight
         #   -> [transformer.]r_embedder.time_embedder.linear_1.weight
         prefix, _, suffix = k.partition(delta_marker)
-        new_sd[f"{prefix}r_embedder.time_embedder.{suffix}"] = new_sd.pop(k)
+        target = f"{prefix}r_embedder.time_embedder.{suffix}"
+        if target in new_sd:
+            raise ValueError(
+                f"remap_anyflow_keys: rewriting {k!r} would overwrite the existing {target!r}. "
+                "This checkpoint carries both the AnyFlow and the FastGen r-pathway layouts; "
+                "drop one of them before loading."
+            )
+        new_sd[target] = new_sd.pop(k)
     logger.info(f"remap_anyflow_keys: rewrote {len(delta_keys)} delta_embedder tensors into r_embedder.")
     return new_sd

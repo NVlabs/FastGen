@@ -59,9 +59,9 @@ class FlowMapLossMixin:
     training objective; distribution-matching methods can co-train it alongside
     their own objective.
 
-    The host class must provide ``net``, ``device``, ``config``,
-    ``precision_amp``, a ``_get_velocity`` implementation, and call
-    ``_init_flow_map_loss`` from its ``__init__``.
+    The host class must provide ``net``, ``device``, ``config`` and ``precision_amp``
+    (plus ``teacher`` when ``loss_config.use_cd``), and call ``_init_flow_map_loss``
+    from its ``__init__``.
     """
 
     def _init_flow_map_loss(self) -> None:
@@ -70,7 +70,8 @@ class FlowMapLossMixin:
         self.sample_r_cfg = self.config.sample_r_cfg
         self.loss_config = self.config.loss_config
 
-        # Precision for JVP
+        # Drop the JVP autocast when it matches the outer one, since a nested region in the
+        # same dtype is a no-op.
         if self.config.precision_amp_jvp is None or self.config.precision_amp_jvp == self.precision_amp:
             self.precision_amp_jvp = None
         else:
@@ -89,28 +90,29 @@ class FlowMapLossMixin:
             grid = shift * grid / (1 + (shift - 1) * grid)
             self._timestep_weight_scale = float(num_steps / self._timestep_weight_raw(grid).sum())
 
-    def _drop_condition(self, condition: Any, neg_condition: Any) -> Tuple[Any, Optional[torch.Tensor]]:
+    def _drop_condition(
+        self, condition: Any, neg_condition: Any, batch_size: int, device: torch.device
+    ) -> Tuple[Any, torch.Tensor]:
         """Replace the condition with neg_condition for a per-sample subset.
 
-        Returns ``(condition, keep)``; ``keep`` is the ``[B]`` bool mask (None if
-        no dropout), so callers can reuse the same subset. Keys in
-        ``cond_keys_no_dropout`` are never replaced.
+        Returns ``(condition, keep)``; ``keep`` is the ``[B]`` bool mask of the
+        samples that stayed conditional, so callers can reuse the same subset.
 
         ``deterministic_buckets`` decides whether an index carries bucket
         information: if so the buckets are cut on the GLOBAL index and an
         index-based rule would only hit flow matching on rank 0, so draw per
         sample; otherwise drop the first ``num_to_drop``.
         """
+        # Dropout disabled, or no negative condition to swap in: every sample
+        # stays conditional.
         if self.config.cond_dropout_prob is None or neg_condition is None:
-            return condition, None
+            return condition, torch.ones(batch_size, dtype=torch.bool, device=device)
 
-        ref = neg_condition if isinstance(neg_condition, torch.Tensor) else next(iter(neg_condition.values()))
-        batch_size = ref.shape[0]
         if self.sample_t_cfg.deterministic_buckets:
-            keep = torch.rand(batch_size, device=ref.device) >= self.config.cond_dropout_prob
+            keep = torch.rand(batch_size, device=device) >= self.config.cond_dropout_prob
         else:
-            num_to_drop = (torch.rand(batch_size, device=ref.device) < self.config.cond_dropout_prob).sum()
-            keep = torch.arange(batch_size, device=ref.device) >= num_to_drop
+            num_to_drop = (torch.rand(batch_size, device=device) < self.config.cond_dropout_prob).sum()
+            keep = torch.arange(batch_size, device=device) >= num_to_drop
 
         if isinstance(condition, torch.Tensor):
             return torch.where(expand_like(keep, condition), condition, neg_condition), keep
@@ -133,8 +135,9 @@ class FlowMapLossMixin:
         t: torch.Tensor,
         condition: Optional[Any] = None,
         neg_condition: Optional[Any] = None,
-    ) -> Tuple[Any, torch.Tensor]:
-        """Regression target for the flow-map loss, plus the condition it was built from.
+    ) -> Tuple[Any, torch.Tensor, torch.Tensor]:
+        """Regression target for the flow-map loss, the condition it was built from,
+        and the ``[B]`` mask of samples that stayed conditional.
 
         Two independent choices:
 
@@ -148,7 +151,9 @@ class FlowMapLossMixin:
         fuse_scale = self.config.guidance_fuse_scale
         if fuse_scale is not None:
             assert fuse_scale > 0, f"guidance_fuse_scale must be > 0, got {fuse_scale} (None disables fusion)"
-            condition, _ = self._drop_condition(condition, neg_condition)
+            condition, keep = self._drop_condition(condition, neg_condition, x.shape[0], x.device)
+        else:
+            keep = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
 
         x_t = self.net.noise_scheduler.forward_process(x, z, t)
 
@@ -201,13 +206,12 @@ class FlowMapLossMixin:
                     )
 
                 self.net.train()
-                condition, keep = self._drop_condition(condition, neg_condition)
-                if keep is not None:
-                    # Same subset: a kept sample is conditional + guided, a
-                    # dropped one unconditional + unguided.
-                    dxt_dt = torch.where(expand_like(keep, dxt_dt), guided_dxt_dt, dxt_dt)
+                condition, keep = self._drop_condition(condition, neg_condition, x_t.shape[0], x_t.device)
+                # Same subset: a kept sample is conditional + guided, a dropped one
+                # unconditional + unguided.
+                dxt_dt = torch.where(expand_like(keep, dxt_dt), guided_dxt_dt, dxt_dt)
 
-        return condition, dxt_dt
+        return condition, dxt_dt, keep
 
     def _estimate_jvp_finite_difference(
         self,
@@ -573,7 +577,7 @@ class FlowMapLossMixin:
         z = torch.randn_like(real_data)
         x_t = self.net.noise_scheduler.forward_process(real_data, z, t)
 
-        condition, dxt_dt = self._get_velocity(real_data, z, t, condition=condition, neg_condition=neg_condition)
+        condition, dxt_dt, keep = self._get_velocity(real_data, z, t, condition=condition, neg_condition=neg_condition)
         # prevent JVP to use cached conversions (which can break the computational graph) that were created in the no_grad context of _get_velocity
         torch.clear_autocast_cache()
         u_theta_jvp = self._jvp(x_t, t, r, dxt_dt, condition=condition)
@@ -594,9 +598,10 @@ class FlowMapLossMixin:
             # Guidance distillation on the PREDICTION side (see `_get_velocity`): the
             # conditional output learns the guided flow directly, so only the prediction
             # changes. The uncond branch is queried at the SAME (t, r) flow-map slice,
-            # giving (u_cond + (g - 1) * u_uncond) / g; dF/dt is then the conditional
-            # finite difference over g, with the unconditional derivative dropped.
-            u_theta_jvp = u_theta_jvp / guidance_fuse_scale
+            # giving (u_cond + (g - 1) * u_uncond) / g; dF/dt is then the finite
+            # difference over g on conditional samples, with the unconditional
+            # derivative dropped.
+            u_theta_jvp = torch.where(expand_like(keep, u_theta_jvp), u_theta_jvp / guidance_fuse_scale, u_theta_jvp)
             with torch.no_grad():
                 u_uncond = self.net(x_t, t, r=r, condition=neg_condition, fwd_pred_type="flow")
             u_theta = (u_theta + (guidance_fuse_scale - 1.0) * u_uncond) / guidance_fuse_scale

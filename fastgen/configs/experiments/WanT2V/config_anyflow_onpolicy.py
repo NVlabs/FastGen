@@ -137,7 +137,7 @@ def create_config():
     config.trainer.callbacks.ema.start_iter = 6399
 
     # ------ data / trainer ------
-    config.dataloader_train = VideoLoaderConfig
+    config.dataloader_train = copy.deepcopy(VideoLoaderConfig)
     config.dataloader_train.img_size = (config.model.input_shape[-1] * 8, config.model.input_shape[-2] * 8)
     config.dataloader_train.sequence_length = (config.model.input_shape[1] - 1) * 4 + 1
     config.dataloader_train.batch_size = 1

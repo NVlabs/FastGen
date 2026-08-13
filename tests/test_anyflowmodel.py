@@ -343,8 +343,10 @@ def test_onpolicy_rollout_compresses_to_three_forwards():
         return orig_forward(*args, **kwargs)
 
     model.net.forward = counting_forward
-    gen = model.gen_data_from_net(input_student, t_student, condition=cond)
-    model.net.forward = orig_forward
+    try:
+        gen = model.gen_data_from_net(input_student, t_student, condition=cond)
+    finally:
+        model.net.forward = orig_forward
 
     assert len(calls) <= 3, f"rollout must compress to <= 3 forwards, got {len(calls)}"
     assert gen.requires_grad

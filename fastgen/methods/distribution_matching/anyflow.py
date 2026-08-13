@@ -38,8 +38,7 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
     """AnyFlow on-policy stage: DMD2 with a flow-map rollout student.
 
     ``FlowMapLossMixin`` supplies the co-trained Stage-1 objective and the
-    flow-map validation sample loop, which integrates with ``r = t_next`` —
-    FastGenModel's default x0-prediction loop never passes ``r``.
+    flow-map validation sample loop, which integrates with ``r = t_next``.
     """
 
     def __init__(self, config: ModelConfig):
@@ -133,7 +132,7 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
         grad_step = self._broadcast_choice(num_steps)
         t_list = self._rollout_t_list(num_steps)
 
-        # The leading jump exists only for grad_step > 0 and the trailing one 
+        # The leading jump exists only for grad_step > 0 and the trailing one
         # only for grad_step + 1 < num_steps.
         seg_t = [t_list[0]] if grad_step > 0 else []
         seg_t += [t_list[grad_step], t_list[grad_step + 1]]
