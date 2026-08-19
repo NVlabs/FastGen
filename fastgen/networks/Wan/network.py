@@ -646,9 +646,7 @@ class Wan(FastGenNetwork):
         self.transformer.time_cond_type = time_cond_type
         if r_timestep:
             logger.info(f"Initializing r embedder with {r_embedder_init}")
-            self.transformer.r_embedder = self.init_embedder(
-                r_embedder_init, r_embedder_fusion, r_embedder_gate_value
-            )
+            self.transformer.r_embedder = self.init_embedder(r_embedder_init, r_embedder_fusion, r_embedder_gate_value)
         else:
             self.transformer.r_embedder = None
 

@@ -87,9 +87,7 @@ class DMD2Model(FastGenModel):
         is_fake_score_step = iteration is not None and iteration % self.config.student_update_freq != 0
         if is_fake_score_step and getattr(self.config, "fake_score_sample_t_cfg", None) is not None:
             t_cfg = self.config.fake_score_sample_t_cfg
-        return self.net.noise_scheduler.sample_t(
-            batch_size, **convert_cfg_to_dict(t_cfg), device=self.device
-        )
+        return self.net.noise_scheduler.sample_t(batch_size, **convert_cfg_to_dict(t_cfg), device=self.device)
 
     def _generate_noise_and_time(
         self, real_data: torch.Tensor, iteration: Optional[int] = None

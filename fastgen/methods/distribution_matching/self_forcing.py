@@ -12,7 +12,6 @@ from fastgen.methods import CausVidModel
 
 import fastgen.utils.logging_utils as logger
 from fastgen.networks.network import CausalFastGenNetwork
-from fastgen.utils.basic_utils import convert_cfg_to_dict
 from fastgen.utils.distributed import is_rank0, world_size
 
 if TYPE_CHECKING:
