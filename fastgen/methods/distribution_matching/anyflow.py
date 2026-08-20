@@ -24,6 +24,7 @@ import torch
 
 from fastgen.methods.consistency_model.mean_flow import FlowMapLossMixin
 from fastgen.methods.distribution_matching.dmd2 import DMD2Model
+from fastgen.networks.noise_schedule import SHIFTED_TIME_DIST_TYPES
 from fastgen.utils.distributed import world_size
 import fastgen.utils.logging_utils as logger
 
@@ -104,7 +105,7 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
         *validation* schedule used at ``student_sample_steps``.
         """
         ns = self.net.noise_scheduler
-        shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type == "shifted" else 1.0
+        shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type in SHIFTED_TIME_DIST_TYPES else 1.0
         s = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64, device=self.device)
         s = shift * s / (1 + (shift - 1) * s)
         return s.clamp(max=float(ns.max_t)).to(ns.t_precision)

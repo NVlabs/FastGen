@@ -254,6 +254,47 @@ def test_pretrain_prediction_side_guidance_fusion():
     assert grad_seen
 
 
+def test_pretrain_guidance_fusion_requires_neg_condition():
+    """Fusion queries the unconditional branch, so a missing neg_condition must
+    stop with a configuration error rather than reach the network as None."""
+    model = _build_pretrain_model()
+    model.config.guidance_fuse_scale = 3.0
+    data = _make_data(model)
+    data["neg_condition"] = None
+
+    with pytest.raises(AssertionError, match="requires neg_condition"):
+        model.single_train_step(data, 0)
+
+
+def test_shifted_variants_share_the_shift_map():
+    """Both shifted time distributions apply the same shift map when sampling t,
+    so the grids rebuilt outside the sampler must pick up `shift` for either one.
+
+    Covers the loss-weight normalization (pretrain) and the rollout schedule
+    (on-policy); a variant missing from the lookup degrades silently to shift=1.
+    """
+    model = _build_pretrain_model()
+    shifted_scale = model._timestep_weight_scale
+
+    model.config.sample_t_cfg.time_dist_type = "shifted_logitnormal"
+    model._init_flow_map_loss()
+    assert model._timestep_weight_scale == pytest.approx(shifted_scale)
+
+    # and the shift is what makes it differ from an unshifted grid
+    model.config.sample_t_cfg.time_dist_type = "uniform"
+    model._init_flow_map_loss()
+    assert model._timestep_weight_scale != pytest.approx(shifted_scale)
+
+    onpolicy = _build_onpolicy_model()
+    onpolicy.sample_t_cfg.shift = 5.0
+    onpolicy.sample_t_cfg.time_dist_type = "shifted"
+    shifted_t_list = onpolicy._rollout_t_list(4)
+    onpolicy.sample_t_cfg.time_dist_type = "shifted_logitnormal"
+    assert torch.allclose(onpolicy._rollout_t_list(4), shifted_t_list)
+    onpolicy.sample_t_cfg.time_dist_type = "uniform"
+    assert not torch.allclose(onpolicy._rollout_t_list(4), shifted_t_list)
+
+
 @pytest.mark.parametrize("weight_type", ["beta08", "gaussian", "uniform"])
 def test_timestep_weight_function(weight_type):
     """The fixed per-timestep weight is a direct function of t: non-negative,
@@ -480,12 +521,12 @@ def test_validation_t_list_matches_shift():
 
     t_list = list(cfg.model.sample_t_cfg.t_list)
     assert len(t_list) == n + 1, t_list
-    assert all(abs(a - b) < 1e-9 for a, b in zip(t_list, expected)), (t_list, expected)
+    assert all(abs(a - b) < 1e-9 for a, b in zip(t_list, expected, strict=True)), (t_list, expected)
     assert t_list[0] == max_t and t_list[-1] == 0.0
 
     # and it must not be the unshifted fallback DMD2 would use for None
     unshifted = [max_t * (1.0 - i / n) for i in range(n + 1)]
-    assert not all(abs(a - b) < 1e-6 for a, b in zip(t_list, unshifted))
+    assert not all(abs(a - b) < 1e-6 for a, b in zip(t_list, unshifted, strict=True))
 
 
 def test_fuse_r_embedding_gated_trains_the_shared_time_proj():

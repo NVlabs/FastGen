@@ -9,6 +9,7 @@ from typing import Dict, Any, Callable, TYPE_CHECKING, Tuple, Optional
 import numpy as np
 import torch
 from fastgen.methods import CMModel
+from fastgen.networks.noise_schedule import SHIFTED_TIME_DIST_TYPES
 from fastgen.utils import basic_utils, expand_like
 from fastgen.utils.basic_utils import convert_cfg_to_dict
 from fastgen.utils.distributed import get_rank, world_size
@@ -85,7 +86,7 @@ class FlowMapLossMixin:
         self._timestep_weight_scale: Optional[float] = None
         if self.loss_config.weight_type is not None:
             num_steps = self.net.noise_scheduler.num_steps
-            shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type == "shifted" else 1.0
+            shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type in SHIFTED_TIME_DIST_TYPES else 1.0
             grid = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)[:-1]
             grid = shift * grid / (1 + (shift - 1) * grid)
             self._timestep_weight_scale = float(num_steps / self._timestep_weight_raw(grid).sum())
@@ -151,6 +152,9 @@ class FlowMapLossMixin:
         fuse_scale = self.config.guidance_fuse_scale
         if fuse_scale is not None:
             assert fuse_scale > 0, f"guidance_fuse_scale must be > 0, got {fuse_scale} (None disables fusion)"
+            assert (
+                neg_condition is not None
+            ), "guidance_fuse_scale requires neg_condition: the unconditional branch is queried at the same (t, r)"
             condition, keep = self._drop_condition(condition, neg_condition, x.shape[0], x.device)
         else:
             keep = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
@@ -603,7 +607,12 @@ class FlowMapLossMixin:
             # derivative dropped.
             u_theta_jvp = torch.where(expand_like(keep, u_theta_jvp), u_theta_jvp / guidance_fuse_scale, u_theta_jvp)
             with torch.no_grad():
+                # Turn off dropout for the unconditional pass, as the target-side path does.
+                was_training = self.net.training
+                self.net.eval()
                 u_uncond = self.net(x_t, t, r=r, condition=neg_condition, fwd_pred_type="flow")
+                if was_training:
+                    self.net.train()
             u_theta = (u_theta + (guidance_fuse_scale - 1.0) * u_uncond) / guidance_fuse_scale
 
         mf_loss, tangent, loss_weight, warmup_weight = self._mf_pred_to_loss(
