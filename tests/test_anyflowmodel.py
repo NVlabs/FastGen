@@ -21,6 +21,7 @@ from fastgen.configs.config_utils import override_config_with_opts
 from fastgen.configs.methods.config_anyflow import ModelConfig as AnyFlowModelConfig
 from fastgen.configs.methods.config_mean_flow import ModelConfig as MeanFlowModelConfig
 from fastgen.methods import AnyFlowModel, MeanFlowModel
+from fastgen.networks.noise_schedule import time_shift
 from fastgen.utils.test_utils import check_grad_zero
 
 
@@ -58,9 +59,13 @@ def _build_pretrain_model(
     return model
 
 
-def _build_onpolicy_model():
+def _build_onpolicy_model(cotrain_time_dist_type="uniform", cotrain_shift=5.0):
     """On-policy fixture mirrors test_dmd2model: img_resolution=8 so the
-    discriminator's 4x4 conv kernels can operate."""
+    discriminator's 4x4 conv kernels can operate.
+
+    ``cotrain_time_dist_type`` defaults to an unshifted density, so ``shift`` stays
+    inert; pass a shifted one to exercise the shifted rollout grid.
+    """
     gc.collect()
     instance = AnyFlowModelConfig()
 
@@ -80,13 +85,15 @@ def _build_onpolicy_model():
     instance.student_sample_steps = 2
     instance.input_shape = [3, 8, 8]
 
-    # Co-trained flow-map loss settings (MeanFlow machinery on the tiny net).
-    instance.sample_t_cfg.time_dist_type = "uniform"
-    instance.sample_t_cfg.min_t = 0.001
-    instance.sample_t_cfg.max_t = 0.999
-    instance.sample_t_cfg.flow_matching_ratio = 0.5
-    instance.sample_t_cfg.consistency_ratio = 0.25
-    instance.sample_t_cfg.deterministic_buckets = True
+    # Co-trained flow-map loss settings (MeanFlow machinery on the tiny net). These
+    # live on their own config: `sample_t_cfg` stays DMD2's noising time.
+    instance.cotrain_sample_t_cfg.time_dist_type = cotrain_time_dist_type
+    instance.cotrain_sample_t_cfg.shift = cotrain_shift
+    instance.cotrain_sample_t_cfg.min_t = 0.001
+    instance.cotrain_sample_t_cfg.max_t = 0.999
+    instance.cotrain_sample_t_cfg.flow_matching_ratio = 0.5
+    instance.cotrain_sample_t_cfg.consistency_ratio = 0.25
+    instance.cotrain_sample_t_cfg.deterministic_buckets = True
     instance.loss_config.loss_type = "l2"
     instance.loss_config.weight_type = "uniform"
     instance.loss_config.norm_method = None
@@ -275,24 +282,91 @@ def test_shifted_variants_share_the_shift_map():
     """
     model = _build_pretrain_model()
     shifted_scale = model._timestep_weight_scale
+    cfg_t, cfg_r = model.config.sample_t_cfg, model.config.sample_r_cfg
 
-    model.config.sample_t_cfg.time_dist_type = "shifted_logitnormal"
-    model._init_flow_map_loss()
+    cfg_t.time_dist_type = "shifted_logitnormal"
+    model._init_flow_map_loss(cfg_t, cfg_r)
     assert model._timestep_weight_scale == pytest.approx(shifted_scale)
 
     # and the shift is what makes it differ from an unshifted grid
-    model.config.sample_t_cfg.time_dist_type = "uniform"
-    model._init_flow_map_loss()
+    cfg_t.time_dist_type = "uniform"
+    model._init_flow_map_loss(cfg_t, cfg_r)
     assert model._timestep_weight_scale != pytest.approx(shifted_scale)
 
-    onpolicy = _build_onpolicy_model()
-    onpolicy.sample_t_cfg.shift = 5.0
-    onpolicy.sample_t_cfg.time_dist_type = "shifted"
-    shifted_t_list = onpolicy._rollout_t_list(4)
-    onpolicy.sample_t_cfg.time_dist_type = "shifted_logitnormal"
-    assert torch.allclose(onpolicy._rollout_t_list(4), shifted_t_list)
-    onpolicy.sample_t_cfg.time_dist_type = "uniform"
-    assert not torch.allclose(onpolicy._rollout_t_list(4), shifted_t_list)
+    # Same lookup on the on-policy rollout schedule. The shift is resolved once at
+    # init, so each variant needs a re-init rather than a bare config mutation.
+    onpolicy = _build_onpolicy_model(cotrain_time_dist_type="shifted", cotrain_shift=5.0)
+    cot_t, cot_r = onpolicy.config.cotrain_sample_t_cfg, onpolicy.config.cotrain_sample_r_cfg
+
+    # `rollout_t_list` is static, so read `flow_map_shift` back off the model: that is
+    # what checks the co-train density actually reaches the rollout grid.
+    def rollout_grid():
+        return onpolicy.rollout_t_list(4, onpolicy.flow_map_shift, float(onpolicy.net.noise_scheduler.max_t))
+
+    shifted_grid = rollout_grid()
+
+    cot_t.time_dist_type = "shifted_logitnormal"
+    onpolicy._init_flow_map_loss(cot_t, cot_r)
+    assert torch.allclose(rollout_grid(), shifted_grid)
+
+    cot_t.time_dist_type = "uniform"
+    onpolicy._init_flow_map_loss(cot_t, cot_r)
+    assert not torch.allclose(rollout_grid(), shifted_grid)
+
+
+def test_onpolicy_shifted_rollout_grid_and_step():
+    """A shifted co-train density must move the rollout grid, and a student update
+    must run on it.
+
+    Every other on-policy test uses the unshifted fixture, so without this the shift
+    never reaches `rollout_t_list` or a real rollout -- the shipped
+    `config_anyflow_onpolicy.py` runs shift=5.
+    """
+    model = _build_onpolicy_model(cotrain_time_dist_type="shifted", cotrain_shift=5.0)
+    assert model.flow_map_shift == 5.0
+
+    max_t = float(model.net.noise_scheduler.max_t)
+    grid = torch.linspace(1.0, 0.0, 5, dtype=torch.float64)
+    expected = time_shift(grid, 5.0).clamp(max=max_t)
+    t_list = model.rollout_t_list(4, model.flow_map_shift, max_t).double()
+
+    assert torch.allclose(t_list, expected)
+    # endpoints are fixed by the map; the interior is pushed towards max_t
+    assert t_list[0].item() == pytest.approx(min(1.0, max_t)) and t_list[-1].item() == 0.0
+    assert (t_list[1:-1] > grid.clamp(max=max_t)[1:-1]).all()
+
+    # and the whole student update runs on that grid
+    data = _make_data(model, img_resolution=8)
+    loss_map, _ = model.single_train_step(data, 0)
+    assert torch.isfinite(loss_map["total_loss"]).all()
+    assert "vsd_loss" in loss_map and "bidirection_loss" in loss_map
+
+
+def test_onpolicy_dmd_and_cotrain_noising_times_are_separate():
+    """DMD2 draws its noising time from `sample_t_cfg`; the co-trained flow-map loss
+    draws (t, r) from `cotrain_sample_t_cfg`.
+
+    The reference keeps these on two schedulers (`dmd_scheduler` vs `scheduler`), so
+    give the two configs disjoint ranges and check neither path reads the other's.
+    """
+    model = _build_onpolicy_model()
+    dmd = model.config.sample_t_cfg
+    dmd.time_dist_type, dmd.min_t, dmd.max_t = "uniform", 0.70, 0.80
+    cot = model.config.cotrain_sample_t_cfg
+    cot.time_dist_type, cot.min_t, cot.max_t = "uniform", 0.10, 0.20
+    model._init_flow_map_loss(cot, model.config.cotrain_sample_r_cfg)
+
+    # the mixin binds the co-train config, never DMD2's
+    assert model.flow_map_sample_t_cfg is cot
+    assert model.flow_map_sample_t_cfg is not dmd
+
+    t_dmd = model._sample_noising_time(64, iteration=0)
+    assert ((t_dmd >= 0.70) & (t_dmd <= 0.80)).all(), t_dmd
+
+    t_mf, r_mf, _ = model._sample_t_r_buckets(64)
+    assert ((t_mf >= 0.10) & (t_mf <= 0.20)).all(), t_mf
+    # r shares t's density unless sample_r_cfg is enabled; the consistency bucket pins 0
+    assert ((r_mf >= 0.0) & (r_mf <= 0.20)).all(), r_mf
 
 
 @pytest.mark.parametrize("weight_type", ["beta08", "gaussian", "uniform"])
@@ -316,7 +390,7 @@ def test_timestep_weight_function(weight_type):
     # (t=0 excluded), which at the default num_steps=1000 is the reference's
     # set_timesteps grid: sum over the shifted grid == num_steps.
     num_steps = model.net.noise_scheduler.num_steps
-    shift = model.sample_t_cfg.shift
+    shift = model.flow_map_sample_t_cfg.shift
     grid = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)[:-1]
     grid = shift * grid / (1 + (shift - 1) * grid)
     assert abs(model._compute_weight(torch.ones_like(grid), grid).sum().item() - num_steps) < 1e-6
@@ -498,23 +572,22 @@ def test_fuse_r_embedding_gated():
 
 
 def test_validation_t_list_matches_shift():
-    """The hardcoded validation schedule must equal the shifted grid.
+    """The validation schedule must equal the student's shifted sampling grid.
 
-    `config_anyflow_onpolicy.py` writes `sample_t_cfg.t_list` out as a constant
-    instead of deriving it at runtime, so nothing detects it going stale if
-    `shift` or `student_sample_steps` changes. Recompute it here from those two
-    settings and compare.
+    `config_anyflow_onpolicy.py` derives `sample_t_cfg.t_list` from
+    `cotrain_sample_t_cfg.shift`, the same shift `rollout_t_list` applies, so this pins
+    the two together and catches a stale override.
 
     Left as None, DMD2 hands `generator_fn` the noise scheduler's UNSHIFTED
     `linspace(max_t, 0, N+1)`, which is far off-policy for a shift=5 model --
-    asserted below so the constant cannot silently degrade to that.
+    asserted below so the schedule cannot silently degrade to that.
     """
     import fastgen.configs.experiments.WanT2V.config_anyflow_onpolicy as mod
 
     cfg = mod.create_config()
-    shift = float(cfg.model.sample_t_cfg.shift)
+    shift = float(cfg.model.cotrain_sample_t_cfg.shift)
     n = int(cfg.model.student_sample_steps)
-    max_t = float(cfg.model.net.max_t)  # the bound `_rollout_t_list` clamps to
+    max_t = float(cfg.model.net.max_t)  # the bound `rollout_t_list` clamps to
 
     grid = [1.0 - i / n for i in range(n + 1)]
     expected = [min(shift * x / (1 + (shift - 1) * x), max_t) for x in grid]

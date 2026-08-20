@@ -17,15 +17,23 @@ checkpoint, read directly with no conversion; ``pretrained_ckpt_key_map`` below
 
     trainer.checkpointer.pretrained_ckpt_path=<stage1>/checkpoints/0006000.pth
 
-Known deviation from the reference: full-rank fine-tuning instead of the paper's
-rank-256 LoRA.
+Known deviations from the reference: full-rank fine-tuning instead of the paper's
+rank-256 LoRA; the noising times for the DMD gradient and the fake score are drawn
+on [0.001, 0.999] rather than the reference's [0, 1] (its ``dmd_cfg`` sets no
+``min_timestep`` / ``max_timestep``, so it clamps to the full range) -- FastGen's
+convention for the other rectified-flow Wan configs; and, in the co-trained loss, the
+1/g rescaling of dF/dt under ``guidance_fuse_scale`` is gated on the samples that kept
+their condition, where the reference's ``compute_central_difference`` rescales the whole
+batch (see ``config_anyflow.py`` and ``FlowMapLossMixin._compute_mf_loss``).
 """
 
 import copy
 
+
 import fastgen.configs.methods.config_anyflow as config_anyflow_default
 from fastgen.configs.data import VideoLoaderConfig
 from fastgen.configs.net import Wan_1_3B_Config
+from fastgen.methods import AnyFlowModel
 
 
 def create_config():
@@ -77,11 +85,13 @@ def create_config():
     config.model.guidance_scale = 4.0
 
     # DMD gradient noising time: reference `generator_loss` draws torch.rand
-    # then applies the shift -> shifted-uniform.
+    # then applies the shift -> shifted-uniform. The bounds keep the score models off
+    # the degenerate endpoints (see the deviation note above); `fake_score_sample_t_cfg`
+    # inherits them through the deepcopy below.
     config.model.sample_t_cfg.time_dist_type = "shifted"
     config.model.sample_t_cfg.shift = 5.0
-    config.model.sample_t_cfg.min_t = 0.0
-    config.model.sample_t_cfg.max_t = 1.0
+    config.model.sample_t_cfg.min_t = 0.001
+    config.model.sample_t_cfg.max_t = 0.999
 
     # Fake-score noising time: reference `discriminator_loss` draws
     # logit_normal(0, 1) then applies the same shift. This is a DIFFERENT
@@ -92,13 +102,12 @@ def create_config():
     config.model.fake_score_sample_t_cfg.train_p_std = 1.0
 
     # ------ student rollout (reference rollout_cfg) ------
+    # The rollout grid's shift comes from `cotrain_sample_t_cfg` below: the reference
+    # builds its rollout pipeline from the same `scheduler` it draws the co-trained
+    # (t, r) from, separately from the DMD noising time above.
     config.model.student_sample_type = "ode"
     config.model.student_sample_steps_list = [2, 4, 8, 16, 50]
     config.model.student_sample_steps = 4
-    # Validation schedule for `student_sample_steps = 4`: `shift * s / (1 + (shift
-    # - 1) * s)` on `s = linspace(1, 0, 5)` -- the same grid the per-NFE rollout
-    # builds. Recompute if `shift`, `max_t` or `student_sample_steps` changes.
-    config.model.sample_t_cfg.t_list = [1.0, 0.9375, 0.8333333333333334, 0.625, 0.0]
 
     # ------ co-trained Stage-1 flow-map loss (reference cotrain_forward_kl) ------
     # FastGen's VSD loss carries a 0.5 factor the reference's DMD loss does
@@ -115,9 +124,22 @@ def create_config():
     config.model.guidance_fuse_scale = 3.0
     config.model.cond_dropout_prob = 0.1
     config.model.precision_amp_jvp = "float32"
-    config.model.sample_t_cfg.flow_matching_ratio = 0.5
-    config.model.sample_t_cfg.consistency_ratio = 0.25
-    config.model.sample_t_cfg.deterministic_buckets = True
+    # (t, r) sampling for the co-trained loss, drawn from the reference's `scheduler`.
+    # Its shift also drives the student's rollout grid, so it is independent of the DMD
+    # noising-time shift above; the reference recipe sets both to 5.0.
+    config.model.cotrain_sample_t_cfg.time_dist_type = "shifted"
+    config.model.cotrain_sample_t_cfg.shift = 5.0
+    config.model.cotrain_sample_t_cfg.min_t = 0.0
+    config.model.cotrain_sample_t_cfg.max_t = 1.0
+    config.model.cotrain_sample_t_cfg.flow_matching_ratio = 0.5
+    config.model.cotrain_sample_t_cfg.consistency_ratio = 0.25
+    config.model.cotrain_sample_t_cfg.deterministic_buckets = True
+
+    # Validation schedule at `student_sample_steps` -- the same grid the per-NFE rollout
+    # builds, so it follows the co-trained sampling shift.
+    config.model.sample_t_cfg.t_list = AnyFlowModel.rollout_t_list(
+        config.model.student_sample_steps, config.model.cotrain_sample_t_cfg.shift, config.model.net.max_t
+    ).tolist()
 
     # ------ optimization (reference: AdamW lr=2e-6, betas=(0.0, 0.999), wd=0,
     # grad clip 1.0, EMA 0.99) ------

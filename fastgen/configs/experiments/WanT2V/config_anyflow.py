@@ -6,19 +6,26 @@
 AnyFlow's pretrain objective is MeanFlow's with a fixed ``beta08`` per-timestep
 weighting, a finite-difference JVP, shifted timestep sampling, and a
 ``consistency_ratio`` fraction of the batch pinned to ``r = 0`` — so this config
-runs``MeanFlowModel`` directly. The values below mirror the reference recipe
+runs ``MeanFlowModel`` directly. The values below mirror the reference recipe
 ``train_wan1b_student_shift5_81f_480p_lr5e-5_6k_b32.yml``.
-Known deviations from the reference: full-rank fine-tuning instead of the paper's
-rank-256 LoRA — the same deviation applies to the on-policy stage;
+
+Known deviations from the reference, both of which also apply to the on-policy stage:
+full-rank fine-tuning instead of the paper's rank-256 LoRA; and under
+``guidance_fuse_scale`` the 1/g rescaling of dF/dt is applied only to the samples that
+kept their condition, where the reference's ``compute_central_difference`` rescales the
+whole batch. A dropped sample's fused prediction is plain ``u_uncond``, so an ungated
+1/g would regress it onto a different fixed point -- ours is gated on ``keep``.
 
 The on-policy stage (paper Stage 2) lives in ``config_anyflow_onpolicy.py``.
 """
 
 import copy
 
+
 import fastgen.configs.methods.config_mean_flow as config_mean_flow
 from fastgen.configs.data import VideoLoaderConfig
 from fastgen.configs.net import Wan_1_3B_Config
+from fastgen.methods import AnyFlowModel
 
 
 def create_config():
@@ -99,8 +106,11 @@ def create_config():
     # ------ inference / validation ------
     config.model.student_sample_type = "ode"
     config.model.student_sample_steps = 4
-    # 4-step shifted schedule shift*s/(1+(shift-1)*s) on s=linspace(1,0,5)
-    config.model.sample_t_cfg.t_list = [1.0, 0.9375, 0.8333333333333334, 0.625, 0.0]
+    # Shifted schedule under the same map the (t, r) sampling applies. The pretrain
+    # stage has a single scheduler in the reference, so it shares that shift.
+    config.model.sample_t_cfg.t_list = AnyFlowModel.rollout_t_list(
+        config.model.student_sample_steps, config.model.sample_t_cfg.shift, config.model.net.max_t
+    ).tolist()
 
     # ------ data / trainer ------
     config.dataloader_train = copy.deepcopy(VideoLoaderConfig)

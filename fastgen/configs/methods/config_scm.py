@@ -77,7 +77,7 @@ class ModelConfig(BaseModelConfig):
     # optimizer
     net_optimizer: DictConfig = attrs.field(factory=lambda: copy.deepcopy(RAdamOptimizerConfig))
 
-    # precision for autocast in JVP (none defaults to training precision)
+    # precision for autocast in JVP (none disables autocast in the JVP region)
     precision_amp_jvp: str | None = None
 
 

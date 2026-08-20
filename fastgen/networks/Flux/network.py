@@ -700,7 +700,6 @@ class Flux(FastGenNetwork):
         mu = image_seq_len * m + b
         return mu
 
-    @torch.no_grad()
     def sample(
         self,
         noise: torch.Tensor,

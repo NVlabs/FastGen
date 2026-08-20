@@ -87,14 +87,51 @@ def to_str(obj: Any) -> str | Dict[Any, str]:
 
 
 @contextmanager
+def train_mode(*modules: torch.nn.Module, mode: bool = True):
+    """
+    Temporarily sets the provided modules to train (mode=True) or eval (mode=False) mode.
+
+    Use mode=False to turn off training-only behavior such as dropout for a single forward
+    pass, e.g. when querying the trained network as its own teacher.
+
+    Args:
+        *modules: Modules to set temporarily to the given mode.
+        mode: Passed to torch.nn.Module.train(); False selects eval mode.
+
+    Returns:
+        Generator that yields the context manager.
+
+    Upon exit, it restores the original .training state of each module.
+    """
+    # Capture the original training state of each module
+    # (True if in train mode, False if in eval mode)
+    modules = [mod for mod in modules if isinstance(mod, torch.nn.Module)]
+    previous_states = [mod.training for mod in modules]
+
+    try:
+        # The mode gates training-only behavior of layers like Dropout and BatchNorm
+        for mod in modules:
+            mod.train(mode)
+        yield
+
+    finally:
+        # Restore the original state of each module
+        for mod, was_training in zip(modules, previous_states):
+            mod.train(was_training)
+
+
+@contextmanager
 def inference_mode(*modules: torch.nn.Module, precision_amp: torch.dtype | None = None, device_type: str = "cuda"):
     """
-    Wraps torch.inference_mode() and temporarily sets the provided modules
-    to .eval() mode. If precision_amp is not None, it also wraps the context in torch.autocast().
+    Wraps torch.inference_mode() and temporarily sets the provided modules to .eval() mode.
+
+    The context always sets the autocast state: with precision_amp it autocasts to that
+    dtype, and with precision_amp=None it explicitly *disables* autocast, so an enclosing
+    autocast region does not carry over into this context.
 
     Args:
         *modules: Modules to set temporarily to eval mode.
-        precision_amp: If not None, wraps the context in torch.autocast().
+        precision_amp: Dtype to autocast to. If None, autocast is disabled in the context.
         device_type: Device type to use for autocast.
 
     Returns:
@@ -102,27 +139,11 @@ def inference_mode(*modules: torch.nn.Module, precision_amp: torch.dtype | None 
 
     Upon exit, it restores the original .training state of each module.
     """
-    # 1. Capture the original training state of each module
-    #    (True if in train mode, False if in eval mode)
-    modules = [mod for mod in modules if isinstance(mod, torch.nn.Module)]
-    previous_states = [mod.training for mod in modules]
-
-    try:
-        # 2. Set all specific modules to eval mode
-        #    This is crucial for layers like Dropout and BatchNorm
-        for mod in modules:
-            mod.eval()
-
-        # 3. Enter strict inference mode (disables gradients, etc.) and autocast if needed
-        with torch.inference_mode(), torch.autocast(
-            dtype=precision_amp, device_type=device_type, enabled=precision_amp is not None
-        ):
-            yield
-
-    finally:
-        # 4. Restore the original state of each module
-        for mod, was_training in zip(modules, previous_states):
-            mod.train(was_training)
+    # Set eval mode, enter strict inference mode (disables gradients, etc.) and set the autocast state
+    with train_mode(*modules, mode=False), torch.inference_mode(), torch.autocast(
+        dtype=precision_amp, device_type=device_type, enabled=precision_amp is not None
+    ):
+        yield
 
 
 def set_random_seed(

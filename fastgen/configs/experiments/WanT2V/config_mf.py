@@ -74,12 +74,8 @@ def create_config():
     config.model.sample_t_cfg.min_t = 0.001
     config.model.sample_t_cfg.max_t = 0.999
 
-    config.dataloader_train = VideoLatentLoaderConfig
+    config.dataloader_train = copy.deepcopy(VideoLatentLoaderConfig)
     config.dataloader_train.batch_size = 1
-
-    # 480p (832x480) resolution
-    config.dataloader_train.img_size = (config.model.input_shape[-1] * 8, config.model.input_shape[-2] * 8)
-    config.dataloader_train.sequence_length = (config.model.input_shape[1] - 1) * 4 + 1
 
     config.log_config.group = "wan_mf"
     return config

@@ -42,10 +42,11 @@ class ModelConfig(DMD2ModelConfig):
     ``cotrain_forward_kl``).
     """
 
-    # MeanFlow-style (t, r) sampling for the co-trained flow-map loss; the
-    # extra fields are ignored by the DMD2 noising-time sampling.
-    sample_t_cfg: MeanFlowSampleTConfig = attrs.field(factory=MeanFlowSampleTConfig)
-    sample_r_cfg: MeanFlowSampleRConfig = attrs.field(factory=MeanFlowSampleRConfig)
+    # MeanFlow-style (t, r) sampling for the co-trained flow-map loss. Separate from
+    # the inherited `sample_t_cfg`, which DMD2 uses for the noising time: the reference
+    # draws these from its `scheduler` and the noising time from its `dmd_scheduler`.
+    cotrain_sample_t_cfg: MeanFlowSampleTConfig = attrs.field(factory=MeanFlowSampleTConfig)
+    cotrain_sample_r_cfg: MeanFlowSampleRConfig = attrs.field(factory=MeanFlowSampleRConfig)
     loss_config: MeanFlowLossConfig = attrs.field(factory=MeanFlowLossConfig)
 
     # Weight of the co-trained Stage-1 flow-map loss in the student update.
@@ -70,7 +71,7 @@ class ModelConfig(DMD2ModelConfig):
     cond_dropout_prob: Optional[float] = None
     cond_keys_no_dropout: List[str] = attrs.field(factory=list)
 
-    # Precision for autocast in the co-trained loss JVP (None = training precision).
+    # Precision for autocast in the co-trained loss JVP (None disables autocast there).
     precision_amp_jvp: str | None = None
 
     # MeanFlow's target-side guidance knobs. AnyFlow typically guides on the

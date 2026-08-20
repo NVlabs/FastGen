@@ -9,7 +9,7 @@ from typing import Dict, Any, Callable, TYPE_CHECKING, Tuple, Optional
 import numpy as np
 import torch
 from fastgen.methods import CMModel
-from fastgen.networks.noise_schedule import SHIFTED_TIME_DIST_TYPES
+from fastgen.networks.noise_schedule import time_shift
 from fastgen.utils import basic_utils, expand_like
 from fastgen.utils.basic_utils import convert_cfg_to_dict
 from fastgen.utils.distributed import get_rank, world_size
@@ -65,30 +65,46 @@ class FlowMapLossMixin:
     from its ``__init__``.
     """
 
-    def _init_flow_map_loss(self) -> None:
-        """Bind the flow-map loss / sampling configs and the JVP precision."""
-        self.sample_t_cfg = self.config.sample_t_cfg
-        self.sample_r_cfg = self.config.sample_r_cfg
+    def _init_flow_map_loss(self, sample_t_cfg: Any, sample_r_cfg: Any) -> None:
+        """Bind the flow-map loss / sampling configs and the JVP precision.
+
+        The (t, r) configs are passed in rather than read off ``self.config``: the host
+        may draw the flow-map times from a different density than its own
+        ``sample_t_cfg`` (AnyFlow does -- see ``AnyFlowModel``), and ``CMModel`` already
+        owns a ``self.sample_t_cfg`` attribute that must not be rebound here.
+
+        Args:
+            sample_t_cfg: Config for sampling the flow-map ``t``.
+            sample_r_cfg: Config for sampling the flow-map ``r``.
+        """
+        self.flow_map_sample_t_cfg = sample_t_cfg
+        self.flow_map_sample_r_cfg = sample_r_cfg
         self.loss_config = self.config.loss_config
 
-        # Drop the JVP autocast when it matches the outer one, since a nested region in the
-        # same dtype is a no-op.
-        if self.config.precision_amp_jvp is None or self.config.precision_amp_jvp == self.precision_amp:
+        # The shift `_sample_t_r_buckets` actually applies: `shift` is inert unless the
+        # density is one of `RFNoiseSchedule`'s shifted ones, so resolve it once here and
+        # reuse it wherever the flow-map timestep grid is rebuilt.
+        shifted = sample_t_cfg.time_dist_type in ("shifted", "shifted_logitnormal")
+        self.flow_map_shift = sample_t_cfg.shift if shifted else 1.0
+
+        # None runs the JVP with autocast disabled: the region always sets the autocast
+        # state, so the enclosing training autocast does not carry over into it.
+        if self.config.precision_amp_jvp is None:
             self.precision_amp_jvp = None
         else:
             self.precision_amp_jvp = basic_utils.PRECISION_MAP[self.config.precision_amp_jvp]
             logger.critical(f"Using precision {self.precision_amp_jvp} for JVP")
 
         # The fixed per-timestep loss weight is normalized to mean one over the
-        # network's discrete training timesteps (t = 0 excluded), mapped through
-        # the same shift the samplers use. The constant depends only on the
-        # config, so derive it once here.
+        # network's discrete training timesteps (t = 0 excluded), mapped through the
+        # same shift `_sample_t_r_buckets` applies -- the weight has to be normalized
+        # over the grid the loss's own t values are drawn from, which is why this reads
+        # the passed-in config. The constant depends only on it, so derive it once here.
         self._timestep_weight_scale: Optional[float] = None
         if self.loss_config.weight_type is not None:
             num_steps = self.net.noise_scheduler.num_steps
-            shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type in SHIFTED_TIME_DIST_TYPES else 1.0
             grid = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)[:-1]
-            grid = shift * grid / (1 + (shift - 1) * grid)
+            grid = time_shift(grid, self.flow_map_shift)
             self._timestep_weight_scale = float(num_steps / self._timestep_weight_raw(grid).sum())
 
     def _drop_condition(
@@ -109,7 +125,7 @@ class FlowMapLossMixin:
         if self.config.cond_dropout_prob is None or neg_condition is None:
             return condition, torch.ones(batch_size, dtype=torch.bool, device=device)
 
-        if self.sample_t_cfg.deterministic_buckets:
+        if self.flow_map_sample_t_cfg.deterministic_buckets:
             keep = torch.rand(batch_size, device=device) >= self.config.cond_dropout_prob
         else:
             num_to_drop = (torch.rand(batch_size, device=device) < self.config.cond_dropout_prob).sum()
@@ -183,33 +199,32 @@ class FlowMapLossMixin:
                 self.config.guidance_scale is not None or self.config.guidance_mixture_ratio is not None
             ):
                 # Turn off dropout
-                self.net.eval()
-                neg_dxt_dt = self.net(x_t, t, r=t, condition=neg_condition, fwd_pred_type="flow")
-                guidance_scale = self.config.guidance_scale or 1.0
-                guidance_scale = torch.where(
-                    ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
-                    guidance_scale,
-                    1.0,
-                )
-                guidance_scale = expand_like(guidance_scale, x_t).to(dtype=x_t.dtype)
-
-                if self.config.guidance_mixture_ratio is None:
-                    guided_dxt_dt = neg_dxt_dt + guidance_scale * (dxt_dt - neg_dxt_dt)
-                else:
-                    guidance_mixture_ratio = torch.where(
+                with basic_utils.train_mode(self.net, mode=False):
+                    neg_dxt_dt = self.net(x_t, t, r=t, condition=neg_condition, fwd_pred_type="flow")
+                    guidance_scale = self.config.guidance_scale or 1.0
+                    guidance_scale = torch.where(
                         ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
-                        self.config.guidance_mixture_ratio,
-                        0.0,
+                        guidance_scale,
+                        1.0,
                     )
-                    guidance_mixture_ratio = expand_like(guidance_mixture_ratio, x_t).to(dtype=x_t.dtype)
-                    cond_dxt_dt = self.net(x_t, t, r=t, condition=condition, fwd_pred_type="flow")
-                    guided_dxt_dt = (
-                        guidance_scale * dxt_dt
-                        + (1.0 - guidance_scale - guidance_mixture_ratio) * neg_dxt_dt
-                        + guidance_mixture_ratio * cond_dxt_dt
-                    )
+                    guidance_scale = expand_like(guidance_scale, x_t).to(dtype=x_t.dtype)
 
-                self.net.train()
+                    if self.config.guidance_mixture_ratio is None:
+                        guided_dxt_dt = neg_dxt_dt + guidance_scale * (dxt_dt - neg_dxt_dt)
+                    else:
+                        guidance_mixture_ratio = torch.where(
+                            ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
+                            self.config.guidance_mixture_ratio,
+                            0.0,
+                        )
+                        guidance_mixture_ratio = expand_like(guidance_mixture_ratio, x_t).to(dtype=x_t.dtype)
+                        cond_dxt_dt = self.net(x_t, t, r=t, condition=condition, fwd_pred_type="flow")
+                        guided_dxt_dt = (
+                            guidance_scale * dxt_dt
+                            + (1.0 - guidance_scale - guidance_mixture_ratio) * neg_dxt_dt
+                            + guidance_mixture_ratio * cond_dxt_dt
+                        )
+
                 condition, keep = self._drop_condition(condition, neg_condition, x_t.shape[0], x_t.device)
                 # Same subset: a kept sample is conditional + guided, a dropped one
                 # unconditional + unguided.
@@ -311,8 +326,8 @@ class FlowMapLossMixin:
 
     def _warn_on_degenerate_buckets(self, n_flow_matching: int, n_consistency: int, global_bsz: int) -> None:
         """Warn once if a requested bucket rounds away under the deterministic partition."""
-        requested_but_empty = (self.sample_t_cfg.flow_matching_ratio > 0 and n_flow_matching == 0) or (
-            self.sample_t_cfg.consistency_ratio > 0 and n_consistency == 0
+        requested_but_empty = (self.flow_map_sample_t_cfg.flow_matching_ratio > 0 and n_flow_matching == 0) or (
+            self.flow_map_sample_t_cfg.consistency_ratio > 0 and n_consistency == 0
         )
         if not requested_but_empty or getattr(self, "_bucket_warned", False):
             return
@@ -320,8 +335,8 @@ class FlowMapLossMixin:
         logger.warning(
             f"The deterministic (t, r) bucket partition is degenerate: with "
             f"world_size * batch_size = {global_bsz}, flow_matching_ratio="
-            f"{self.sample_t_cfg.flow_matching_ratio} and consistency_ratio="
-            f"{self.sample_t_cfg.consistency_ratio} yield bucket sizes "
+            f"{self.flow_map_sample_t_cfg.flow_matching_ratio} and consistency_ratio="
+            f"{self.flow_map_sample_t_cfg.consistency_ratio} yield bucket sizes "
             f"({n_flow_matching}, {n_consistency}). The partition spans ranks but not "
             f"gradient-accumulation rounds, so empty buckets stay empty every iteration."
         )
@@ -336,22 +351,24 @@ class FlowMapLossMixin:
         ``r = t``, a ``consistency_ratio`` fraction gets ``r = 0``
         (consistency to clean data), and the rest keep the sampled random pair.
         """
-        t_sample_kwargs = convert_cfg_to_dict(self.sample_t_cfg)
+        t_sample_kwargs = convert_cfg_to_dict(self.flow_map_sample_t_cfg)
         t = self.net.noise_scheduler.sample_t(batch_size, **t_sample_kwargs, device=self.device)
-        r_sample_kwargs = convert_cfg_to_dict(self.sample_r_cfg) if self.sample_r_cfg.enabled else t_sample_kwargs
+        r_sample_kwargs = (
+            convert_cfg_to_dict(self.flow_map_sample_r_cfg) if self.flow_map_sample_r_cfg.enabled else t_sample_kwargs
+        )
         r = self.net.noise_scheduler.sample_t(batch_size, **r_sample_kwargs, device=self.device)
         t, r = torch.maximum(t, r), torch.minimum(t, r)
         assert torch.all(t >= r), "r cannot be larger than t"
 
-        flow_matching_ratio = self.sample_t_cfg.flow_matching_ratio
-        consistency_ratio = self.sample_t_cfg.consistency_ratio
+        flow_matching_ratio = self.flow_map_sample_t_cfg.flow_matching_ratio
+        consistency_ratio = self.flow_map_sample_t_cfg.consistency_ratio
         assert (
             flow_matching_ratio + consistency_ratio <= 1.0
         ), f"flow_matching_ratio + consistency_ratio must be <= 1, got {flow_matching_ratio} + {consistency_ratio}"
 
         # Both policies produce two bucket sizes and index the batch the same
         # way; they differ only in how the sizes are obtained.
-        if self.sample_t_cfg.deterministic_buckets:
+        if self.flow_map_sample_t_cfg.deterministic_buckets:
             global_bsz = world_size() * batch_size
             n_flow_matching = round(flow_matching_ratio * global_bsz)
             n_consistency = round(consistency_ratio * global_bsz)
@@ -606,13 +623,9 @@ class FlowMapLossMixin:
             # difference over g on conditional samples, with the unconditional
             # derivative dropped.
             u_theta_jvp = torch.where(expand_like(keep, u_theta_jvp), u_theta_jvp / guidance_fuse_scale, u_theta_jvp)
-            with torch.no_grad():
-                # Turn off dropout for the unconditional pass, as the target-side path does.
-                was_training = self.net.training
-                self.net.eval()
+            # Turn off dropout for the unconditional pass, as the target-side path does.
+            with basic_utils.train_mode(self.net, mode=False), torch.no_grad():
                 u_uncond = self.net(x_t, t, r=r, condition=neg_condition, fwd_pred_type="flow")
-                if was_training:
-                    self.net.train()
             u_theta = (u_theta + (guidance_fuse_scale - 1.0) * u_uncond) / guidance_fuse_scale
 
         mf_loss, tangent, loss_weight, warmup_weight = self._mf_pred_to_loss(
@@ -644,7 +657,7 @@ class MeanFlowModel(FlowMapLossMixin, CMModel):
         """
         super().__init__(config)
         self.config = config
-        self._init_flow_map_loss()
+        self._init_flow_map_loss(config.sample_t_cfg, config.sample_r_cfg)
 
     def single_train_step(
         self, data: Dict[str, Any], iteration: int

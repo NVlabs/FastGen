@@ -20,6 +20,22 @@ from fastgen.utils.basic_utils import PRECISION_MAP
 NET_PRED_TYPES = {"x0", "eps", "v", "flow"}
 
 
+def time_shift(t: torch.Tensor, shift: float = 1.0) -> torch.Tensor:
+    """Map timesteps through ``t * shift / (t * (shift - 1) + 1)``.
+
+    Args:
+        t: Timesteps in [0, 1].
+        shift: Shift of the map. 1.0 is the identity.
+
+    Returns:
+        torch.Tensor: The shifted timesteps.
+    """
+    assert shift >= 1, f"shift must be >= 1, got {shift}"
+    if shift == 1.0:
+        return t
+    return t * shift / (t * (shift - 1) + 1)
+
+
 class BaseNoiseSchedule(torch.nn.Module):
     """Abstract base noise schedule class.
 
@@ -1303,13 +1319,6 @@ class CogVideoXNoiseSchedule(AlphasNoiseSchedule):
         del scheduler
 
 
-# Time distributions whose draws are mapped through shift * t / (1 + (shift - 1) * t).
-# Consumers that rebuild that grid outside the sampler -- the flow-map loss weight
-# normalization and the AnyFlow rollout schedule -- key the shift off this tuple, so
-# adding a shifted variant below stays in sync with them.
-SHIFTED_TIME_DIST_TYPES = ("shifted", "shifted_logitnormal")
-
-
 class RFNoiseSchedule(BaseNoiseSchedule):
     """Rectified Flow noise schedule: x_t = (1-t)*x_0 + t*noise.
 
@@ -1324,7 +1333,7 @@ class RFNoiseSchedule(BaseNoiseSchedule):
         **kwargs,
     ):
         super().__init__(min_t, max_t, num_steps, **kwargs)
-        self._supported_time_dist_types = self._supported_time_dist_types + SHIFTED_TIME_DIST_TYPES
+        self._supported_time_dist_types = self._supported_time_dist_types + ("shifted", "shifted_logitnormal")
         assert 0 <= min_t < max_t <= 1.0, "RF min_t and max_t must be between 0 and 1"
         self._sigmas = torch.linspace(min_t, max_t, num_steps, dtype=self.t_precision)
 
@@ -1417,20 +1426,16 @@ class RFNoiseSchedule(BaseNoiseSchedule):
         elif time_dist_type == "uniform":
             t = torch.rand(n, device=target_device, dtype=self.t_precision) * (max_t - min_t) + min_t
         elif time_dist_type == "shifted":
-            shift = kwargs.get("shift", 5.0)
-            assert shift >= 1, f"shift must be >= 1, got {shift}"
             t = torch.rand(n, device=target_device, dtype=self.t_precision) * (max_t - min_t) + min_t
-            t = t * shift / (t * (shift - 1) + 1)
+            t = time_shift(t, kwargs.get("shift", 5.0))
         elif time_dist_type == "shifted_logitnormal":
             # Logit-normal base density under the same shift map as "shifted"
-            shift = kwargs.get("shift", 5.0)
-            assert shift >= 1, f"shift must be >= 1, got {shift}"
             t = (
                 torch.sigmoid(torch.randn(n, device=target_device, dtype=self.t_precision) * train_p_std + train_p_mean)
                 * (max_t - min_t)
                 + min_t
             )
-            t = t * shift / (t * (shift - 1) + 1)
+            t = time_shift(t, kwargs.get("shift", 5.0))
         else:
             raise ValueError(
                 f"Unsupported time distribution type: {time_dist_type} in RFNoiseSchedule."

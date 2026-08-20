@@ -129,7 +129,7 @@ class ModelConfig(BaseModelConfig):
     # guidance t end
     guidance_t_end: float = 1.0
 
-    # precision for autocast in JVP (none defaults to training precision)
+    # precision for autocast in JVP (none disables autocast in the JVP region)
     precision_amp_jvp: str | None = None
 
 

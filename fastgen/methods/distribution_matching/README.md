@@ -87,13 +87,14 @@ DMD2 extended for causal video generation with autoregressive chunk-by-chunk pro
 
 ## AnyFlow
 
-**File:** [`anyflow.py`](anyflow.py) | **Reference:** [Gu et al., 2026](https://arxiv.org/abs/2605.13724)
+**File:** [`anyflow.py`](anyflow.py) | **Reference:** [Gu et al. (2026)](https://arxiv.org/abs/2605.13724)
 
 DMD2 with a flow-map student `u(x_t, t, r)` (mean velocity from `t` back to `r`), supporting arbitrary inference NFE. The student generates by rolling out the flow map from pure noise with the NFE sampled per iteration and gradients through all segments, and co-trains the flow-map loss at every update. Requires a Stage-1 flow-map pretrain, which runs directly on [`MeanFlowModel`](../consistency_model/mean_flow.py) using AnyFlow's hyperparameters.
 
 **Key Parameters (Stage 2):**
 - `student_sample_steps_list`: Rollout NFEs sampled per iteration
 - `cotrain_pretrain_weight`: Weight of the co-trained Stage-1 flow-map loss
+- `cotrain_sample_t_cfg`, `cotrain_sample_r_cfg`: Separate `(t, r)` distributions for the co-trained flow-map loss; its shift also defines the rollout schedule
 - Requires a Stage-1 pretrained checkpoint via `trainer.checkpointer.pretrained_ckpt_path`
 - See also the key parameters of DMD2 above (and the key parameters of [MeanFlow](../consistency_model/README.md#meanflow) for Stage 1)
 

@@ -24,7 +24,7 @@ import torch
 
 from fastgen.methods.consistency_model.mean_flow import FlowMapLossMixin
 from fastgen.methods.distribution_matching.dmd2 import DMD2Model
-from fastgen.networks.noise_schedule import SHIFTED_TIME_DIST_TYPES
+from fastgen.networks.noise_schedule import time_shift
 from fastgen.utils.distributed import world_size
 import fastgen.utils.logging_utils as logger
 
@@ -45,7 +45,9 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
     def __init__(self, config: ModelConfig):
         super().__init__(config)
         self.config = config
-        self._init_flow_map_loss()
+        # The co-trained flow-map loss draws its (t, r) from its own config, not from
+        # `sample_t_cfg` -- DMD2 keeps that one for the noising time.
+        self._init_flow_map_loss(config.cotrain_sample_t_cfg, config.cotrain_sample_r_cfg)
 
         logger.info(
             f"AnyFlow on-policy: student_sample_steps_list={self.config.student_sample_steps_list}, "
@@ -84,31 +86,16 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
             torch.distributed.broadcast(idx, src=0)
         return int(idx.item())
 
-    def _sample_rollout_steps(self) -> int:
-        """Sample this iteration's rollout NFE, as the reference does
-        (``random.choice(num_inference_steps_list)``, rank-0 broadcast in both
-        the generator and fake-score updates). Falls back to the fixed
-        ``student_sample_steps`` when no list is set.
-        """
-        steps_list = self.config.student_sample_steps_list
-        if not steps_list:
-            return int(self.config.student_sample_steps)
-        return int(steps_list[self._broadcast_choice(len(steps_list))])
+    @staticmethod
+    def rollout_t_list(num_steps: int, shift: float = 1.0, max_t: float = 1.0) -> torch.Tensor:
+        """Shifted timestep schedule ``[max_t, ..., 0]`` with ``num_steps + 1`` entries.
 
-    def _rollout_t_list(self, num_steps: int) -> torch.Tensor:
-        """Shifted timestep schedule for ``num_steps`` rollout steps.
-
-        Equivalent to the reference scheduler's ``set_timesteps``: a uniform grid
-        mapped through ``shift * s / (1 + (shift - 1) * s)``, first entry clamped
-        to ``max_t``. Computed here rather than read from ``sample_t_cfg.t_list``
-        because the rollout NFE varies per iteration; that list stays the fixed
-        *validation* schedule used at ``student_sample_steps``.
+        Equivalent to the reference scheduler's ``set_timesteps``, with ``shift`` the
+        model's ``flow_map_shift``. Static so the configs can derive the matching
+        validation ``t_list`` from it; float64 on the CPU for the caller to cast.
         """
-        ns = self.net.noise_scheduler
-        shift = self.sample_t_cfg.shift if self.sample_t_cfg.time_dist_type in SHIFTED_TIME_DIST_TYPES else 1.0
-        s = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64, device=self.device)
-        s = shift * s / (1 + (shift - 1) * s)
-        return s.clamp(max=float(ns.max_t)).to(ns.t_precision)
+        grid = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)
+        return time_shift(grid, shift).clamp(max=max_t)
 
     def gen_data_from_net(
         self,
@@ -127,11 +114,21 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
         """
         del t_student  # the rollout schedule is built below
 
-        num_steps = self._sample_rollout_steps()
-        if num_steps < 1:
-            raise ValueError(f"rollout steps must be >= 1, got {num_steps}")
+        # This iteration's rollout NFE, as the reference draws it
+        # (``random.choice(num_inference_steps_list)``, rank-0 broadcast in both the
+        # generator and the fake-score update); no list means the fixed
+        # ``student_sample_steps``.
+        steps_list = self.config.student_sample_steps_list
+        if steps_list:
+            num_steps = int(steps_list[self._broadcast_choice(len(steps_list))])
+        else:
+            num_steps = int(self.config.student_sample_steps)
+        assert num_steps >= 1, f"rollout steps must be >= 1, got {num_steps}"
         grad_step = self._broadcast_choice(num_steps)
-        t_list = self._rollout_t_list(num_steps)
+        ns = self.net.noise_scheduler
+        t_list = self.rollout_t_list(num_steps, self.flow_map_shift, float(ns.max_t)).to(
+            device=self.device, dtype=ns.t_precision
+        )
 
         # The leading jump exists only for grad_step > 0 and the trailing one
         # only for grad_step + 1 < num_steps.
