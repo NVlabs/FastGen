@@ -12,7 +12,6 @@ from fastgen.methods import CausVidModel
 
 import fastgen.utils.logging_utils as logger
 from fastgen.networks.network import CausalFastGenNetwork
-from fastgen.utils.basic_utils import convert_cfg_to_dict
 from fastgen.utils.distributed import is_rank0, world_size
 
 if TYPE_CHECKING:
@@ -37,13 +36,15 @@ class SelfForcingModel(CausVidModel):
         self.config = config
 
     def _generate_noise_and_time(
-        self, real_data: torch.Tensor
+        self, real_data: torch.Tensor, iteration: Optional[int] = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate random noises and time step
 
         Args:
-            batch_size: Batch size
             real_data: Real data tensor for dtype/device reference
+            iteration: Current training iteration, used only to tell a generator
+                update from a fake-score one so `fake_score_sample_t_cfg` can
+                apply on the latter. `None` always uses `sample_t_cfg`.
 
         Returns:
             input_student: Random noise used by the student
@@ -62,9 +63,7 @@ class SelfForcingModel(CausVidModel):
         )
         input_student = self.net.noise_scheduler.latents(noise=eps_student)
 
-        t = self.net.noise_scheduler.sample_t(
-            batch_size, **convert_cfg_to_dict(self.config.sample_t_cfg), device=self.device
-        )
+        t = self._sample_noising_time(batch_size, iteration)
 
         eps = torch.randn_like(real_data, device=self.device, dtype=real_data.dtype)
 

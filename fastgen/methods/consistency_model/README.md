@@ -73,7 +73,7 @@ Two-stage training: frozen Stage-1 CM for `t < transition_t`, trainable student 
 
 ## MeanFlow
 
-**File:** [`mean_flow.py`](mean_flow.py) | **Reference:** [Geng et al., 2025](https://arxiv.org/abs/2505.13447)
+**File:** [`mean_flow.py`](mean_flow.py) | **References:** [Geng et al., 2025](https://arxiv.org/abs/2505.13447), [Sabour et al., 2025](https://arxiv.org/abs/2506.14603)
 
 Learns average velocity between trajectory points: `x_r = x_t - (t-r) · u(x_t, t, r)`.
 
@@ -81,10 +81,11 @@ Learns average velocity between trajectory points: `x_r = x_t - (t-r) · u(x_t, 
 - `loss_config.use_cd`: Use consistency distillation (requires teacher; `guidance_scale` controls CFG for the teacher)
 - `loss_config.use_jvp_finite_diff`: Use finite difference for JVP (e.g., for compatibility with Flash Attention and FSDP)
 - `sample_t_cfg`, `sample_r_cfg`: Configs of the distributions for sampling `t` and `r`
-- `sample_t_cfg.r_sample_ratio`: Ratio for flow matching loss
+- `sample_t_cfg.flow_matching_ratio`: Fraction of the batch with `r = t` (flow matching loss)
+- `guidance_scale`, `guidance_fuse_scale`: If `guidance_fuse_scale` is `None`, use target-side guidance (`guidance_scale`, 3-way mixture via `guidance_mixture_ratio`, t-window via `guidance_t_start` / `guidance_t_end`), otherwise use prediction-side guidance (conditional output learns the guided flow directly)
 
 
-**Configs:** [`EDM/config_mf_cifar10.py`](../../configs/experiments/EDM/config_mf_cifar10.py), [`DiT/config_mf_b.py`](../../configs/experiments/DiT/config_mf_b.py), [`DiT/config_mf_xl.py`](../../configs/experiments/DiT/config_mf_xl.py), [`WanT2V/config_mf.py`](../../configs/experiments/WanT2V/config_mf.py)
+**Configs:** [`EDM/config_mf_cifar10.py`](../../configs/experiments/EDM/config_mf_cifar10.py), [`DiT/config_mf_b.py`](../../configs/experiments/DiT/config_mf_b.py), [`DiT/config_mf_xl.py`](../../configs/experiments/DiT/config_mf_xl.py), [`WanT2V/config_mf.py`](../../configs/experiments/WanT2V/config_mf.py), [`WanT2V/config_anyflow.py`](../../configs/experiments/WanT2V/config_anyflow.py) (Stage 1 of [AnyFlow](../distribution_matching/README.md#anyflow))
 
 
 **Expected results:**

@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+from typing import Optional
+
 import attrs
 from omegaconf import DictConfig
 
@@ -9,6 +11,7 @@ from fastgen.utils import LazyCall as L
 from fastgen.configs.config import (
     BaseModelConfig,
     BaseConfig,
+    SampleTConfig,
 )
 from fastgen.configs.opt import BaseOptimizerConfig, BaseSchedulerConfig
 from fastgen.methods import DMD2Model
@@ -32,6 +35,10 @@ class ModelConfig(BaseModelConfig):
     # optimizer and scheduler for the discriminator
     discriminator_optimizer: DictConfig = attrs.field(factory=lambda: copy.deepcopy(BaseOptimizerConfig))
     discriminator_scheduler: DictConfig = attrs.field(factory=lambda: copy.deepcopy(BaseSchedulerConfig))
+
+    # Optional noising-time distribution used ONLY on fake-score update
+    # iterations (`iteration % student_update_freq != 0`)
+    fake_score_sample_t_cfg: Optional[SampleTConfig] = None
 
     # student update frequency
     student_update_freq: int = 5

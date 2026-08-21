@@ -26,7 +26,7 @@ def create_config():
     config.model.sample_t_cfg.train_p_std = 1.0
     config.model.sample_t_cfg.min_t = 0.0
     config.model.sample_t_cfg.max_t = 0.999
-    config.model.sample_t_cfg.r_sample_ratio = 0.25
+    config.model.sample_t_cfg.flow_matching_ratio = 0.75
 
     config.model.loss_config.norm_method = "poly_1.0"
     config.model.loss_config.norm_const = 1.0

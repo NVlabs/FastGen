@@ -9,8 +9,10 @@ from typing import Dict, Any, Callable, TYPE_CHECKING, Tuple, Optional
 import numpy as np
 import torch
 from fastgen.methods import CMModel
+from fastgen.networks.noise_schedule import time_shift
 from fastgen.utils import basic_utils, expand_like
 from fastgen.utils.basic_utils import convert_cfg_to_dict
+from fastgen.utils.distributed import get_rank, world_size
 import fastgen.utils.logging_utils as logger
 
 
@@ -48,57 +50,99 @@ def temp_disable_efficient_attn(device_type: str = "cuda"):
         yield
 
 
-class MeanFlowModel(CMModel):
-    def __init__(self, config: ModelConfig):
-        """
+class FlowMapLossMixin:
+    """The MeanFlow flow-map regression objective, shared across methods.
+
+    Holds everything needed to turn a real batch into the flow-map loss
+    ``|| u_theta(x_t, t, r) - sg(v - (t - r) du/dt) ||^2``: the (t, r) sampler
+    with its flow-matching / consistency buckets, the JVP estimate, the loss
+    weighting, and the reduction. ``MeanFlowModel`` uses it as its whole
+    training objective; distribution-matching methods can co-train it alongside
+    their own objective.
+
+    The host class must provide ``net``, ``device``, ``config`` and ``precision_amp``
+    (plus ``teacher`` when ``loss_config.use_cd``), and call ``_init_flow_map_loss``
+    from its ``__init__``.
+    """
+
+    def _init_flow_map_loss(self, sample_t_cfg: Any, sample_r_cfg: Any) -> None:
+        """Bind the flow-map loss / sampling configs and the JVP precision.
+
+        The (t, r) configs are passed in rather than read off ``self.config``: the host
+        may draw the flow-map times from a different density than its own
+        ``sample_t_cfg`` (AnyFlow does -- see ``AnyFlowModel``), and ``CMModel`` already
+        owns a ``self.sample_t_cfg`` attribute that must not be rebound here.
 
         Args:
-            config (ModelConfig): The configuration for the MeanFlow model
+            sample_t_cfg: Config for sampling the flow-map ``t``.
+            sample_r_cfg: Config for sampling the flow-map ``r``.
         """
-        super().__init__(config)
-        self.config = config
-        self.sample_t_cfg = self.config.sample_t_cfg
-        self.sample_r_cfg = self.config.sample_r_cfg
+        self.flow_map_sample_t_cfg = sample_t_cfg
+        self.flow_map_sample_r_cfg = sample_r_cfg
         self.loss_config = self.config.loss_config
 
-        # Precision for JVP
-        if self.config.precision_amp_jvp is None or self.config.precision_amp_jvp == self.precision_amp:
+        # The shift `_sample_t_r_buckets` actually applies: `shift` is inert unless the
+        # density is one of `RFNoiseSchedule`'s shifted ones, so resolve it once here and
+        # reuse it wherever the flow-map timestep grid is rebuilt.
+        shifted = sample_t_cfg.time_dist_type in ("shifted", "shifted_logitnormal")
+        self.flow_map_shift = sample_t_cfg.shift if shifted else 1.0
+
+        # None runs the JVP with autocast disabled: the region always sets the autocast
+        # state, so the enclosing training autocast does not carry over into it.
+        if self.config.precision_amp_jvp is None:
             self.precision_amp_jvp = None
         else:
             self.precision_amp_jvp = basic_utils.PRECISION_MAP[self.config.precision_amp_jvp]
             logger.critical(f"Using precision {self.precision_amp_jvp} for JVP")
 
-    def _mix_condition(
-        self,
-        condition: Any,
-        neg_condition: torch.Tensor,
-        dxt_dt: torch.Tensor,
-        guided_dxt_dt: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.config.cond_dropout_prob is None:
-            return condition, dxt_dt
+        # The fixed per-timestep loss weight is normalized to mean one over the
+        # network's discrete training timesteps (t = 0 excluded), mapped through the
+        # same shift `_sample_t_r_buckets` applies -- the weight has to be normalized
+        # over the grid the loss's own t values are drawn from, which is why this reads
+        # the passed-in config. The constant depends only on it, so derive it once here.
+        self._timestep_weight_scale: Optional[float] = None
+        if self.loss_config.weight_type is not None:
+            num_steps = self.net.noise_scheduler.num_steps
+            grid = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)[:-1]
+            grid = time_shift(grid, self.flow_map_shift)
+            self._timestep_weight_scale = float(num_steps / self._timestep_weight_raw(grid).sum())
 
-        batch_size = dxt_dt.shape[0]
-        # Decide how many to drop first.
-        num_to_drop = (torch.rand(batch_size, device=dxt_dt.device) < self.config.cond_dropout_prob).sum()
-        # Create the mask to keep all but the first samples (the order is important to ensures most dropout happens at flow matching loss)
-        mask = torch.arange(batch_size, device=dxt_dt.device) >= num_to_drop
-        dxt_dt = torch.where(expand_like(mask, dxt_dt), guided_dxt_dt, dxt_dt)
+    def _drop_condition(
+        self, condition: Any, neg_condition: Any, batch_size: int, device: torch.device
+    ) -> Tuple[Any, torch.Tensor]:
+        """Replace the condition with neg_condition for a per-sample subset.
+
+        Returns ``(condition, keep)``; ``keep`` is the ``[B]`` bool mask of the
+        samples that stayed conditional, so callers can reuse the same subset.
+
+        ``deterministic_buckets`` decides whether an index carries bucket
+        information: if so the buckets are cut on the GLOBAL index and an
+        index-based rule would only hit flow matching on rank 0, so draw per
+        sample; otherwise drop the first ``num_to_drop``.
+        """
+        # Dropout disabled, or no negative condition to swap in: every sample
+        # stays conditional.
+        if self.config.cond_dropout_prob is None or neg_condition is None:
+            return condition, torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        if self.flow_map_sample_t_cfg.deterministic_buckets:
+            keep = torch.rand(batch_size, device=device) >= self.config.cond_dropout_prob
+        else:
+            num_to_drop = (torch.rand(batch_size, device=device) < self.config.cond_dropout_prob).sum()
+            keep = torch.arange(batch_size, device=device) >= num_to_drop
 
         if isinstance(condition, torch.Tensor):
-            condition = torch.where(expand_like(mask, condition), condition, neg_condition)
-        elif isinstance(condition, dict):
-            condition = condition.copy()
-            keys_no_drop = self.config.cond_keys_no_dropout
-            assert set(keys_no_drop).issubset(
+            return torch.where(expand_like(keep, condition), condition, neg_condition), keep
+        if isinstance(condition, dict):
+            keys_no_drop = set(self.config.cond_keys_no_dropout)
+            assert keys_no_drop.issubset(
                 condition.keys()
-            ), f"keys_no_drop: {keys_no_drop} not in {condition.keys()}"
+            ), f"cond_keys_no_dropout: {keys_no_drop} not in {condition.keys()}"
+            condition = condition.copy()
             for k in condition.keys() - keys_no_drop:
-                condition[k] = torch.where(expand_like(mask, condition[k]), condition[k], neg_condition[k])
-        else:
-            raise TypeError(f"Unsupported type: {type(condition)}")
-
-        return condition, dxt_dt
+                condition[k] = torch.where(expand_like(keep, condition[k]), condition[k], neg_condition[k])
+            return condition, keep
+        raise TypeError(f"Unsupported condition type: {type(condition)}")
 
     @torch.no_grad()
     def _get_velocity(
@@ -106,14 +150,37 @@ class MeanFlowModel(CMModel):
         x: torch.Tensor,
         z: torch.Tensor,
         t: torch.Tensor,
-        condition: Optional[torch.Tensor] = None,
-        neg_condition: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        condition: Optional[Any] = None,
+        neg_condition: Optional[Any] = None,
+    ) -> Tuple[Any, torch.Tensor, torch.Tensor]:
+        """Regression target for the flow-map loss, the condition it was built from,
+        and the ``[B]`` mask of samples that stayed conditional.
+
+        Two independent choices:
+
+        * ``loss_config.use_cd`` picks the target SOURCE -- the teacher, or the
+          conditional data velocity.
+        * ``guidance_fuse_scale`` guides the *prediction* in
+          ``_compute_mf_loss``, so the target needs no guidance of its own and we only
+          drop the condition. Otherwise we guide the target too: through the teacher, or
+          -- without one -- by the net's own cond/uncond pass.
+        """
+        fuse_scale = self.config.guidance_fuse_scale
+        if fuse_scale is not None:
+            assert fuse_scale > 0, f"guidance_fuse_scale must be > 0, got {fuse_scale} (None disables fusion)"
+            assert (
+                neg_condition is not None
+            ), "guidance_fuse_scale requires neg_condition: the unconditional branch is queried at the same (t, r)"
+            condition, keep = self._drop_condition(condition, neg_condition, x.shape[0], x.device)
+        else:
+            keep = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
+
         x_t = self.net.noise_scheduler.forward_process(x, z, t)
 
         if self.loss_config.use_cd:
             dxt_dt = self.teacher(x_t, t, condition=condition, fwd_pred_type="flow")
-            if self.config.guidance_scale is not None:
+            # Under fusion the target stays unguided, or it would be guided twice.
+            if self.config.guidance_scale is not None and fuse_scale is None:
                 guidance_scale = torch.where(
                     ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
                     self.config.guidance_scale,
@@ -125,39 +192,45 @@ class MeanFlowModel(CMModel):
         else:
             dxt_dt = self.net.noise_scheduler.cond_velocity(x=x, eps=z, t=t)
 
-            # unconditional score estimation from meanflow eq (19)
-            if self.config.guidance_scale is not None or self.config.guidance_mixture_ratio is not None:
+            # unconditional score estimation from meanflow eq (19). Skipped under
+            # prediction-side fusion: that is this same guidance, moved onto the
+            # prediction, and the dropout it needs already ran above.
+            if fuse_scale is None and (
+                self.config.guidance_scale is not None or self.config.guidance_mixture_ratio is not None
+            ):
                 # Turn off dropout
-                self.net.eval()
-                neg_dxt_dt = self.net(x_t, t, r=t, condition=neg_condition, fwd_pred_type="flow")
-                guidance_scale = self.config.guidance_scale or 1.0
-                guidance_scale = torch.where(
-                    ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
-                    guidance_scale,
-                    1.0,
-                )
-                guidance_scale = expand_like(guidance_scale, x_t).to(dtype=x_t.dtype)
-
-                if self.config.guidance_mixture_ratio is None:
-                    guided_dxt_dt = neg_dxt_dt + guidance_scale * (dxt_dt - neg_dxt_dt)
-                else:
-                    guidance_mixture_ratio = torch.where(
+                with basic_utils.train_mode(self.net, mode=False):
+                    neg_dxt_dt = self.net(x_t, t, r=t, condition=neg_condition, fwd_pred_type="flow")
+                    guidance_scale = self.config.guidance_scale or 1.0
+                    guidance_scale = torch.where(
                         ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
-                        self.config.guidance_mixture_ratio,
-                        0.0,
+                        guidance_scale,
+                        1.0,
                     )
-                    guidance_mixture_ratio = expand_like(guidance_mixture_ratio, x_t).to(dtype=x_t.dtype)
-                    cond_dxt_dt = self.net(x_t, t, r=t, condition=condition, fwd_pred_type="flow")
-                    guided_dxt_dt = (
-                        guidance_scale * dxt_dt
-                        + (1.0 - guidance_scale - guidance_mixture_ratio) * neg_dxt_dt
-                        + guidance_mixture_ratio * cond_dxt_dt
-                    )
+                    guidance_scale = expand_like(guidance_scale, x_t).to(dtype=x_t.dtype)
 
-                self.net.train()
-                condition, dxt_dt = self._mix_condition(condition, neg_condition, dxt_dt, guided_dxt_dt)
+                    if self.config.guidance_mixture_ratio is None:
+                        guided_dxt_dt = neg_dxt_dt + guidance_scale * (dxt_dt - neg_dxt_dt)
+                    else:
+                        guidance_mixture_ratio = torch.where(
+                            ((t >= self.config.guidance_t_start) & (t <= self.config.guidance_t_end)),
+                            self.config.guidance_mixture_ratio,
+                            0.0,
+                        )
+                        guidance_mixture_ratio = expand_like(guidance_mixture_ratio, x_t).to(dtype=x_t.dtype)
+                        cond_dxt_dt = self.net(x_t, t, r=t, condition=condition, fwd_pred_type="flow")
+                        guided_dxt_dt = (
+                            guidance_scale * dxt_dt
+                            + (1.0 - guidance_scale - guidance_mixture_ratio) * neg_dxt_dt
+                            + guidance_mixture_ratio * cond_dxt_dt
+                        )
 
-        return condition, dxt_dt
+                condition, keep = self._drop_condition(condition, neg_condition, x_t.shape[0], x_t.device)
+                # Same subset: a kept sample is conditional + guided, a dropped one
+                # unconditional + unguided.
+                dxt_dt = torch.where(expand_like(keep, dxt_dt), guided_dxt_dt, dxt_dt)
+
+        return condition, dxt_dt, keep
 
     def _estimate_jvp_finite_difference(
         self,
@@ -251,20 +324,137 @@ class MeanFlowModel(CMModel):
 
         return u_theta_jvp
 
-    @torch.no_grad()
-    def _compute_weight(self, tensor: torch.Tensor) -> torch.Tensor:
-        norm_method, *norm_args = self.loss_config.norm_method.split("_")
+    def _warn_on_degenerate_buckets(self, n_flow_matching: int, n_consistency: int, global_bsz: int) -> None:
+        """Warn once if a requested bucket rounds away under the deterministic partition."""
+        requested_but_empty = (self.flow_map_sample_t_cfg.flow_matching_ratio > 0 and n_flow_matching == 0) or (
+            self.flow_map_sample_t_cfg.consistency_ratio > 0 and n_consistency == 0
+        )
+        if not requested_but_empty or getattr(self, "_bucket_warned", False):
+            return
+        self._bucket_warned = True
+        logger.warning(
+            f"The deterministic (t, r) bucket partition is degenerate: with "
+            f"world_size * batch_size = {global_bsz}, flow_matching_ratio="
+            f"{self.flow_map_sample_t_cfg.flow_matching_ratio} and consistency_ratio="
+            f"{self.flow_map_sample_t_cfg.consistency_ratio} yield bucket sizes "
+            f"({n_flow_matching}, {n_consistency}). The partition spans ranks but not "
+            f"gradient-accumulation rounds, so empty buckets stay empty every iteration."
+        )
 
-        if norm_method == "poly":
-            power = float(norm_args[0])
-            assert len(norm_args) == 1, "poly norm method requires 1 argument"
-            weight = 1 / (tensor + self.loss_config.norm_const).pow(power)
-        elif norm_method == "exp":
-            assert len(norm_args) == 2, "exp norm method requires 2 arguments"
-            const, scale = float(norm_args[0]), float(norm_args[1])
-            weight = const * torch.exp(scale * tensor + self.loss_config.norm_const)
+    def _sample_t_r_buckets(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample (t, r) with t >= r and assign the per-batch buckets.
+
+        Returns ``(t, r, r_eq_t_mask)`` where ``r_eq_t_mask`` marks the
+        samples with ``r = t`` (pure flow matching).
+
+        The batch splits three ways: a ``flow_matching_ratio`` fraction gets
+        ``r = t``, a ``consistency_ratio`` fraction gets ``r = 0``
+        (consistency to clean data), and the rest keep the sampled random pair.
+        """
+        t_sample_kwargs = convert_cfg_to_dict(self.flow_map_sample_t_cfg)
+        t = self.net.noise_scheduler.sample_t(batch_size, **t_sample_kwargs, device=self.device)
+        r_sample_kwargs = (
+            convert_cfg_to_dict(self.flow_map_sample_r_cfg) if self.flow_map_sample_r_cfg.enabled else t_sample_kwargs
+        )
+        r = self.net.noise_scheduler.sample_t(batch_size, **r_sample_kwargs, device=self.device)
+        t, r = torch.maximum(t, r), torch.minimum(t, r)
+        assert torch.all(t >= r), "r cannot be larger than t"
+
+        flow_matching_ratio = self.flow_map_sample_t_cfg.flow_matching_ratio
+        consistency_ratio = self.flow_map_sample_t_cfg.consistency_ratio
+        assert (
+            flow_matching_ratio + consistency_ratio <= 1.0
+        ), f"flow_matching_ratio + consistency_ratio must be <= 1, got {flow_matching_ratio} + {consistency_ratio}"
+
+        # Both policies produce two bucket sizes and index the batch the same
+        # way; they differ only in how the sizes are obtained.
+        if self.flow_map_sample_t_cfg.deterministic_buckets:
+            global_bsz = world_size() * batch_size
+            n_flow_matching = round(flow_matching_ratio * global_bsz)
+            n_consistency = round(consistency_ratio * global_bsz)
+            self._warn_on_degenerate_buckets(n_flow_matching, n_consistency, global_bsz)
+            position = get_rank() * batch_size + torch.arange(batch_size, device=self.device)
         else:
-            raise ValueError(f"Invalid norm method: {self.loss_config.norm_method}")
+            # Both sizes come from one uniform draw, cut at either end of [0, 1).
+            # The two events are disjoint by the assert above, so the buckets
+            # cannot overlap.
+            uniform = torch.rand(batch_size, device=self.device)
+            n_flow_matching = (uniform >= 1.0 - flow_matching_ratio).sum()
+            n_consistency = (uniform < consistency_ratio).sum()
+            position = torch.arange(batch_size, device=self.device)
+
+        r_eq_t_mask = position < n_flow_matching
+        is_consistency = (position >= n_flow_matching) & (position < n_flow_matching + n_consistency)
+        r = torch.where(r_eq_t_mask, t, r)
+        r = torch.where(is_consistency, torch.zeros_like(r), r)
+
+        return t, r, r_eq_t_mask
+
+    def _reduce_mf_loss(self, mf_loss: torch.Tensor, r_eq_t_mask: torch.Tensor) -> torch.Tensor:
+        """Reduce the per-sample loss to a scalar, optionally rebalancing.
+
+        With ``loss_config.rebalance_to_flow_matching`` set, every flow-map /
+        consistency (r < t) sample's loss is multiplied by the detached factor
+        ``mean(global flow-matching losses) / (own loss + 1e-5)``, so those
+        gradients are self-normalized and rescaled to the global
+        flow-matching-loss mean.
+        """
+        # No rank-local condition here: the branch must be taken (or not) by
+        # every rank so the collective below cannot deadlock. Applying the
+        # scale to an empty ~r_eq_t_mask selection is a no-op.
+        if getattr(self.loss_config, "rebalance_to_flow_matching", False):
+            with torch.no_grad():
+                # The global flow-matching-loss mean only needs the global sum
+                # and count, so reduce two scalars instead of gathering the
+                # per-sample losses (equivalent, and independent of the
+                # per-rank batch sizes).
+                fm_loss_sum = torch.where(r_eq_t_mask, mf_loss, torch.zeros_like(mf_loss)).sum()
+                fm_count = r_eq_t_mask.sum().to(mf_loss.dtype)
+                if world_size() > 1:
+                    torch.distributed.all_reduce(fm_loss_sum)
+                    torch.distributed.all_reduce(fm_count)
+                scale = torch.ones_like(mf_loss)
+                if fm_count > 0:
+                    scale[~r_eq_t_mask] = (fm_loss_sum / fm_count) / (mf_loss[~r_eq_t_mask] + 1e-5)
+            mf_loss = mf_loss * scale
+        return mf_loss.mean()
+
+    def _timestep_weight_raw(self, t: torch.Tensor) -> torch.Tensor:
+        """Unnormalized per-timestep weight as a direct function of t in [0, 1]."""
+        weight_type = self.loss_config.weight_type
+        if weight_type == "beta08":
+            return t * (1 - t).clamp(min=0).sqrt()
+        if weight_type == "gaussian":
+            # exp(-2 (t - 1/2)^2), shifted so the minimum over [0, 1] is zero.
+            return (torch.exp(-2 * (t - 0.5) ** 2) - float(torch.exp(torch.tensor(-0.5)))).clamp(min=0)
+        if weight_type == "uniform":
+            return torch.ones_like(t)
+        raise ValueError(f"Invalid weight_type: {weight_type!r}")
+
+    @torch.no_grad()
+    def _compute_weight(self, tensor: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Per-sample loss weight: the adaptive normalization (``norm_method``,
+        a function of the per-sample loss; ``None`` disables it) times the
+        optional fixed per-timestep weight (``weight_type``, a function of t).
+        """
+        if self.loss_config.norm_method is None:
+            weight = torch.ones_like(tensor)
+        else:
+            norm_method, *norm_args = self.loss_config.norm_method.split("_")
+
+            if norm_method == "poly":
+                power = float(norm_args[0])
+                assert len(norm_args) == 1, "poly norm method requires 1 argument"
+                weight = 1 / (tensor + self.loss_config.norm_const).pow(power)
+            elif norm_method == "exp":
+                assert len(norm_args) == 2, "exp norm method requires 2 arguments"
+                const, scale = float(norm_args[0]), float(norm_args[1])
+                weight = const * torch.exp(scale * tensor + self.loss_config.norm_const)
+            else:
+                raise ValueError(f"Invalid norm method: {self.loss_config.norm_method}")
+
+        if self.loss_config.weight_type is not None:
+            weight = weight * (self._timestep_weight_raw(t) * self._timestep_weight_scale)
 
         assert (
             weight.shape == tensor.shape
@@ -306,8 +496,14 @@ class MeanFlowModel(CMModel):
         if self.loss_config.loss_type == "l2":
             tangent = dxt_dt - warmup_weight * delta_t * u_theta_jvp
             loss = (u_theta - tangent).pow(2)
-            loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
-            weight = self._compute_weight(loss)
+            if self.loss_config.norm_method is None:
+                # Without adaptive normalization the reduction matters: the
+                # per-element mean keeps the loss scale independent of the
+                # sample dimensionality.
+                loss = torch.mean(loss, dim=list(range(1, loss.ndim)))
+            else:
+                loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
+            weight = self._compute_weight(loss, t)
             loss = loss * weight
 
         # use explicit gradient
@@ -321,7 +517,7 @@ class MeanFlowModel(CMModel):
                 tangent = tangent * sample_dim_inv
 
             opt_grad_norm = torch.linalg.vector_norm(tangent.flatten(1), dim=-1)
-            weight = self._compute_weight(opt_grad_norm)
+            weight = self._compute_weight(opt_grad_norm, t)
             weight = expand_like(weight, tangent)
             loss = (u_theta - (u_theta + tangent * weight).detach()).pow(2)
             loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
@@ -402,7 +598,7 @@ class MeanFlowModel(CMModel):
         z = torch.randn_like(real_data)
         x_t = self.net.noise_scheduler.forward_process(real_data, z, t)
 
-        condition, dxt_dt = self._get_velocity(real_data, z, t, condition=condition, neg_condition=neg_condition)
+        condition, dxt_dt, keep = self._get_velocity(real_data, z, t, condition=condition, neg_condition=neg_condition)
         # prevent JVP to use cached conversions (which can break the computational graph) that were created in the no_grad context of _get_velocity
         torch.clear_autocast_cache()
         u_theta_jvp = self._jvp(x_t, t, r, dxt_dt, condition=condition)
@@ -417,6 +613,21 @@ class MeanFlowModel(CMModel):
             condition=condition,
             fwd_pred_type="flow",
         )
+
+        guidance_fuse_scale = self.config.guidance_fuse_scale
+        if guidance_fuse_scale is not None:
+            # Guidance distillation on the PREDICTION side (see `_get_velocity`): the
+            # conditional output learns the guided flow directly, so only the prediction
+            # changes. The uncond branch is queried at the SAME (t, r) flow-map slice,
+            # giving (u_cond + (g - 1) * u_uncond) / g; dF/dt is then the finite
+            # difference over g on conditional samples, with the unconditional
+            # derivative dropped.
+            u_theta_jvp = torch.where(expand_like(keep, u_theta_jvp), u_theta_jvp / guidance_fuse_scale, u_theta_jvp)
+            # Turn off dropout for the unconditional pass, as the target-side path does.
+            with basic_utils.train_mode(self.net, mode=False), torch.no_grad():
+                u_uncond = self.net(x_t, t, r=r, condition=neg_condition, fwd_pred_type="flow")
+            u_theta = (u_theta + (guidance_fuse_scale - 1.0) * u_uncond) / guidance_fuse_scale
+
         mf_loss, tangent, loss_weight, warmup_weight = self._mf_pred_to_loss(
             u_theta=u_theta, u_theta_jvp=u_theta_jvp, x_t=x_t, dxt_dt=dxt_dt, t=t, r=r, iteration=iteration
         )
@@ -436,6 +647,18 @@ class MeanFlowModel(CMModel):
             warmup_weight,
         )
 
+
+class MeanFlowModel(FlowMapLossMixin, CMModel):
+    def __init__(self, config: ModelConfig):
+        """
+
+        Args:
+            config (ModelConfig): The configuration for the MeanFlow model
+        """
+        super().__init__(config)
+        self.config = config
+        self._init_flow_map_loss(config.sample_t_cfg, config.sample_r_cfg)
+
     def single_train_step(
         self, data: Dict[str, Any], iteration: int
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | Callable]]:
@@ -454,19 +677,8 @@ class MeanFlowModel(CMModel):
         real_data, condition, neg_condition = self._prepare_training_data(data)
         batch_size = real_data.shape[0]
 
-        # sample t and r
-        t_sample_kwargs = convert_cfg_to_dict(self.sample_t_cfg)
-        t = self.net.noise_scheduler.sample_t(batch_size, **t_sample_kwargs, device=self.device)
-        r_sample_kwargs = convert_cfg_to_dict(self.sample_r_cfg) if self.sample_r_cfg.enabled else t_sample_kwargs
-        r = self.net.noise_scheduler.sample_t(batch_size, **r_sample_kwargs, device=self.device)
-        t, r = torch.maximum(t, r), torch.minimum(t, r)
-        assert torch.all(t >= r), "r cannot be larger than t"
-
-        # set t=r (flow matching loss) for a subset of the batch
-        batch_size = real_data.shape[0]
-        flow_matching_size = (torch.rand(batch_size, device=self.device) >= self.sample_t_cfg.r_sample_ratio).sum()
-        zero_mask = torch.arange(batch_size, device=self.device) < flow_matching_size
-        r = torch.where(zero_mask, t, r)
+        # sample t and r, with per-batch buckets (flow matching / consistency)
+        t, r, r_eq_t_mask = self._sample_t_r_buckets(batch_size)
 
         (
             mf_loss,
@@ -486,7 +698,7 @@ class MeanFlowModel(CMModel):
             neg_condition=neg_condition,
         )
 
-        loss = mf_loss.mean()
+        loss = self._reduce_mf_loss(mf_loss, r_eq_t_mask)
         loss_map = {
             "total_loss": loss,
             "mf_loss": loss,

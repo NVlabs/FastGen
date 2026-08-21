@@ -33,8 +33,18 @@ class SampleTConfig(BaseSampleTConfig):
     train_p_mean: float = -1.1
     train_p_std: float = 2.0
 
-    # ratio for randomly sampling r
-    r_sample_ratio: float = 0.0
+    # fraction of the batch with r = t (pure flow matching); the rest keeps
+    # the randomly sampled r, minus the consistency fraction below
+    flow_matching_ratio: float = 0.25
+
+    # fraction of the batch forced to r = 0 (consistency-to-clean, used by
+    # AnyFlow; 0.0 keeps the original MeanFlow behavior)
+    consistency_ratio: float = 0.0
+
+    # how samples are assigned to the two buckets above: False draws each
+    # sample's bucket independently, True partitions the global batch by rank
+    # index so the bucket sizes are exact every iteration (used by AnyFlow)
+    deterministic_buckets: bool = False
 
 
 @attrs.define(slots=False)
@@ -61,8 +71,9 @@ class LossConfig:
     use_jvp_finite_diff: bool = False
     # epsilon for finite difference estimate of JVP
     jvp_finite_diff_eps: float = 1e-4
-    # normalize JVP
-    norm_method: str = "poly_1.0"
+    # adaptive loss normalization as a function of the per-sample loss
+    # (None disables it; the l2 loss then reduces with a per-element mean)
+    norm_method: Optional[str] = "poly_1.0"
     # tangent warmup constant
     norm_const: float = 1e-1
     # tangent warmup steps
@@ -71,6 +82,13 @@ class LossConfig:
     tangent_spatial_invariance: bool = False
     # loss type (choice between l2 and opt_grad)
     loss_type: str = "opt_grad"
+    # optional fixed per-timestep loss weighting evaluated as a function of t
+    # ("beta08", "gaussian", "uniform"). Multiplies the adaptive norm_method
+    # weight above; None disables it.
+    weight_type: Optional[str] = None
+    # rebalance the flow-map / consistency (r < t) sample losses to the global
+    # flow-matching (r = t) loss mean via a detached per-sample factor
+    rebalance_to_flow_matching: bool = False
 
 
 @attrs.define(slots=False)
@@ -93,11 +111,17 @@ class ModelConfig(BaseModelConfig):
     # optimizer
     net_optimizer: DictConfig = attrs.field(factory=lambda: copy.deepcopy(RAdamOptimizerConfig))
 
+    # prediction-side guidance fusion scale (AnyFlow guidance distillation):
+    # the conditional output is trained to be the guided flow directly via
+    # (u_cond + (g-1) * u_uncond) / g against the raw data velocity. None
+    # keeps MeanFlow's target-side guidance (guidance_scale).
+    guidance_fuse_scale: Optional[float] = None
+
     # condition dropout probability
     cond_dropout_prob: Optional[float] = None
 
     # list of condition keys that do not drop
-    cond_keys_no_dropout: List[str] = []
+    cond_keys_no_dropout: List[str] = attrs.field(factory=list)
 
     # guidance t start
     guidance_t_start: float = 0.0
@@ -105,7 +129,7 @@ class ModelConfig(BaseModelConfig):
     # guidance t end
     guidance_t_end: float = 1.0
 
-    # precision for autocast in JVP (none defaults to training precision)
+    # precision for autocast in JVP (none disables autocast in the JVP region)
     precision_amp_jvp: str | None = None
 
 

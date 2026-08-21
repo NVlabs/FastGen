@@ -647,7 +647,6 @@ class QwenImage(FastGenNetwork):
             return out, logvar
         return out
 
-    @torch.no_grad()
     def sample(
         self,
         noise: torch.Tensor,

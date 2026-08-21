@@ -93,8 +93,9 @@ class SCMModel(CMModel):
         self.loss_config = self.config.loss_config
         self.sigma_data = self.sample_t_cfg.sigma_data
 
-        # Precision for JVP
-        if self.config.precision_amp_jvp is None or self.config.precision_amp_jvp == self.precision_amp:
+        # Precision for JVP. None disables autocast in the JVP region: it always sets the
+        # autocast state, so the enclosing training autocast does not carry over into it.
+        if self.config.precision_amp_jvp is None:
             self.precision_amp_jvp = None
         else:
             self.precision_amp_jvp = PRECISION_MAP[self.config.precision_amp_jvp]

@@ -31,6 +31,7 @@ from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_la
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from fastgen.networks.network import FastGenNetwork
+from fastgen.networks.Wan.utils import convert_wan_official_state_dict, remap_anyflow_keys
 from fastgen.networks.noise_schedule import NET_PRED_TYPES
 
 from fastgen.utils.basic_utils import prompt_clean, str2bool
@@ -274,6 +275,46 @@ def classify_forward(
     return out
 
 
+def _fuse_r_embedding(
+    self,
+    temb: torch.Tensor,
+    timestep_proj: torch.Tensor,
+    remb: torch.Tensor,
+    rs_seq_len: Optional[torch.LongTensor],
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Combine the t- and r-time embeddings into the final timestep projection.
+
+    * ``additive``: project each embedding separately and sum — ``temb + remb``,
+      ``timestep_proj + r_embedder.time_proj(...)``.
+    * ``gated``: interpolate first, ``(1-g)·temb + g·remb``, then project the
+      blend through the condition_embedder's own ``time_proj`` — shared with the
+      t-only path, so ``Wan.__init__`` drops the unused ``r_embedder.time_proj``
+      rather than let it drift during training.
+
+    Returns ``(temb, timestep_proj, r_timestep_proj)``: ``temb`` [B, D] modulates
+    the output head (``scale_shift_table + temb``), ``timestep_proj`` [B, 6, D] is
+    the AdaLN modulation every block consumes, and ``r_timestep_proj`` is what the
+    blocks switch to at ``encoder_depth`` — ``None`` when there is no switch.
+    """
+    fusion = getattr(self.r_embedder, "fusion_mode", "additive")
+
+    if fusion == "gated":
+        gate = self.r_embedder.gate_value
+        rt_emb = (1 - gate) * temb + gate * remb
+        rt_ts_proj = self.condition_embedder.time_proj(self.condition_embedder.act_fn(rt_emb))
+        rt_ts_proj = unflatten_timestep_proj(rt_ts_proj, rs_seq_len)
+        if self.encoder_depth is None:
+            return rt_emb, rt_ts_proj, None
+        return rt_emb, timestep_proj, rt_ts_proj
+
+    # additive — MeanFlow original path, bit-identical
+    r_ts_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(remb))
+    r_ts_proj = unflatten_timestep_proj(r_ts_proj, rs_seq_len)
+    if self.encoder_depth is None:
+        return temb + remb, timestep_proj + r_ts_proj, None
+    return remb, timestep_proj, r_ts_proj
+
+
 def classify_forward_prepare(
     self,
     hidden_states: torch.Tensor,
@@ -338,14 +379,8 @@ def classify_forward_prepare(
             r_timestep = r_timestep.to(time_embedder_dtype)
 
         remb = self.r_embedder.time_embedder(r_timestep).type_as(encoder_hidden_states)
-        r_timestep_proj = self.r_embedder.time_proj(self.r_embedder.act_fn(remb))
-        r_timestep_proj = unflatten_timestep_proj(r_timestep_proj, rs_seq_len)
 
-        if self.encoder_depth is None:
-            timestep_proj = timestep_proj + r_timestep_proj
-            temb = temb + remb
-        else:
-            temb = remb
+        temb, timestep_proj, r_timestep_proj = self._fuse_r_embedding(temb, timestep_proj, remb, rs_seq_len)
     elif r_timestep is not None:
         # Raise an error here, otherwise we silently ignore the r_timestep
         raise ValueError("r_timestep provided but no r_embedder is present")
@@ -557,6 +592,8 @@ class Wan(FastGenNetwork):
         load_pretrained: bool = True,
         use_fsdp_checkpoint: bool = True,
         use_wan_official_sinusoidal: bool = False,
+        r_embedder_fusion: str = "additive",
+        r_embedder_gate_value: float = 0.25,
         **model_kwargs,
     ):
         """Wan2.1/2.2 model constructor.
@@ -609,12 +646,22 @@ class Wan(FastGenNetwork):
         self.transformer.time_cond_type = time_cond_type
         if r_timestep:
             logger.info(f"Initializing r embedder with {r_embedder_init}")
-            self.transformer.r_embedder = self.init_embedder(r_embedder_init)
+            self.transformer.r_embedder = self.init_embedder(r_embedder_init, r_embedder_fusion, r_embedder_gate_value)
         else:
             self.transformer.r_embedder = None
 
         # core functionality to override forward function and other methods in the transformer
         self.override_transformer_forward(inner_dim=inner_dim)
+
+        # Only the base Wan forward routes the r-embedding through
+        # _fuse_r_embedding (installed just above); the causal / VACE variants
+        # install their own (additive-only) classify_forward_prepare, where
+        # "gated" would be silently ignored.
+        if r_timestep and r_embedder_fusion == "gated" and not hasattr(self.transformer, "_fuse_r_embedding"):
+            raise ValueError(
+                f"r_embedder_fusion='gated' is not supported by {type(self).__name__} "
+                "(its transformer forward does not implement gated t/r fusion)."
+            )
 
         # Use lazy initialization as this wont work in a meta context when doing FSDP2.
         self._unipc_scheduler = None
@@ -791,17 +838,44 @@ class Wan(FastGenNetwork):
         name = model_path_or_id[idx_start:].split("/")[0]
         return f"Wan-AI/{name}"
 
-    def init_embedder(self, embedder_init: str) -> None:
+    def init_embedder(
+        self,
+        embedder_init: str,
+        r_embedder_fusion: str = "additive",
+        r_embedder_gate_value: float = 0.25,
+    ) -> torch.nn.Module:
+        """Build the r-embedder and stash its fusion config on the module.
+
+        The fusion settings live on the module (not on `self`) so the
+        method-bound forward override can branch on them without changing its
+        signature. They are set before the meta-device early return so both
+        paths carry them.
+
+        For gated fusion the r_embedder's own `time_proj` / `act_fn` are dropped
+        here (the fused embedding goes through the condition_embedder's shared
+        projection instead). Whether the transformer's forward actually supports
+        gated fusion can only be checked after `override_transformer_forward`
+        installs `_fuse_r_embedding`, so that check lives in `__init__`.
+        """
         embedder = copy.deepcopy(self.transformer.condition_embedder)
         del embedder.text_embedder
+
+        if r_embedder_fusion not in ("additive", "gated"):
+            raise ValueError(f"r_embedder_fusion must be 'additive' or 'gated', got {r_embedder_fusion!r}")
+        embedder.fusion_mode = r_embedder_fusion
+        # Plain float (not a buffer) so FSDP's reset_parameters does not need to
+        # re-materialize it after meta-device init.
+        embedder.gate_value = float(r_embedder_gate_value)
+        logger.info(
+            f"r_embedder fusion={r_embedder_fusion}"
+            + (f" gate_value={r_embedder_gate_value}" if r_embedder_fusion == "gated" else "")
+        )
 
         # Skip initialization if using meta device (weights will be broadcast via FSDP)
         if self._is_in_meta_context():
             logger.info("Skipping r_embedder initialization on meta device (will receive weights via FSDP sync)")
-            return embedder
-
         # zero init the r_embedder
-        if embedder_init == "zero":
+        elif embedder_init == "zero":
             for param in embedder.parameters():
                 param.data.zero_()
         elif embedder_init == "random":
@@ -826,12 +900,22 @@ class Wan(FastGenNetwork):
             pass
         else:
             raise ValueError(f"Invalid embedder_init: {embedder_init}")
+
+        if r_embedder_fusion == "gated":
+            # The gated path projects the fused (t, r) embedding through the
+            # condition_embedder's own time_proj, shared with the t-only path.
+            # Drop the r_embedder's copy so it cannot linger as an untrained
+            # dead parameter. Done after the init branches above because
+            # "random" initializes time_proj.
+            del embedder.time_proj
+            del embedder.act_fn
         return embedder
 
     def override_transformer_forward(self, inner_dim: int) -> None:
         # Override transformer forward methods with custom implementations
         for block in self.transformer.blocks:
             block.forward = types.MethodType(block_forward, block)
+        self.transformer._fuse_r_embedding = types.MethodType(_fuse_r_embedding, self.transformer)
         self.transformer.classify_forward_prepare = types.MethodType(classify_forward_prepare, self.transformer)
         self.transformer.classify_forward_block_forward = types.MethodType(
             classify_forward_block_forward, self.transformer
@@ -990,83 +1074,12 @@ class Wan(FastGenNetwork):
         i.e., {'generator': state_dict}.
         """
         if self._use_wan_official_sinusoidal and not any(k.startswith("transformer.") for k in state_dict.keys()):
-            # Handle original Wan checkpoint formats
-            # Pick the source state dict (adjust these keys to your file)
-            state = None
-            for k in ["generator", "state_dict", "model", "module", "net", None]:
-                if k is None:
-                    # fallback: assume loaded object IS the state_dict
-                    if isinstance(state_dict, dict) and all(isinstance(v, torch.Tensor) for v in state_dict.values()):
-                        state = state_dict
-                    break
-                if isinstance(state_dict, dict) and k in state_dict and isinstance(state_dict[k], dict):
-                    state = state_dict[k]
-                    break
-            assert state is not None, "Could not find a state_dict in checkpoint."
-            logger.info(f"Loading original Wan checkpoint formats from key: {k}")
+            state_dict = convert_wan_official_state_dict(state_dict)
 
-            # Rename mapping as list of tuples (order matters for the norm swap)
-            rename_mapping = [
-                ("time_embedding.0", "condition_embedder.time_embedder.linear_1"),
-                ("time_embedding.2", "condition_embedder.time_embedder.linear_2"),
-                ("text_embedding.0", "condition_embedder.text_embedder.linear_1"),
-                ("text_embedding.2", "condition_embedder.text_embedder.linear_2"),
-                ("time_projection.1", "condition_embedder.time_proj"),
-                ("head.modulation", "scale_shift_table"),
-                ("head.head", "proj_out"),
-                ("modulation", "scale_shift_table"),
-                ("ffn.0", "ffn.net.0.proj"),
-                ("ffn.2", "ffn.net.2"),
-                # swap norm names: norm1, norm3, norm2 -> norm1, norm2, norm3
-                ("norm2", "norm__placeholder"),
-                ("norm3", "norm2"),
-                ("norm__placeholder", "norm3"),
-                # I2V extras
-                ("img_emb.proj.0", "condition_embedder.image_embedder.norm1"),
-                ("img_emb.proj.1", "condition_embedder.image_embedder.ff.net.0.proj"),
-                ("img_emb.proj.3", "condition_embedder.image_embedder.ff.net.2"),
-                ("img_emb.proj.4", "condition_embedder.image_embedder.norm2"),
-                ("img_emb.emb_pos", "condition_embedder.image_embedder.pos_embed"),
-                # attention parts
-                ("self_attn.q", "attn1.to_q"),
-                ("self_attn.k", "attn1.to_k"),
-                ("self_attn.v", "attn1.to_v"),
-                ("self_attn.o", "attn1.to_out.0"),
-                ("self_attn.norm_q", "attn1.norm_q"),
-                ("self_attn.norm_k", "attn1.norm_k"),
-                ("cross_attn.q", "attn2.to_q"),
-                ("cross_attn.k", "attn2.to_k"),
-                ("cross_attn.v", "attn2.to_v"),
-                ("cross_attn.o", "attn2.to_out.0"),
-                ("cross_attn.norm_q", "attn2.norm_q"),
-                ("cross_attn.norm_k", "attn2.norm_k"),
-                ("attn2.to_k_img", "attn2.add_k_proj"),
-                ("attn2.to_v_img", "attn2.add_v_proj"),
-                ("attn2.norm_k_img", "attn2.norm_added_k"),
-            ]
-
-            # Convert keys
-            def rename_key(k: str) -> str:
-                # strip common prefixes if present
-                for prefix in ["model.", "module.", "transformer."]:
-                    if k.startswith(prefix):
-                        k = k[len(prefix) :]
-                # apply replacements in the specified order
-                for old, new in rename_mapping:
-                    if old in k:
-                        k = k.replace(old, new)
-                return k
-
-            new_state = {}
-            for k, v in state.items():
-                # optional: skip buffer-like positional/freq params if not needed
-                # if "freqs" in k:
-                #     continue
-                new_k = rename_key(k)
-                # Add 'transformer.' prefix since the model expects it
-                new_k = f"transformer.{new_k}"
-                new_state[new_k] = v
-            state_dict = new_state
+        # Some third-party checkpoints store the r-pathway as
+        # condition_embedder.delta_embedder; remap to FastGen's r_embedder
+        # layout (no-op for all other checkpoints).
+        state_dict = remap_anyflow_keys(state_dict)
 
         return super().load_state_dict(state_dict, **kwargs)
 
@@ -1117,6 +1130,7 @@ class Wan(FastGenNetwork):
             assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
 
         condition = torch.stack(condition, dim=0) if isinstance(condition, list) else condition
+
         timestep_mask = torch.ones_like(x_t[:, 0])  # shape: [batch_size, num_latent_frames, H, W]
         timestep = self._compute_timestep_inputs(t, timestep_mask)
         r_timestep = None if r is None else self._compute_timestep_inputs(r, timestep_mask)
