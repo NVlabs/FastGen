@@ -22,5 +22,5 @@ ftfy
 opencv-python-headless
 sentencepiece
 nvidia-ml-py
-numpy<2.0.0
+numpy
 torch>=2.6.0
