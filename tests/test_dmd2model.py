@@ -97,3 +97,11 @@ def test_optimizers(get_model_data):
     model.optimizers_zero_grad(3)
     check_grad_zero(model.discriminator)
     check_grad_zero(model.fake_score)
+
+
+def test_explicit_phase_ignores_iteration_routing(get_model_data):
+    model, data = get_model_data
+    losses, _ = model.single_train_step(data, 0, phase="auxiliary")
+    assert "fake_score_loss" in losses
+    losses, _ = model.single_train_step(data, 1, phase="student")
+    assert "vsd_loss" in losses

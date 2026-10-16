@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from fastgen.methods.loss_support import LossReduction
+
 import contextlib
 from typing import Dict, Any, Callable, TYPE_CHECKING, Tuple, Optional
 
@@ -135,9 +137,9 @@ class FlowMapLossMixin:
             return torch.where(expand_like(keep, condition), condition, neg_condition), keep
         if isinstance(condition, dict):
             keys_no_drop = set(self.config.cond_keys_no_dropout)
-            assert keys_no_drop.issubset(
-                condition.keys()
-            ), f"cond_keys_no_dropout: {keys_no_drop} not in {condition.keys()}"
+            assert keys_no_drop.issubset(condition.keys()), (
+                f"cond_keys_no_dropout: {keys_no_drop} not in {condition.keys()}"
+            )
             condition = condition.copy()
             for k in condition.keys() - keys_no_drop:
                 condition[k] = torch.where(expand_like(keep, condition[k]), condition[k], neg_condition[k])
@@ -168,9 +170,9 @@ class FlowMapLossMixin:
         fuse_scale = self.config.guidance_fuse_scale
         if fuse_scale is not None:
             assert fuse_scale > 0, f"guidance_fuse_scale must be > 0, got {fuse_scale} (None disables fusion)"
-            assert (
-                neg_condition is not None
-            ), "guidance_fuse_scale requires neg_condition: the unconditional branch is queried at the same (t, r)"
+            assert neg_condition is not None, (
+                "guidance_fuse_scale requires neg_condition: the unconditional branch is queried at the same (t, r)"
+            )
             condition, keep = self._drop_condition(condition, neg_condition, x.shape[0], x.device)
         else:
             keep = torch.ones(x.shape[0], dtype=torch.bool, device=x.device)
@@ -312,9 +314,10 @@ class FlowMapLossMixin:
             if self.loss_config.use_jvp_finite_diff:
                 u_theta_jvp = self._estimate_jvp_finite_difference(net_wrapper, x_t, t, r, dxt_dt)
             else:
-                with torch.random.fork_rng(
-                    devices=[self.device] if self.device.type == "cuda" else []
-                ), temp_disable_efficient_attn(self.device.type):
+                with (
+                    torch.random.fork_rng(devices=[self.device] if self.device.type == "cuda" else []),
+                    temp_disable_efficient_attn(self.device.type),
+                ):
                     tangents = (
                         dxt_dt.to(dtype=x_t.dtype),
                         torch.ones_like(t, dtype=x_t.dtype),
@@ -362,9 +365,9 @@ class FlowMapLossMixin:
 
         flow_matching_ratio = self.flow_map_sample_t_cfg.flow_matching_ratio
         consistency_ratio = self.flow_map_sample_t_cfg.consistency_ratio
-        assert (
-            flow_matching_ratio + consistency_ratio <= 1.0
-        ), f"flow_matching_ratio + consistency_ratio must be <= 1, got {flow_matching_ratio} + {consistency_ratio}"
+        assert flow_matching_ratio + consistency_ratio <= 1.0, (
+            f"flow_matching_ratio + consistency_ratio must be <= 1, got {flow_matching_ratio} + {consistency_ratio}"
+        )
 
         # Both policies produce two bucket sizes and index the batch the same
         # way; they differ only in how the sizes are obtained.
@@ -456,9 +459,9 @@ class FlowMapLossMixin:
         if self.loss_config.weight_type is not None:
             weight = weight * (self._timestep_weight_raw(t) * self._timestep_weight_scale)
 
-        assert (
-            weight.shape == tensor.shape
-        ), f"weight and input tensor must have the same shape: {weight.shape} != {tensor.shape}"
+        assert weight.shape == tensor.shape, (
+            f"weight and input tensor must have the same shape: {weight.shape} != {tensor.shape}"
+        )
         return weight
 
     def _mf_pred_to_loss(
@@ -470,7 +473,22 @@ class FlowMapLossMixin:
         t: torch.Tensor,
         r: torch.Tensor,
         iteration: int,
+        *,
+        loss_weight: torch.Tensor | None = None,
+        clip_time_interval: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+        """Compute MeanFlow losses with adaptive weighting and tangent normalization.
+
+        Omit ``loss_weight`` to include every entry. Supply finite nonnegative
+        weights that broadcast to ``u_theta`` to scale squared residuals and
+        exclude zero-weight entries from tangent norms and adaptive weights.
+        Mean reductions divide by the full element count. Samples with no valid
+        entries contribute zero loss.
+
+        By default, clip ``t - r`` to the noise scheduler's time bounds. Set
+        ``clip_time_interval=False`` when ``t - r`` already expresses the
+        duration required by a custom time parameterization.
+        """
         # perform loss computations in higher precision
         dtype = torch.float64
         u_theta = u_theta.to(dtype=dtype)
@@ -479,12 +497,13 @@ class FlowMapLossMixin:
         dxt_dt = dxt_dt.to(dtype=dtype)
         t = t.to(dtype=dtype)
         r = r.to(dtype=dtype)
-        delta_t = expand_like((t - r).clip(self.net.noise_scheduler.min_t, self.net.noise_scheduler.max_t), u_theta)
+        interval = t - r
+        if clip_time_interval:
+            interval = interval.clip(self.net.noise_scheduler.min_t, self.net.noise_scheduler.max_t)
+        delta_t = expand_like(interval, u_theta)
+        reduction = LossReduction(u_theta, loss_weight) if loss_weight is not None else None
 
         assert u_theta.requires_grad is torch.is_grad_enabled(), "u_theta requires gradients if gradients are enabled"
-        assert not any(
-            t.requires_grad for t in [u_theta_jvp, x_t, dxt_dt, delta_t]
-        ), "u_theta_jvp, x_t, v_t, dxt_dt, delta_t should not require gradients"
 
         # warmup weight
         if self.loss_config.tangent_warmup_steps > 0:
@@ -495,25 +514,41 @@ class FlowMapLossMixin:
         # use l2 loss as in the original paper
         if self.loss_config.loss_type == "l2":
             tangent = dxt_dt - warmup_weight * delta_t * u_theta_jvp
+            if reduction is not None:
+                tangent = reduction.clean(tangent)
             loss = (u_theta - tangent).pow(2)
-            if self.loss_config.norm_method is None:
+            if reduction is not None:
+                residual = reduction.clean(u_theta - tangent)
+                statistic = residual.square().sum(reduction.dims)
+                if self.loss_config.norm_method is None:
+                    statistic = statistic / reduction.count.clamp_min(1)
+                weight = self._compute_weight(statistic, t)
+                loss = reduction.residual(residual, mean=self.loss_config.norm_method is None)
+            elif self.loss_config.norm_method is None:
                 # Without adaptive normalization the reduction matters: the
                 # per-element mean keeps the loss scale independent of the
                 # sample dimensionality.
                 loss = torch.mean(loss, dim=list(range(1, loss.ndim)))
             else:
                 loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
-            weight = self._compute_weight(loss, t)
+            if reduction is None:
+                weight = self._compute_weight(loss, t)
             loss = loss * weight
 
         # use explicit gradient
         elif self.loss_config.loss_type == "opt_grad":
             u_theta_ = u_theta.detach()
             tangent = dxt_dt - u_theta_ - warmup_weight * delta_t * u_theta_jvp
+            if reduction is not None:
+                tangent = reduction.clean(tangent)
 
             if self.loss_config.tangent_spatial_invariance:
                 # scale tangent to be dimension invariant
-                sample_dim_inv = np.sqrt(tangent.shape[0] / tangent.numel())
+                sample_dim_inv = (
+                    np.sqrt(tangent.shape[0] / tangent.numel())
+                    if reduction is None
+                    else expand_like(reduction.count.clamp_min(1).rsqrt(), tangent)
+                )
                 tangent = tangent * sample_dim_inv
 
             opt_grad_norm = torch.linalg.vector_norm(tangent.flatten(1), dim=-1)
@@ -521,12 +556,16 @@ class FlowMapLossMixin:
             weight = expand_like(weight, tangent)
             loss = (u_theta - (u_theta + tangent * weight).detach()).pow(2)
             loss = torch.sum(loss, dim=list(range(1, loss.ndim)))
+            if reduction is not None:
+                residual = u_theta - (u_theta + tangent * weight).detach()
+                loss = reduction.residual(residual, mean=False)
 
         else:
             raise ValueError(f"Invalid loss type: {self.loss_config.loss_type}")
 
-        assert not tangent.requires_grad, "Tangent should not require gradients"
         assert not weight.requires_grad, "Loss weight should not require gradients"
+        if reduction is not None:
+            loss = torch.where(reduction.active, loss, torch.zeros_like(loss))
         return loss, tangent, weight, warmup_weight
 
     @classmethod

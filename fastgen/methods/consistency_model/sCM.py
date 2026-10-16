@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from fastgen.methods.loss_support import LossReduction
+
 from typing import Dict, Any, Callable, TYPE_CHECKING, Tuple, Optional
 
 import numpy as np
@@ -248,7 +250,17 @@ class SCMModel(CMModel):
         sigma_t: torch.Tensor,
         t_hat: torch.Tensor,
         iteration: int,
+        *,
+        loss_weight: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Compute sCM losses with adaptive weighting and tangent normalization.
+
+        Omit ``loss_weight`` to include every entry. Supply finite nonnegative
+        weights that broadcast to ``F_theta`` to scale squared residuals and
+        exclude zero-weight entries from tangent norms and dimension counts.
+        Means divide by the full element count. Samples with no valid entries
+        contribute zero loss, including the log-variance term.
+        """
         # perform loss computations in higher precision
         dtype = torch.float64
         F_theta = F_theta.to(dtype)
@@ -268,22 +280,35 @@ class SCMModel(CMModel):
         g2_coeff = expand_like(alpha_hat * sigma_hat, x_t_hat).to(F_theta.dtype)
         g2 = -(g2_coeff * x_t_hat + self.sigma_data * F_theta_jvp)
         g = g1 + r * g2
+        reduction = LossReduction(F_theta, loss_weight) if loss_weight is not None else None
+        if reduction is not None:
+            g = reduction.clean(g)
 
         # Tangent normalization (or we can perform Tangent clipping: g = torch.clamp(g, min=-1, max=1))
         g_norm = torch.linalg.vector_norm(g, dim=tuple(range(1, g.ndim)), keepdim=True)
         if self.loss_config.g_norm_spatial_invariance:
-            g_norm = g_norm * np.sqrt(g_norm.numel() / g.numel())  # Make the norm to be invariant to spatial size
+            if reduction is None:
+                g_norm = g_norm * np.sqrt(g_norm.numel() / g.numel())
+            else:
+                g_norm = g_norm / expand_like(reduction.count.clamp_min(1).sqrt(), g)
         g = g / (g_norm + self.loss_config.tangent_warmup_const)
 
         # Calculate loss with adaptive weighting
         weight = 1.0 / sigma_t if self.loss_config.prior_weighting_enabled else 1.0
         D = x_t_hat[0, :].numel() if self.loss_config.divide_x_0_spatial_dim else 1.0
         scm_loss_unweighted = torch.mean(torch.square(F_theta - F_theta_ - g), dim=tuple(range(1, F_theta.ndim)))
+        if reduction is not None:
+            scm_loss_unweighted = reduction.residual(F_theta - F_theta_ - g, mean=True)
+            D = reduction.count.clamp_min(1) if self.loss_config.divide_x_0_spatial_dim else 1.0
 
-        assert (
-            logvar.shape == scm_loss_unweighted.shape == t_hat.shape
-        ), f"log_var.shape: {logvar.shape}, scm_loss_unweighted.shape: {scm_loss_unweighted.shape}, t_hat.shape: {t_hat.shape}"
+        assert logvar.shape == scm_loss_unweighted.shape == t_hat.shape, (
+            f"log_var.shape: {logvar.shape}, scm_loss_unweighted.shape: {scm_loss_unweighted.shape}, t_hat.shape: {t_hat.shape}"
+        )
+        if reduction is not None:
+            logvar = torch.where(reduction.active, logvar, torch.zeros_like(logvar))
         scm_loss = weight / (torch.exp(logvar) * D) * scm_loss_unweighted + logvar
+        if reduction is not None:
+            scm_loss = torch.where(reduction.active, scm_loss, torch.zeros_like(scm_loss))
 
         return scm_loss, scm_loss_unweighted, r
 

@@ -11,7 +11,7 @@ from fastgen.methods.common_loss import (
     gan_loss_generator,
 )
 import fastgen.utils.logging_utils as logger
-from fastgen.utils.distributed import world_size
+from fastgen.methods.loss_support import f_divergence_weights
 
 if TYPE_CHECKING:
     from fastgen.configs.methods.config_f_distill import ModelConfig
@@ -40,9 +40,9 @@ class FdistillModel(DMD2Model):
 
         assert self.config.gan_loss_weight_gen > 0, "f-distill requires gan_loss_weight_gen > 0"
 
-        assert (
-            self.config.f_distill.f_div in all_f_div_weighting_function
-        ), f"Unsupported f-divergence {self.config.f_distill.f_div}"
+        assert self.config.f_distill.f_div in all_f_div_weighting_function, (
+            f"Unsupported f-divergence {self.config.f_distill.f_div}"
+        )
         logger.info(f"Using {self.config.f_distill.f_div}-divergence")
         self.f_div_weighting_function = all_f_div_weighting_function[self.config.f_distill.f_div]
 
@@ -56,59 +56,43 @@ class FdistillModel(DMD2Model):
             # IF you make them not persistent, you need to ensure they are initialized in net.reset_parameters
             self.net.register_buffer("bins", torch.ones(self.bin_num))
 
-    def _get_f_div_weighting_h(self, fake_logits: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        assert fake_logits.ndim == 2, f"fake_logits expected to be of rank 2, got {fake_logits.ndim}"
+    def _get_f_div_weighting_h(
+        self,
+        fake_logits: torch.Tensor,
+        t: torch.Tensor,
+        *,
+        logit_weight: torch.Tensor | None = None,
+        sample_mask: torch.Tensor | None = None,
+        statistics_group=None,
+        update_state: bool = True,
+    ) -> torch.Tensor:
+        """Compute f-distill weights and maintain the student's ratio bins.
 
-        # Store original dtype and convert to fp32/64 for numerical stability
-        original_dtype = fake_logits.dtype
-        fake_logits_fp32 = fake_logits.float()
-
-        # Clamp fake_logits to prevent exponential overflow (in fp32)
-        fake_logits_clamped = torch.clamp(fake_logits_fp32.mean(dim=1), min=-10.0, max=10.0)
-        ratio = torch.exp(fake_logits_clamped).detach()
-        ratio = torch.clamp(ratio, self.config.f_distill.ratio_lower, self.config.f_distill.ratio_upper)
-        assert ratio.shape == t.shape, f"ratio.shape {ratio.shape} != t.shape {t.shape}"
-
-        if self.config.f_distill.ratio_normalization:
-            # get bin idx (using fp32 precision)
-            max_t = float(self.net.noise_scheduler.max_t)
-            min_t = float(self.net.noise_scheduler.min_t)
-            bin_width = (max_t - min_t) / self.bin_num
-            idx = ((t.double() - min_t) / bin_width).floor().long().clamp(0, self.bin_num - 1)
-
-            # bin statistics (keep in fp32)
-            cnt = torch.bincount(idx, minlength=self.bin_num).float()
-            ratio_sum = torch.bincount(idx, weights=ratio, minlength=self.bin_num).float()
-
-            if world_size() > 1:
-                torch.distributed.all_reduce(cnt)
-                torch.distributed.all_reduce(ratio_sum)
-
-            # EMA update only where cnt > 0 (in fp32 for stability)
-            valid = cnt > 0
-            new_vals = ratio_sum / (cnt + 1e-6)
-            ema_rate = self.config.f_distill.ratio_ema_rate
-
-            # Convert bins to fp32 for stable computation, then back
-            bins_fp32 = self.net.bins.float()
-            bins_fp32[valid] = bins_fp32[valid] * ema_rate + (1 - ema_rate) * new_vals[valid]
-            self.net.bins.copy_(bins_fp32.to(self.net.bins.dtype))
-
-            # normalize ratio based on EMA histogram with stability epsilon (in fp32)
-            ratio = ratio / (bins_fp32[idx] + 1e-6)
-
-        # normalize the weighting function h (in fp32)
-        h = self.f_div_weighting_function(ratio)
-        h_sum = h.sum()
-        if world_size() > 1:
-            torch.distributed.all_reduce(h_sum)
-        h_mean = h_sum / (len(h) * world_size())
-
-        # Add epsilon to prevent division by zero in h normalization (in fp32)
-        h = h / (h_mean + 1e-6)
-
-        # Convert back to original precision
-        return h.to(dtype=original_dtype)
+        Use ``logit_weight``, ``sample_mask``, and ``statistics_group`` with
+        the semantics of ``f_divergence_weights``. Set ``update_state=False``
+        to use saved bins without updating them. Call ``f_divergence_weights``
+        directly when your training loop owns the statistics.
+        """
+        options = self.config.f_distill
+        bins = self.net.bins if options.ratio_normalization else None
+        h, updated = f_divergence_weights(
+            fake_logits,
+            t,
+            self.f_div_weighting_function,
+            ratio_lower=options.ratio_lower,
+            ratio_upper=options.ratio_upper,
+            bins=bins,
+            min_t=float(self.net.noise_scheduler.min_t),
+            max_t=float(self.net.noise_scheduler.max_t),
+            ema_rate=options.ratio_ema_rate,
+            logit_weight=logit_weight,
+            sample_mask=sample_mask,
+            statistics_group=statistics_group,
+            update_state=update_state,
+        )
+        if bins is not None and update_state:
+            bins.copy_(updated.to(bins.dtype))
+        return h
 
     def _student_update_step(
         self,

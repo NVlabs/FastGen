@@ -64,8 +64,16 @@ class DMD2Model(FastGenModel):
             synchronize()
         torch.cuda.empty_cache()
 
-    def _setup_grad_requirements(self, iteration: int) -> None:
-        if iteration % self.config.student_update_freq == 0:
+    def _select_training_phase(self, iteration: int, phase: str | None = None) -> str:
+        """Select an explicit phase or follow ``student_update_freq``."""
+        if phase is None:
+            return "student" if iteration % self.config.student_update_freq == 0 else "auxiliary"
+        if phase not in ("student", "auxiliary"):
+            raise ValueError("phase must be student or auxiliary.")
+        return phase
+
+    def _setup_grad_requirements(self, iteration: int, phase: str | None = None) -> None:
+        if self._select_training_phase(iteration, phase) == "student":
             # update the student
             self.fake_score.eval().requires_grad_(False)
             if self.config.gan_loss_weight_gen > 0:
@@ -76,29 +84,33 @@ class DMD2Model(FastGenModel):
             if self.config.gan_loss_weight_gen > 0:
                 self.discriminator.train().requires_grad_(True)
 
-    def _sample_noising_time(self, batch_size: int, iteration: Optional[int] = None) -> torch.Tensor:
-        """Draw the noising time `t` for whichever branch this iteration runs.
+    def _sample_noising_time(
+        self, batch_size: int, iteration: Optional[int] = None, phase: str | None = None
+    ) -> torch.Tensor:
+        """Draw noising times for the selected training phase.
 
-        The generator and fake-score updates alternate and need not noise from
-        the same density. Unset `fake_score_sample_t_cfg` means both use
-        `sample_t_cfg`.
+        Use ``phase`` to select student or auxiliary sampling explicitly.
+        Otherwise, follow ``student_update_freq`` at ``iteration``. Auxiliary
+        updates use ``fake_score_sample_t_cfg`` when set. Both phases use
+        ``sample_t_cfg`` otherwise.
         """
         t_cfg = self.config.sample_t_cfg
-        is_fake_score_step = iteration is not None and iteration % self.config.student_update_freq != 0
+        is_fake_score_step = self._select_training_phase(iteration or 0, phase) == "auxiliary"
         if is_fake_score_step and getattr(self.config, "fake_score_sample_t_cfg", None) is not None:
             t_cfg = self.config.fake_score_sample_t_cfg
         return self.net.noise_scheduler.sample_t(batch_size, **convert_cfg_to_dict(t_cfg), device=self.device)
 
     def _generate_noise_and_time(
-        self, real_data: torch.Tensor, iteration: Optional[int] = None
+        self, real_data: torch.Tensor, iteration: Optional[int] = None, *, phase: str | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Generate random noises and time step
 
         Args:
             real_data: Real data tensor for dtype/device reference
-            iteration: Current training iteration, used only to tell a generator
-                update from a fake-score one so `fake_score_sample_t_cfg` can
-                apply on the latter. `None` always uses `sample_t_cfg`.
+            iteration: Training iteration used to select the sampling phase when
+                you omit phase. With both omitted, use student sampling.
+            phase: Explicit student or auxiliary sampling phase. Auxiliary
+                sampling uses fake_score_sample_t_cfg when set.
 
         Returns:
             rand_z_max: Random noise used by the student
@@ -130,7 +142,11 @@ class DMD2Model(FastGenModel):
             )
             input_student = self.net.noise_scheduler.forward_process(real_data, eps_student, t_student)
 
-        t = self._sample_noising_time(batch_size, iteration)
+        t = (
+            self._sample_noising_time(batch_size, iteration)
+            if phase is None
+            else self._sample_noising_time(batch_size, iteration, phase)
+        )
         eps = torch.randn_like(real_data, device=self.device, dtype=real_data.dtype)
         return input_student, t_student, t, eps
 
@@ -230,12 +246,12 @@ class DMD2Model(FastGenModel):
             fake_score_x0 = self.fake_score(perturbed_data, t, condition=condition, fwd_pred_type="x0")
 
         # Compute the teacher x0-prediction and gan loss for generator
-        assert (
-            perturbed_data.dtype == data["real"].dtype == input_student.dtype
-        ), f"perturbed_data.dtype: {perturbed_data.dtype}, data['real'].dtype: {data['real'].dtype}, input_student.dtype: {input_student.dtype}"
-        assert (
-            t.dtype == t_student.dtype == self.net.noise_scheduler.t_precision
-        ), f"t.dtype: {t.dtype}, t_student.dtype: {t_student.dtype}, self.net.noise_scheduler.t_precision: {self.net.noise_scheduler.t_precision}"
+        assert perturbed_data.dtype == data["real"].dtype == input_student.dtype, (
+            f"perturbed_data.dtype: {perturbed_data.dtype}, data['real'].dtype: {data['real'].dtype}, input_student.dtype: {input_student.dtype}"
+        )
+        assert t.dtype == t_student.dtype == self.net.noise_scheduler.t_precision, (
+            f"t.dtype: {t.dtype}, t_student.dtype: {t_student.dtype}, self.net.noise_scheduler.t_precision: {self.net.noise_scheduler.t_precision}"
+        )
         teacher_x0, gan_loss_gen = self._compute_teacher_prediction_gan_loss(perturbed_data, t, condition=condition)
 
         # Apply classifier-free guidance if needed
@@ -358,12 +374,12 @@ class DMD2Model(FastGenModel):
 
         # The fake score matches the teacher, but we want to do SDS in x0 space
         fake_score_pred_type = self.config.fake_score_pred_type or self.teacher.net_pred_type
-        assert (
-            x_t_sg.dtype == real_data.dtype == input_student.dtype
-        ), f"x_t_sg.dtype: {x_t_sg.dtype}, real_data.dtype: {real_data.dtype}, input_student.dtype: {input_student.dtype}"
-        assert (
-            t.dtype == t_student.dtype == self.net.noise_scheduler.t_precision
-        ), f"t.dtype: {t.dtype}, t_student.dtype: {t_student.dtype}, self.net.noise_scheduler.t_precision: {self.net.noise_scheduler.t_precision}"
+        assert x_t_sg.dtype == real_data.dtype == input_student.dtype, (
+            f"x_t_sg.dtype: {x_t_sg.dtype}, real_data.dtype: {real_data.dtype}, input_student.dtype: {input_student.dtype}"
+        )
+        assert t.dtype == t_student.dtype == self.net.noise_scheduler.t_precision, (
+            f"t.dtype: {t.dtype}, t_student.dtype: {t_student.dtype}, self.net.noise_scheduler.t_precision: {self.net.noise_scheduler.t_precision}"
+        )
         fake_score_pred = self.fake_score(x_t_sg, t, condition=condition, fwd_pred_type=fake_score_pred_type)
         loss_fakescore = denoising_score_matching_loss(
             fake_score_pred_type,
@@ -434,38 +450,69 @@ class DMD2Model(FastGenModel):
             return {"gen_rand": gen_rand_func, "input_rand": noise, "gen_rand_train": gen_data}
 
     def single_train_step(
-        self, data: Dict[str, Any], iteration: int
+        self, data: Dict[str, Any], iteration: int, *, phase: str | None = None
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | Callable]]:
         """
-        Single training step for distribution matching distillation (DMD)
+        Compute losses and outputs for one distribution matching training phase.
+
+        By default, ``student_update_freq`` selects the phase at ``iteration``.
+        Set ``phase`` when your training loop schedules student and auxiliary
+        updates independently. Pass the actual iteration for warmup schedules,
+        and step the optimizer matching the selected phase. This method
+        prepares inputs, samples noise, and sets model modes and gradients.
+        Use ``_dispatch_training_phase`` when your loop manages that setup.
 
         Args:
             data (Dict[str, Any]): Data dict for the current iteration.
-            iteration (int): Current training iteration
+            iteration (int): Actual training iteration, including when phase is explicit.
+            phase (str, optional): Select "student" or "auxiliary", or omit to
+                follow student_update_freq.
 
         Returns:
             loss_map (dict[str, torch.Tensor]): Dictionary containing the loss values
             outputs (dict[str, torch.Tensor]): Dictionary containing the network output
 
         """
+        selected_phase = self._select_training_phase(iteration, phase)
         # Prepare training data and conditions
         real_data, condition, neg_condition = self._prepare_training_data(data)
 
         # Set up gradient requirements based on training phase
-        self._setup_grad_requirements(iteration)
+        if phase is None:
+            self._setup_grad_requirements(iteration)
+        else:
+            self._setup_grad_requirements(iteration, phase=phase)
 
         # Generate noise and time steps
-        input_student, t_student, t, eps = self._generate_noise_and_time(real_data, iteration=iteration)
+        if phase is None:
+            input_student, t_student, t, eps = self._generate_noise_and_time(real_data, iteration=iteration)
+        else:
+            input_student, t_student, t, eps = self._generate_noise_and_time(
+                real_data, iteration=iteration, phase=phase
+            )
 
-        # Choose between student update or fake_score/discriminator update
-        if iteration % self.config.student_update_freq == 0:
+        return self._dispatch_training_phase(
+            selected_phase, input_student, t_student, t, eps, data, real_data, condition, neg_condition
+        )
+
+    def _dispatch_training_phase(
+        self, phase, input_student, t_student, t, eps, data, real_data, condition=None, neg_condition=None
+    ):
+        """Compute student or auxiliary losses from prepared inputs.
+
+        Use this hook when your training loop manages sampling, model modes,
+        frozen parameters, and optimizer selection. For automatic input and
+        model setup, use ``single_train_step``.
+        """
+        if phase == "student":
             return self._student_update_step(
                 input_student, t_student, t, eps, data, condition=condition, neg_condition=neg_condition
             )
-        else:
+        elif phase == "auxiliary":
             return self._fake_score_discriminator_update_step(
                 input_student, t_student, t, eps, real_data, condition=condition
             )
+        raise ValueError("phase must be student or auxiliary.")
 
     def init_optimizers(self):
         """Initialize optimizers, lr_schedulers and grad_scalers"""
