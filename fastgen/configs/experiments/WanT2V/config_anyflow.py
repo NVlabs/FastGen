@@ -21,11 +21,10 @@ The on-policy stage (paper Stage 2) lives in ``config_anyflow_onpolicy.py``.
 
 import copy
 
-
 import fastgen.configs.methods.config_mean_flow as config_mean_flow
 from fastgen.configs.data import VideoLoaderConfig
 from fastgen.configs.net import Wan_1_3B_Config
-from fastgen.methods import AnyFlowModel
+from fastgen.configs.config_utils import model_pixel_shape
 
 
 def create_config():
@@ -44,12 +43,12 @@ def create_config():
     config.model.net.min_t = 0.0
     config.model.net.max_t = 1.0
 
-    config.model.precision = "bfloat16"
+    config.trainer.fsdp = True
+    config.model.precision_model = "bfloat16"
     # FSDP2 parameter storage and gradient reduction in fp32 while compute stays
-    # bfloat16 -- the same split as the reference. Takes
-    # effect only under FSDP (`trainer.ddp=False`); it is ignored under DDP, where
-    # params, grads and compute are all `precision`.
-    config.model.precision_fsdp = "float32"
+    # bfloat16 -- the same split as the reference. With eager execution or DDP,
+    # precision_opt still controls storage; use precision_amp for autocast.
+    config.model.precision_opt = "float32"
 
     # VAE compress ratio: (1 + T/4) * H/8 * W/8. 81-frame, 480p clips.
     config.model.input_shape = [16, 21, 60, 104]
@@ -71,9 +70,8 @@ def create_config():
 
     # Prediction-side guidance fusion with text dropout (reference:
     # drop_text_ratio=0.1, fuse_guidance_scale=3.0): the conditional output
-    # learns the guided flow directly. guidance_scale stays None — MeanFlow's
-    # target-side eq. 19 fusion is a different mechanism.
-    config.model.guidance_scale = None
+    # learns the guided flow directly. `guidance_cfg` stays at its empty default
+    # — MeanFlow's target-side eq. 19/21 fusion is a different mechanism.
     config.model.guidance_fuse_scale = 3.0
     config.model.cond_dropout_prob = 0.1
 
@@ -103,19 +101,19 @@ def create_config():
     # Reference `ema_warmup_step: 1000` (as `start_iter = warmup_steps - 1`).
     config.trainer.callbacks.ema.start_iter = 999
 
-    # ------ inference / validation ------
+    # ------ inference ------
     config.model.student_sample_type = "ode"
-    config.model.student_sample_steps = 4
-    # Shifted schedule under the same map the (t, r) sampling applies. The pretrain
-    # stage has a single scheduler in the reference, so it shares that shift.
-    config.model.sample_t_cfg.t_list = AnyFlowModel.rollout_t_list(
-        config.model.student_sample_steps, config.model.sample_t_cfg.shift, config.model.net.max_t
-    ).tolist()
+    config.model.student_grid_cfg.steps = 4
+    # Independent flow-map grid policy; this recipe happens to use the same shift as t/r sampling.
+    config.model.student_grid_cfg.grid_kwargs["shift"] = 5.0
 
     # ------ data / trainer ------
     config.dataloader_train = copy.deepcopy(VideoLoaderConfig)
-    config.dataloader_train.img_size = (config.model.input_shape[-1] * 8, config.model.input_shape[-2] * 8)
-    config.dataloader_train.sequence_length = (config.model.input_shape[1] - 1) * 4 + 1
+    # Resample onto the model's fps if the dataset is not already preprocessed at it.
+    # config.dataloader_train.target_fps = config.model.net.fps
+    num_frames, height, width = model_pixel_shape(config.model)
+    config.dataloader_train.img_size = (width, height)
+    config.dataloader_train.sequence_length = num_frames
     config.dataloader_train.batch_size = 1
 
     config.trainer.max_iter = 6000

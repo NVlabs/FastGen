@@ -4,22 +4,19 @@
 import attrs
 from omegaconf import DictConfig
 
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
 from fastgen.configs.methods.config_dmd2 import (
     Config as DMD2Config,
     ModelConfig as DMD2ModelConfig,
 )
 from fastgen.methods import FdistillModel
+from fastgen.configs.callbacks import BASE_CALLBACKS
 from fastgen.configs.callbacks import (
-    WANDB_CALLBACK,
     GradClip_CALLBACK,
-    ParamCount_CALLBACK,
-    TrainProfiler_CALLBACK,
-    GPUStats_CALLBACK,
 )
 
 
-@attrs.define(slots=False)
+@attrs.define
 class FdistillConfig:
     # f-div type
     f_div: str = "js"
@@ -34,18 +31,16 @@ class FdistillConfig:
     ratio_ema_rate: float = 0.0
 
 
-@attrs.define(slots=False)
+@attrs.define
 class ModelConfig(DMD2ModelConfig):
     # hyperparameters specific to the f-distill
     f_distill: FdistillConfig = attrs.field(factory=FdistillConfig)
 
 
-@attrs.define(slots=False)
+@attrs.define
 class Config(DMD2Config):
     model: ModelConfig = attrs.field(factory=ModelConfig)
-    model_class: DictConfig = L(FdistillModel)(
-        config=None,
-    )
+    model_class: DictConfig = attrs.field(factory=lambda: L(FdistillModel)(config=None))
 
 
 def create_config():
@@ -53,10 +48,7 @@ def create_config():
     config.trainer.callbacks = DictConfig(
         {
             **GradClip_CALLBACK,
-            **GPUStats_CALLBACK,
-            **TrainProfiler_CALLBACK,
-            **ParamCount_CALLBACK,
-            **WANDB_CALLBACK,
+            **BASE_CALLBACKS,
         }
     )
 

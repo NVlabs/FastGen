@@ -1,30 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Base config for knowledge distillation from paired/path data."""
+
 import attrs
 from omegaconf import DictConfig
 
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
 from fastgen.configs.config import (
     BaseConfig,
 )
-from fastgen.methods.knowledge_distillation.KD import KDModel
+from fastgen.methods import KDModel
+from fastgen.configs.callbacks import BASE_CALLBACKS
 from fastgen.configs.callbacks import (
-    WANDB_CALLBACK,
     GradClip_CALLBACK,
-    ParamCount_CALLBACK,
-    TrainProfiler_CALLBACK,
-    GPUStats_CALLBACK,
 )
 
-""" Configs for the KD model, on CIFAR-10 dataset. """
 
-
-@attrs.define(slots=False)
+@attrs.define
 class Config(BaseConfig):
-    model_class: DictConfig = L(KDModel)(
-        config=None,
-    )
+    model_class: DictConfig = attrs.field(factory=lambda: L(KDModel)(config=None))
 
 
 def create_config():
@@ -32,10 +27,7 @@ def create_config():
     config.trainer.callbacks = DictConfig(
         {
             **GradClip_CALLBACK,
-            **GPUStats_CALLBACK,
-            **TrainProfiler_CALLBACK,
-            **ParamCount_CALLBACK,
-            **WANDB_CALLBACK,
+            **BASE_CALLBACKS,
         }
     )
 

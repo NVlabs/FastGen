@@ -6,7 +6,8 @@ import copy
 import fastgen.configs.methods.config_mean_flow as config_mf_default
 from fastgen.configs.data import VideoLatentLoaderConfig
 from fastgen.configs.net import Wan_1_3B_Config
-from fastgen.utils import LazyCall as L
+from fastgen.networks.Wan.network import Wan
+from fastgen.configs.instantiate import LazyCall as L
 from fastgen.utils.lr_scheduler import LambdaInverseSquareRootScheduler
 from fastgen.callbacks.ema import EMACallback
 
@@ -23,9 +24,10 @@ def create_config():
     config.trainer.callbacks.pop("grad_clip")
 
     # model
-    config.model.precision = "bfloat16"
+    config.trainer.fsdp = True
+    config.model.precision_model = "bfloat16"
+    config.model.precision_opt = "float32"
     # VAE compress ratio: (1+T/4) * H / 8 * W / 8
-    # config.model.input_shape = [16, 21, 60, 104]
     config.model.input_shape = [16, 21, 60, 104]
     config.model.net_optimizer.optim_type = "adamw"
     config.model.net_optimizer.lr = 1e-5
@@ -38,11 +40,11 @@ def create_config():
     )
 
     # CFG guidance
-    config.model.guidance_scale = 3.0
+    config.model.guidance_cfg = Wan.default_guidance_cfg()
+    config.model.guidance_cfg.cfg.scale = 3.0
     config.model.cond_dropout_prob = 0.1
     config.model.precision_amp_jvp = "float32"
     config.model.loss_config.use_cd = True
-    config.model.loss_config.pred_type = "flow"
     config.model.loss_config.norm_method = "poly_1.0"
     config.model.loss_config.norm_const = 10.0
 
@@ -64,9 +66,8 @@ def create_config():
     # r_embedder that is never invoked.
     config.model.teacher = copy.deepcopy(Wan_1_3B_Config)
     config.model.teacher.r_timestep = False
-
-    # we use simple diffusion version: 0.73 = 0.5 * log((21 * 60 * 104)/(64 * 64)) - 0.1
     config.model.enable_preprocessors = False
+
     config.model.sample_t_cfg.time_dist_type = "logitnormal"
     config.model.sample_t_cfg.flow_matching_ratio = 0.0
     config.model.sample_t_cfg.train_p_mean = -0.8

@@ -3,16 +3,24 @@
 
 # These dependencies are installed by setup.py when calling `pip install -e .`
 wandb[media]
-diffusers==0.35.1
-transformers==4.49.0
+diffusers==0.40.0
+transformers==5.15.0
 accelerate
+# Pin the PEFT/TorchAO pair tested with diffusers 0.40 and torch 2.10.
+peft==0.20.0
+torchao==0.16.0
 safetensors
 scipy
+attrs
+matplotlib
+psutil
 einops
-jupyter
 hydra-core
-imageio
+pyyaml
+# The mp4 writer uses imageio's FFMPEG plugin, which needs the imageio-ffmpeg binary wheel.
+imageio[ffmpeg]
 tqdm
+click
 webdataset
 av
 loguru
@@ -22,5 +30,10 @@ ftfy
 opencv-python-headless
 sentencepiece
 nvidia-ml-py
+openai
+python-dotenv
 numpy<2.0.0
-torch>=2.6.0
+# TorchAO 0.16 supports PyTorch through 2.10; newer releases need a matched upgrade.
+# Include the 2.10/0.25 prereleases shipped by our Docker base image.
+torch>=2.10.0a0,<2.11
+torchvision>=0.25.0a0,<0.26

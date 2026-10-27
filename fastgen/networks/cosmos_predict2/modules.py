@@ -16,6 +16,7 @@ This module contains all the building blocks used by the main network classes:
 """
 
 import collections
+import contextlib
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -27,6 +28,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
+
+from fastgen.utils.tensor import assert_tensor, promote_dtype
 
 # Try to import checkpoint utilities
 try:
@@ -182,6 +185,21 @@ def recompute_all_context_fn():
 # ---------------------- Basic Layers -----------------------
 
 
+class FP32Linear(nn.Linear):
+    """A reference FP32 operation over the caller's parameter storage dtype.
+
+    Explicit operand casts apply the same policy on CPU and CUDA, independent of
+    an enclosing autocast region. Higher-precision parameters/inputs retain their
+    precision, and gradients flow through the casts back to the stored parameters.
+    """
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        dtype = promote_dtype(input, self.weight, torch.float32)
+        with torch.amp.autocast(device_type=input.device.type, enabled=False):
+            bias = None if self.bias is None else self.bias.to(dtype)
+            return F.linear(input.to(dtype), self.weight.to(dtype), bias)
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization."""
 
@@ -193,12 +211,12 @@ class RMSNorm(nn.Module):
     def reset_parameters(self):
         nn.init.ones_(self.weight)
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        # Fused normalization multiplies by the weight before rounding to BF16/FP16.
+        # Rounding the normalized activation first differs from the native TE kernel.
+        dtype = promote_dtype(x, self.weight)
+        x, weight = x.to(dtype), self.weight.to(dtype)
+        return F.rms_norm(x, (weight.numel(),), weight, self.eps)
 
 
 # ---------------------- Feed Forward Network -----------------------
@@ -216,7 +234,6 @@ class GPT2FeedForward(nn.Module):
         self._layer_id = None
         self._dim = d_model
         self._hidden_dim = d_ff
-        self.init_weights()
 
     def init_weights(self) -> None:
         std = 1.0 / math.sqrt(self._dim)
@@ -240,7 +257,7 @@ class GPT2FeedForward(nn.Module):
 def apply_rotary_pos_emb_simple(x: torch.Tensor, rope_emb: torch.Tensor) -> torch.Tensor:
     """Apply rotary position embeddings to input tensor using SPLIT convention.
 
-    This matches Transformer Engine's apply_rotary_pos_emb with tensor_format="bshd".
+    Evaluate the split-half rotation in at least FP32 before restoring the input dtype.
 
     Args:
         x: Input tensor of shape (B, S, H, D) where D is head_dim
@@ -258,17 +275,19 @@ def apply_rotary_pos_emb_simple(x: torch.Tensor, rope_emb: torch.Tensor) -> torc
     # Reshape rope_emb from (S, 1, 1, D) to (1, S, 1, D) for proper broadcasting
     rope_emb = rope_emb.squeeze(1).squeeze(1)  # (S, D)
     rope_emb = rope_emb.unsqueeze(0).unsqueeze(2)  # (1, S, 1, D)
-    rope_emb = rope_emb.to(x.dtype)
 
-    # The angles are in the first half (and repeated in second half)
-    angles = rope_emb[:, :seq_len, :, :half_dim]  # (1, S, 1, D/2)
+    # The angles are in the first half (and repeated in second half). Like Transformer Engine's fused kernel,
+    # compute cos/sin and the rotation in at least FP32 and round to the input dtype once; low-precision angles
+    # garble large positions.
+    dtype = promote_dtype(x, torch.float32)
+    angles = rope_emb[:, :seq_len, :, :half_dim].to(dtype)  # (1, S, 1, D/2)
     cos = torch.cos(angles)
     sin = torch.sin(angles)
 
     # SPLIT convention: first half and second half of the dimension
     # x1 = x[..., :half_dim], x2 = x[..., half_dim:]
-    x1 = x[..., :half_dim]  # (B, S, H, D/2)
-    x2 = x[..., half_dim:]  # (B, S, H, D/2)
+    x1 = x[..., :half_dim].to(dtype)  # (B, S, H, D/2)
+    x2 = x[..., half_dim:].to(dtype)  # (B, S, H, D/2)
 
     # Apply rotation: standard 2D rotation matrix
     # [cos -sin] [x1]   [x1 * cos - x2 * sin]
@@ -277,7 +296,7 @@ def apply_rotary_pos_emb_simple(x: torch.Tensor, rope_emb: torch.Tensor) -> torc
     out2 = x1 * sin + x2 * cos
 
     # Concatenate back: [out1, out2]
-    out = torch.cat([out1, out2], dim=-1)
+    out = torch.cat([out1, out2], dim=-1).to(x.dtype)
 
     return out
 
@@ -360,7 +379,7 @@ class Attention(nn.Module):
         v = self.v_norm(v)
 
         if self.is_selfattn and rope_emb is not None:
-            # WAN fp32 strategy: convert q/k to fp32 before RoPE for numerical stability
+            # WAN fp32 strategy, as in the reference; RoPE computes in FP32 and rounds once either way
             original_dtype = q.dtype
             if self.use_wan_fp32_strategy:
                 q = q.to(torch.float32)
@@ -406,7 +425,6 @@ class VideoRopePosition3DEmb(nn.Module):
 
     def __init__(
         self,
-        *,
         head_dim: int,
         len_h: int,
         len_w: int,
@@ -453,21 +471,22 @@ class VideoRopePosition3DEmb(nn.Module):
         dim_h = self._dim_h
         dim_t = self._dim_t
 
-        self.seq = torch.arange(max(self.max_h, self.max_w, self.max_t)).float().to(self.dim_spatial_range.device)
-        self.dim_spatial_range = (
-            torch.arange(0, dim_h, 2)[: (dim_h // 2)].float().to(self.dim_spatial_range.device) / dim_h
+        self.seq.copy_(
+            torch.arange(
+                max(self.max_h, self.max_w, self.max_t),
+                dtype=torch.float32,
+                device=self.seq.device,
+            )
         )
-        self.dim_temporal_range = (
-            torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().to(self.dim_spatial_range.device) / dim_t
+        self.dim_spatial_range.copy_(
+            torch.arange(0, dim_h, 2, dtype=torch.float32, device=self.dim_spatial_range.device)[: (dim_h // 2)] / dim_h
+        )
+        self.dim_temporal_range.copy_(
+            torch.arange(0, dim_t, 2, dtype=torch.float32, device=self.dim_temporal_range.device)[: (dim_t // 2)]
+            / dim_t
         )
 
     def forward(self, x_B_T_H_W_C: torch.Tensor, fps: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # Ensure buffers are on the same device as input (needed for FSDP CPU offloading)
-        if self.seq.device != x_B_T_H_W_C.device:
-            self.seq = self.seq.to(x_B_T_H_W_C.device)
-            self.dim_spatial_range = self.dim_spatial_range.to(x_B_T_H_W_C.device)
-            self.dim_temporal_range = self.dim_temporal_range.to(x_B_T_H_W_C.device)
-
         B_T_H_W_C = x_B_T_H_W_C.shape
         return self.generate_embeddings(B_T_H_W_C, fps=fps)
 
@@ -493,6 +512,9 @@ class VideoRopePosition3DEmb(nn.Module):
             if fps is None:
                 half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
             else:
+                # Reference guard: the first sample's fps positions the whole batch.
+                if B > 1 and T > 1:
+                    assert_tensor((fps == fps[0]).all(), "non-uniform fps needs batch size 1")
                 half_emb_t = torch.outer(self.seq[:T] / fps[:1] * self.base_fps, temporal_freqs)
         else:
             half_emb_t = torch.outer(self.seq[:T], temporal_freqs)
@@ -515,7 +537,6 @@ class LearnablePosEmbAxis(nn.Module):
 
     def __init__(
         self,
-        *,
         interpolation: str,
         model_channels: int,
         len_h: int,
@@ -594,19 +615,25 @@ class Timesteps(nn.Module):
 class TimestepEmbedding(nn.Module):
     """MLP for timestep embedding projection."""
 
-    def __init__(self, in_features: int, out_features: int, use_adaln_lora: bool = False):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        use_adaln_lora: bool = False,
+        use_wan_fp32_strategy: bool = False,
+    ):
         super().__init__()
         self.in_dim = in_features
         self.out_dim = out_features
-        self.linear_1 = nn.Linear(in_features, out_features, bias=not use_adaln_lora)
+        self.use_wan_fp32_strategy = use_wan_fp32_strategy
+        linear = FP32Linear if use_wan_fp32_strategy else nn.Linear
+        self.linear_1 = linear(in_features, out_features, bias=not use_adaln_lora)
         self.activation = nn.SiLU()
         self.use_adaln_lora = use_adaln_lora
         if use_adaln_lora:
-            self.linear_2 = nn.Linear(out_features, 3 * out_features, bias=False)
+            self.linear_2 = linear(out_features, 3 * out_features, bias=False)
         else:
-            self.linear_2 = nn.Linear(out_features, out_features, bias=False)
-
-        self.init_weights()
+            self.linear_2 = linear(out_features, out_features, bias=False)
 
     def init_weights(self) -> None:
         std = 1.0 / math.sqrt(self.in_dim)
@@ -615,14 +642,14 @@ class TimestepEmbedding(nn.Module):
         nn.init.trunc_normal_(self.linear_2.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, sample: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        sample = sample.to(self.linear_1.weight.dtype)
-        emb = self.linear_1(sample)
+        mlp_input = sample if self.use_wan_fp32_strategy else sample.to(self.linear_1.weight.dtype)
+        emb = self.linear_1(mlp_input)
         emb = self.activation(emb)
         emb = self.linear_2(emb)
 
         if self.use_adaln_lora:
             adaln_lora_B_T_3D = emb
-            emb_B_T_D = sample
+            emb_B_T_D = mlp_input
         else:
             emb_B_T_D = emb
             adaln_lora_B_T_3D = None
@@ -660,8 +687,6 @@ class PatchEmbed(nn.Module):
         )
         self.dim = in_channels * spatial_patch_size * spatial_patch_size * temporal_patch_size
 
-        self.init_weights()
-
     def init_weights(self) -> None:
         std = 1.0 / math.sqrt(self.dim)
         nn.init.trunc_normal_(self.proj[1].weight, std=std, a=-3 * std, b=3 * std)
@@ -696,10 +721,13 @@ class FinalLayer(nn.Module):
         out_channels: int,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
+        use_wan_fp32_strategy: bool = False,
     ):
         super().__init__()
+        self.use_wan_fp32_strategy = use_wan_fp32_strategy
+        linear = FP32Linear if use_wan_fp32_strategy else nn.Linear
         self.layer_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = nn.Linear(
+        self.linear = linear(
             hidden_size, spatial_patch_size * spatial_patch_size * temporal_patch_size * out_channels, bias=False
         )
         self.hidden_size = hidden_size
@@ -710,15 +738,13 @@ class FinalLayer(nn.Module):
         if use_adaln_lora:
             self.adaln_modulation = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(hidden_size, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, self.n_adaln_chunks * hidden_size, bias=False),
+                linear(hidden_size, adaln_lora_dim, bias=False),
+                linear(adaln_lora_dim, self.n_adaln_chunks * hidden_size, bias=False),
             )
         else:
             self.adaln_modulation = nn.Sequential(
-                nn.SiLU(), nn.Linear(hidden_size, self.n_adaln_chunks * hidden_size, bias=False)
+                nn.SiLU(), linear(hidden_size, self.n_adaln_chunks * hidden_size, bias=False)
             )
-
-        self.init_weights()
 
     def init_weights(self) -> None:
         std = 1.0 / math.sqrt(self.hidden_size)
@@ -744,12 +770,21 @@ class FinalLayer(nn.Module):
         else:
             shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
-        # Cast to input dtype (fp32 autocast may have produced fp32 tensors)
-        shift_B_T_1_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-        scale_B_T_1_1_D = rearrange(scale_B_T_D, "b t d -> b t 1 1 d").type_as(x_B_T_H_W_D)
-
-        x_B_T_H_W_D = self.layer_norm(x_B_T_H_W_D) * (1 + scale_B_T_1_1_D) + shift_B_T_1_1_D
-        x_B_T_H_W_O = self.linear(x_B_T_H_W_D)
+        shift_B_T_1_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 1 d")
+        scale_B_T_1_1_D = rearrange(scale_B_T_D, "b t d -> b t 1 1 d")
+        final_context = (
+            torch.amp.autocast(device_type=x_B_T_H_W_D.device.type, enabled=False)
+            if self.use_wan_fp32_strategy
+            else contextlib.nullcontext()
+        )
+        with final_context:
+            if self.use_wan_fp32_strategy:
+                x_B_T_H_W_D = x_B_T_H_W_D.to(promote_dtype(x_B_T_H_W_D, torch.float32))
+            else:
+                shift_B_T_1_1_D = shift_B_T_1_1_D.type_as(x_B_T_H_W_D)
+                scale_B_T_1_1_D = scale_B_T_1_1_D.type_as(x_B_T_H_W_D)
+            x_B_T_H_W_D = self.layer_norm(x_B_T_H_W_D) * (1 + scale_B_T_1_1_D) + shift_B_T_1_1_D
+            x_B_T_H_W_O = self.linear(x_B_T_H_W_D)
         return x_B_T_H_W_O
 
 
@@ -790,26 +825,27 @@ class Block(nn.Module):
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
 
         self.use_adaln_lora = use_adaln_lora
+        linear = FP32Linear if use_wan_fp32_strategy else nn.Linear
         if self.use_adaln_lora:
             self.adaln_modulation_self_attn = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(x_dim, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+                linear(x_dim, adaln_lora_dim, bias=False),
+                linear(adaln_lora_dim, 3 * x_dim, bias=False),
             )
             self.adaln_modulation_cross_attn = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(x_dim, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+                linear(x_dim, adaln_lora_dim, bias=False),
+                linear(adaln_lora_dim, 3 * x_dim, bias=False),
             )
             self.adaln_modulation_mlp = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(x_dim, adaln_lora_dim, bias=False),
-                nn.Linear(adaln_lora_dim, 3 * x_dim, bias=False),
+                linear(x_dim, adaln_lora_dim, bias=False),
+                linear(adaln_lora_dim, 3 * x_dim, bias=False),
             )
         else:
-            self.adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
-            self.adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
-            self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), nn.Linear(x_dim, 3 * x_dim, bias=False))
+            self.adaln_modulation_self_attn = nn.Sequential(nn.SiLU(), linear(x_dim, 3 * x_dim, bias=False))
+            self.adaln_modulation_cross_attn = nn.Sequential(nn.SiLU(), linear(x_dim, 3 * x_dim, bias=False))
+            self.adaln_modulation_mlp = nn.Sequential(nn.SiLU(), linear(x_dim, 3 * x_dim, bias=False))
 
     def reset_parameters(self) -> None:
         self.layer_norm_self_attn.reset_parameters()
@@ -848,8 +884,13 @@ class Block(nn.Module):
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        # Compute modulation parameters (in fp32 if use_wan_fp32_strategy for numerical stability)
-        with torch.amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
+        # Match native FP32 modulation, including when parameter storage is BF16.
+        modulation_context = (
+            torch.amp.autocast(device_type=x_B_T_H_W_D.device.type, enabled=False)
+            if self.use_wan_fp32_strategy
+            else contextlib.nullcontext()
+        )
+        with modulation_context:
             if self.use_adaln_lora:
                 shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
                     self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D

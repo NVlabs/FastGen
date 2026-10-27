@@ -1,28 +1,42 @@
-sinclude .env
-
 all: help
 
 install-linters: ## install the linters
-	pip install black==23.10.0 ruff==0.6.9 mypy==1.9.0 types-psutil
+	pip install ruff==0.6.9 mypy==2.1.0
 
-install: install-linters
+install: install-linters ## install the development dependencies (alias for install-linters)
 
-mypy:
-	python3 -m mypy --check-untyped-defs --follow-imports=silent --exclude third_party/ train.py
+mypy: ## smoke-check train.py with mypy (fastgen/ modules are not analysed)
+	python3 -m mypy --check-untyped-defs --follow-imports=skip train.py
 
-lint:
-	python3 -m ruff format --check --exclude fastgen/third_party/
-	python3 -m ruff check --exclude fastgen/third_party/
+lint: ## check formatting and lint rules with ruff
+	python3 -m ruff format --check
+	python3 -m ruff check
 
-format:
-	python3 -m ruff format --exclude fastgen/third_party/
-	python3 -m ruff check --fix --exclude fastgen/third_party/
+format: ## format the code and auto-fix lint rules with ruff
+	python3 -m ruff format
+	python3 -m ruff check --fix
 
-install-fastgen:
+install-fastgen: ## install FastGen in editable mode
 	python3 -m pip install -e .
 
-pytest:
-	ulimit -n 4096 && python3 -m pytest --ignore=FASTGEN_OUTPUT --ignore=runs --ignore=tmp --ignore third_party
+# Run the suite in three sequential pytest invocations so memory accumulated by
+# tests that load large pretrained models (HF caches, CUDA allocator state,
+# diffusers/transformers globals) is reclaimed between batches. Each batch
+# always runs (so CI gets a complete picture) and the final exit code reflects
+# whether any batch failed.
+pytest: ## run the test suite in three batches
+	@rc=0; \
+	ulimit -n 4096 || echo "Could not raise file descriptor limit"; \
+	echo "===== batch 1/3: all tests except tests/test_network.py and tests/test_network_fsdp.py ====="; \
+	python3 -m pytest \
+		--ignore=FASTGEN_OUTPUT --ignore=runs --ignore=tmp \
+		--ignore=tests/test_network.py --ignore=tests/test_network_fsdp.py \
+		|| rc=$$?; \
+	echo "===== batch 2/3: tests/test_network.py ====="; \
+	python3 -m pytest tests/test_network.py || rc=$$?; \
+	echo "===== batch 3/3: tests/test_network_fsdp.py ====="; \
+	python3 -m pytest tests/test_network_fsdp.py || rc=$$?; \
+	exit $$rc
 
 .PHONY: help
 help:

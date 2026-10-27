@@ -5,35 +5,32 @@ from typing import List, Optional
 import attrs
 from omegaconf import DictConfig
 
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
 from fastgen.configs.config import (
     BaseModelConfig,
     BaseConfig,
 )
 from fastgen.methods import SFTModel
+from fastgen.configs.callbacks import BASE_CALLBACKS
 from fastgen.configs.callbacks import (
-    WANDB_CALLBACK,
     GradClip_CALLBACK,
-    GPUStats_CALLBACK,
-    TrainProfiler_CALLBACK,
-    ParamCount_CALLBACK,
 )
 
 
-@attrs.define(slots=False)
+@attrs.define
 class ModelConfig(BaseModelConfig):
     # condition drop probability for better CFG inference
     cond_dropout_prob: Optional[float] = None
     # list of condition keys that do not drop
-    cond_keys_no_dropout: List[str] = []
+    cond_keys_no_dropout: List[str] = attrs.field(factory=list)
+    # SFT samplers are deterministic unless a network-specific config opts into SDE.
+    student_sample_type: str = "ode"
 
 
-@attrs.define(slots=False)
+@attrs.define
 class Config(BaseConfig):
     model: ModelConfig = attrs.field(factory=ModelConfig)
-    model_class: DictConfig = L(SFTModel)(
-        config=None,
-    )
+    model_class: DictConfig = attrs.field(factory=lambda: L(SFTModel)(config=None))
 
 
 def create_config():
@@ -41,10 +38,7 @@ def create_config():
     config.trainer.callbacks = DictConfig(
         {
             **GradClip_CALLBACK,
-            **GPUStats_CALLBACK,
-            **TrainProfiler_CALLBACK,
-            **ParamCount_CALLBACK,
-            **WANDB_CALLBACK,
+            **BASE_CALLBACKS,
         }
     )
 

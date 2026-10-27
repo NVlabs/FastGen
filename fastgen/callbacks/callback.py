@@ -6,7 +6,7 @@ from typing import Callable, Any, TYPE_CHECKING
 import torch
 from torch.utils.data import DataLoader
 
-from fastgen.utils import instantiate
+from fastgen.configs.instantiate import instantiate
 import fastgen.utils.logging_utils as logger
 
 if TYPE_CHECKING:
@@ -38,6 +38,10 @@ class CallbackDict:
                 self._callbacks[callback_name] = _callback
 
     def __getattr__(self, method_name: str) -> Callable:
+        # Protocol probes (``copy``, ``pickle``) must see a missing dunder, not a broadcasting wrapper.
+        if method_name.startswith("__"):
+            raise AttributeError(method_name)
+
         def load_state_dict(state_dict: dict[str, Any]) -> None:
             for name, callback in self._callbacks.items():
                 if name in state_dict:
@@ -109,6 +113,16 @@ class Callback:
         self,
         model: FastGenModel,
         data_batch: dict[str, torch.Tensor],
+        iteration: int = 0,
+        accum_iter: int = 0,
+    ) -> None:
+        pass
+
+    def on_training_accum_step_end(
+        self,
+        model: FastGenModel,
+        data_batch: dict[str, torch.Tensor],
+        output_batch: dict[str, torch.Tensor | Callable],
         iteration: int = 0,
         accum_iter: int = 0,
     ) -> None:

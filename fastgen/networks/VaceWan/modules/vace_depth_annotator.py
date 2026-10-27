@@ -1,18 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import torch
-import torch.nn as nn
-from typing import Optional
 
-import fastgen.utils.logging_utils as logger
+from fastgen.utils.cache_utils import cache
+from fastgen.networks.module import FastGenModule
+from fastgen.utils.distributed import is_rank0
+from fastgen.utils.distributed.collectives import raise_across_ranks
+from fastgen.utils.io_utils import load_checkpoint_state_dict
+from fastgen.utils.module import load_module_state_dict
 
 # Import VACE annotators
 from fastgen.third_party.annotators.depth_anything_v2.dpt import DepthAnythingV2
 
+DEPTH_ANYTHING_V2_VITL_URL = (
+    "https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/"
+    "cbbb86a30ce19b5684b7a05155dc7e6cbc7685b9/depth_anything_v2_vitl.pth"
+)
 
-class VACEDepthExtractor(nn.Module):
+
+class VACEDepthExtractor(FastGenModule):
     """Depth extractor using VACE's Depth Anything V2 model.
 
     This integrates VACE's Depth Anything V2 model for
@@ -21,36 +28,51 @@ class VACEDepthExtractor(nn.Module):
 
     def __init__(
         self,
-        model_path: Optional[str] = None,
-        device: Optional[str] = None,
+        model_path: str = DEPTH_ANYTHING_V2_VITL_URL,
     ):
-        """Initialize depth extractor with Depth Anything V2.
+        """Load Depth Anything V2 on CPU before the model lifecycle prepares this extractor.
 
         Args:
-            model_path: Path to model weights. If None, uses default path
-            device: Device to run on. If None, auto-selects cuda/cpu
+            model_path: Local path, S3 URI, or HTTP(S) URL for model weights. Defaults to the
+                pinned official Depth Anything V2 Large checkpoint.
         """
         super().__init__()
 
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_path = model_path
 
-        # Set default model path for Depth Anything V2
-        if model_path is None:
-            model_path = "FASTGEN_OUTPUT/.cache/annotators/depth_anything_v2_vitl.pth"
+        # Mirror remote sources once before every rank loads the checkpoint. Construction happens
+        # with the other preprocessors, so preparation can place or shard the complete module.
+        with raise_across_ranks(f"cache VACE depth model {self.model_path}"):
+            if is_rank0():
+                cache(self.model_path, strict=False)
+        with raise_across_ranks(f"load VACE depth model {self.model_path}"):
+            with torch.inference_mode(False), torch.no_grad(), torch.device("cpu"):
+                self.model = DepthAnythingV2(encoder="vitl", features=256, out_channels=[256, 512, 1024, 1024]).to(
+                    dtype=self.precision_model
+                )
+                load_module_state_dict(
+                    self.model,
+                    load_checkpoint_state_dict(self.model_path, device="cpu"),
+                    description=f"Depth Anything V2 model from {self.model_path}",
+                )
 
-        # Initialize Depth Anything V2 model
-        self.model = DepthAnythingV2(encoder="vitl", features=256, out_channels=[256, 512, 1024, 1024]).to(self.device)
+    @property
+    def precision_model(self) -> torch.dtype:
+        """Depth Anything V2 keeps its weights and neural inputs in FP32."""
+        return torch.float32
 
-        # Load model weights if path exists
-        if os.path.exists(model_path):
-            net_load_info = self.model.load_state_dict(
-                torch.load(model_path, map_location=self.device, weights_only=False)
-            )
-            logger.success(f"Loaded Depth Anything V2 model from {model_path}. Loading info: {net_load_info}")
-        else:
-            logger.warning(f"Depth Anything V2 model not found at {model_path}.")
+    def fully_shard(self, **kwargs) -> None:
+        """Shard the complete extractor behind its one callable root boundary.
 
-        self.model.eval().requires_grad_(False)  # Freeze the depth model
+        Depth Anything invokes DINOv2 through ``get_intermediate_layers`` instead of the child's
+        ``forward``. A separately wrapped DINOv2 child would therefore bypass its FSDP pre-forward
+        hook and expose sharded parameters to ordinary tensor operations. One root group ensures
+        the extractor hook materializes every parameter before any custom child method runs.
+        """
+        from torch.distributed.fsdp import fully_shard
+
+        # The shared preprocessing boundary reshards this root after all depth-conditioning work.
+        fully_shard(self, **kwargs)
 
     def process_frame_tensor(self, image_tensor: torch.Tensor) -> torch.Tensor:
         """Process a single frame tensor to extract depth.
@@ -127,13 +149,15 @@ class VACEDepthExtractor(nn.Module):
         Returns:
             Depth maps with same shape as input, in range [0, 1]
         """
+        if frames.ndim not in (4, 5):
+            raise ValueError(f"Expected 4D or 5D input, got {frames.ndim}D")
+        model_frames = frames.to(dtype=self.precision_model)
         if frames.ndim == 5:
             # Video input
-            return self.extract_depth_from_frames(frames)
+            depths = self.extract_depth_from_frames(model_frames)
         elif frames.ndim == 4:
             # Image batch - add time dimension, process, remove
-            frames_5d = frames.unsqueeze(2)  # [B, C, 1, H, W]
+            frames_5d = model_frames.unsqueeze(2)  # [B, C, 1, H, W]
             depths_5d = self.extract_depth_from_frames(frames_5d)
-            return depths_5d.squeeze(2)  # [B, C, H, W]
-        else:
-            raise ValueError(f"Expected 4D or 5D input, got {frames.ndim}D")
+            depths = depths_5d.squeeze(2)  # [B, C, H, W]
+        return depths

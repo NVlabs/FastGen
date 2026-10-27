@@ -5,7 +5,10 @@
 Auto-resume interface for cluster-specific implementations.
 
 This module provides an abstract interface that users can implement based on their
-cluster needs (e.g., SLURM, PBS, Kubernetes, etc.).
+cluster needs (e.g., SLURM, PBS, Kubernetes, etc.). The concrete implementation is
+selected from config: set ``config.trainer.auto_resume`` to a LazyCall spec that
+builds an ``AutoResumeInterface``; leaving it ``None`` (the default) uses
+``NoOpAutoResume`` (auto-resume disabled).
 
 Example usage:
 
@@ -27,13 +30,15 @@ Example usage:
             # Requeue the job
             ...
 
-    # Pass to trainer
-    auto_resume = SlurmAutoResume()
-    trainer = Trainer(config, auto_resume=auto_resume)
+    # Wire it through config; the Trainer builds it from ``config.trainer.auto_resume``
+    from fastgen.configs.instantiate import LazyCall as L
+    config.trainer.auto_resume = L(SlurmAutoResume)()
 """
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
+
+import fastgen.utils.logging_utils as logger
 
 
 class AutoResumeInterface(ABC):
@@ -140,23 +145,35 @@ class NoOpAutoResume(AutoResumeInterface):
         pass
 
 
-def create_auto_resume(auto_resume: Optional[AutoResumeInterface] = None) -> AutoResumeInterface:
+def create_auto_resume(
+    auto_resume_config: Optional[Any] = None,
+) -> AutoResumeInterface:
     """
-    Factory function to create an AutoResume instance.
+    Resolve the AutoResume instance for a training run.
 
-    This is a simplified implementation that defaults to NoOpAutoResume (no auto-resume).
+    Resolution order:
+    1. ``auto_resume_config`` (a LazyCall spec from ``config.trainer.auto_resume``)
+       is instantiated when provided.
+    2. Otherwise ``NoOpAutoResume`` (auto-resume disabled).
+
     For production training on preemptible clusters (SLURM, PBS, Kubernetes, etc.),
-    replace this with a functional auto-resume package that implements:
-    - Signal handling for preemption
-    - Checkpoint saving before termination
-    - Job requeuing with resume details
+    provide an ``AutoResumeInterface`` implementation via ``config.trainer.auto_resume``
+    that handles signal handling, checkpoint saving before termination, and job requeuing.
 
     Args:
-        auto_resume: Optional AutoResumeInterface instance. If provided, use it directly.
+        auto_resume_config: Optional LazyCall/DictConfig spec to instantiate.
 
     Returns:
-        The provided AutoResumeInterface instance, or NoOpAutoResume if None.
+        The resolved ``AutoResumeInterface`` instance.
     """
-    if auto_resume is not None:
-        return auto_resume
+    if auto_resume_config is not None:
+        # Local import avoids any import-order coupling with fastgen.utils.__init__.
+        from fastgen.configs.instantiate import instantiate
+
+        resolved = instantiate(auto_resume_config)
+        if resolved is not None:
+            logger.info(f"Using auto-resume from config: {type(resolved).__name__}")
+            return resolved
+
+    logger.info("Auto-resume not configured, using NoOpAutoResume (auto-resume disabled)")
     return NoOpAutoResume()

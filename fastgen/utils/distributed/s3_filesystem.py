@@ -2,25 +2,37 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import io
-import json
 import os
 from contextlib import contextmanager
 from typing import Generator, Union
-from urllib.parse import urlparse
 
 import boto3
-from botocore.exceptions import ClientError
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
 from torch.distributed.checkpoint.filesystem import FileSystemBase
 
+import fastgen.utils.s3 as s3
+
+
+_COPY_OBJECT_MAX_BYTES = 5 * 1024**3
+
+
+class _DeferredCloseBytesIO(io.BytesIO):
+    """Keep an S3 context-owned upload buffer readable until context exit."""
+
+    def close(self) -> None:
+        # PyTorch's filesystem writer closes the stream it is given. The S3
+        # context manager still has to rewind and upload that stream afterwards.
+        pass
+
+    def release(self) -> None:
+        super().close()
+
 
 class S3FileSystem(FileSystemBase):
-    """Implementation of FileSystem for AWS S3 storage."""
+    """Implementation of FileSystem for AWS S3 storage, authenticated through boto3's default credential chain."""
 
-    def __init__(self, credential_path: str) -> None:
-        with open(credential_path, "r") as f:
-            config = json.load(f)
-        self.s3_client = boto3.client("s3", **config)
+    def __init__(self) -> None:
+        self.s3_client = boto3.client("s3")
 
     @contextmanager
     def create_stream(self, path: Union[str, os.PathLike], mode: str) -> Generator[io.IOBase, None, None]:
@@ -31,8 +43,7 @@ class S3FileSystem(FileSystemBase):
             path: S3 URI in the format s3://bucket-name/key
             mode: 'rb' for reading, 'wb' for writing
         """
-        path_str = str(path)
-        bucket, key = self._parse_s3_uri(path_str)
+        bucket, key = s3.parse_uri(str(path))
 
         if mode == "rb":
             # For reading, download to memory stream
@@ -45,13 +56,13 @@ class S3FileSystem(FileSystemBase):
                 stream.close()
         elif mode == "wb":
             # For writing, use memory stream then upload
-            stream = io.BytesIO()
+            stream = _DeferredCloseBytesIO()
             try:
                 yield stream
                 stream.seek(0)
                 self.s3_client.upload_fileobj(stream, bucket, key)
             finally:
-                stream.close()
+                stream.release()
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
@@ -68,12 +79,22 @@ class S3FileSystem(FileSystemBase):
 
         In S3, this is implemented as a copy followed by a deletion of the original.
         """
-        src_bucket, src_key = self._parse_s3_uri(str(path))
-        dst_bucket, dst_key = self._parse_s3_uri(str(new_path))
+        src_bucket, src_key = s3.parse_uri(str(path))
+        dst_bucket, dst_key = s3.parse_uri(str(new_path))
 
-        # Copy the object
+        # Avoid boto3's managed transfer helper: some S3-compatible endpoints
+        # return ETags it rejects after the server-side copy already succeeded.
+        source_metadata = self.s3_client.head_object(Bucket=src_bucket, Key=src_key)
+        source_size = source_metadata["ContentLength"]
+        # botocore percent-encodes the dict form exactly once; a pre-quoted string would be encoded twice.
         copy_source = {"Bucket": src_bucket, "Key": src_key}
-        self.s3_client.copy(copy_source, dst_bucket, dst_key)
+
+        if source_size <= _COPY_OBJECT_MAX_BYTES:
+            self.s3_client.copy_object(Bucket=dst_bucket, Key=dst_key, CopySource=copy_source)
+        else:
+            # CopyObject is limited to 5 GiB. Boto3's managed helper performs
+            # a multipart server-side copy for larger objects.
+            self.s3_client.copy(copy_source, dst_bucket, dst_key)
 
         # Delete the original
         self.s3_client.delete_object(Bucket=src_bucket, Key=src_key)
@@ -81,7 +102,7 @@ class S3FileSystem(FileSystemBase):
     def init_path(self, path: Union[str, os.PathLike]) -> Union[str, os.PathLike]:
         """Initialize and validate S3 path."""
         path_str = str(path)
-        if not path_str.startswith("s3://"):
+        if not s3.is_uri(path_str):
             raise ValueError(f"Invalid S3 URI: {path_str}. It must start with 's3://'")
         return path_str
 
@@ -96,7 +117,7 @@ class S3FileSystem(FileSystemBase):
         if not path_str.endswith("/"):
             path_str += "/"
 
-        bucket, key = self._parse_s3_uri(path_str)
+        bucket, key = s3.parse_uri(path_str, allow_bucket_root=True)
         if key:  # Don't create empty object if this is just a bucket
             self.s3_client.put_object(Bucket=bucket, Key=key)
 
@@ -105,71 +126,34 @@ class S3FileSystem(FileSystemBase):
         """Validate if the checkpoint_id is a valid S3 URI."""
         checkpoint_id_str = str(checkpoint_id)
         try:
-            if not checkpoint_id_str.startswith("s3://"):
+            if not s3.is_uri(checkpoint_id_str):
                 return False
-            parsed = urlparse(checkpoint_id_str)
-            return bool(parsed.netloc and parsed.path)  # Must have bucket and key
-        except Exception:
+            s3.parse_uri(checkpoint_id_str)
+            return True
+        except ValueError:
             return False
 
     def exists(self, path: Union[str, os.PathLike]) -> bool:
         """Check if an object exists in S3."""
-        bucket, key = self._parse_s3_uri(str(path))
-        try:
-            self.s3_client.head_object(Bucket=bucket, Key=key)
-            return True
-        except ClientError as e:
-            error_code = e.response.get("Error", {}).get("Code", "")
-            if error_code == "404":
-                return False
-            raise  # Re-raise other errors
+        return s3.exists(str(path))
 
     def rm_file(self, path: Union[str, os.PathLike]) -> None:
         """Remove a file from S3."""
-        bucket, key = self._parse_s3_uri(str(path))
+        bucket, key = s3.parse_uri(str(path))
         self.s3_client.delete_object(Bucket=bucket, Key=key)
-
-    def _parse_s3_uri(self, uri: str) -> tuple[str, str]:
-        """
-        Parse an S3 URI into bucket and key.
-
-        Args:
-            uri: S3 URI in the format s3://bucket-name/key
-
-        Returns:
-            Tuple of (bucket_name, key)
-
-        Raises:
-            ValueError: If the URI is invalid
-        """
-        uri = uri if isinstance(uri, str) else str(uri)
-        if not uri.startswith("s3://"):
-            raise ValueError(f"Invalid S3 URI: {uri}. Must start with 's3://'")
-
-        parsed = urlparse(uri)
-        bucket = parsed.netloc
-
-        # Remove leading slash from key
-        key = parsed.path.lstrip("/")
-
-        if not bucket:
-            raise ValueError(f"Invalid S3 URI: {uri}. No bucket specified")
-
-        return bucket, key
 
 
 class S3StorageWriter(FileSystemWriter):
-    def __init__(self, credential_path: str, path: str, **kwargs) -> None:
+    def __init__(self, path: str, **kwargs) -> None:
         """
         Initialize an S3 writer for distributed checkpointing.
 
         Args:
-            credential_path (str): The path to the credential file of accessing AWS S3.
             path (str): The S3 URI to write checkpoints to.
             kwargs (dict): Keyword arguments to pass to the parent :class:`FileSystemWriter`.
         """
         super().__init__(path=path, sync_files=False, **kwargs)
-        self.fs = S3FileSystem(credential_path)
+        self.fs = S3FileSystem()
         self.path = self.fs.init_path(path)
 
     @classmethod
@@ -178,18 +162,16 @@ class S3StorageWriter(FileSystemWriter):
 
 
 class S3StorageReader(FileSystemReader):
-    def __init__(self, credential_path: str, path: Union[str, os.PathLike]) -> None:
+    def __init__(self, path: Union[str, os.PathLike]) -> None:
         """
         Initialize an S3 reader for distributed checkpointing.
 
         Args:
-            credential_path (str): The path to the credential file of accessing AWS S3.
             path (Union[str, os.PathLike]): The S3 URI to read checkpoints from.
         """
         super().__init__(path=path)
-        self.fs = S3FileSystem(credential_path)
+        self.fs = S3FileSystem()
         self.path = self.fs.init_path(path)
-        # self.sync_files = False
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:

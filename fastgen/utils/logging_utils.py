@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-from typing import Callable
-from loguru import logger
 import sys
+from typing import Callable
+
+from loguru import logger
+
 from fastgen.utils.distributed import get_rank, is_rank0
 
 # Default logging level — can be changed later
@@ -13,6 +15,7 @@ LOG_LEVEL = "INFO"
 logger.remove(0)
 logger.add(
     sys.stdout,
+    level=LOG_LEVEL,
     format="[<green>{time:MMM D, YYYY - HH:mm:ss}</green> | "
     "<level>{level}</level> | "
     "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> ] {message}",
@@ -23,11 +26,11 @@ def formatter(record):
     """
     Custom formatter function to conditionally add the MPI rank.
     """
-    # Base format string for all levels
+    # Base format string for all levels; a callable format must append the newline and {exception} itself
     msg = (
         "[<green>{time:MMM D, YYYY - HH:mm:ss}</green> | "
         "<level>{level}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> ] {message}\n"
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> ] {message}\n{exception}"
     )
 
     # For DEBUG messages, add the rank

@@ -1,14 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+
 from omegaconf import DictConfig
 
 import fastgen.configs.methods.config_mean_flow as config_mf_default
 from fastgen.configs.data import ImageNet256_Loader_Config
 from fastgen.configs.net import DiT_IN256_B_Config
 from fastgen.configs.callbacks import EMA_CONST_CALLBACKS
+from fastgen.utils.guidance import GuidanceConfig
 
-""" Configs for the MeanFlow model, on DiT-XL and ImageNet-256 dataset. """
+""" Configs for the MeanFlow model, on DiT-B and ImageNet-256 dataset. """
 
 
 def create_config():
@@ -17,9 +20,19 @@ def create_config():
     # model
     config.model.input_shape = [4, 32, 32]
     config.model.precision_amp = "bfloat16"
+    config.model.precision_amp_infer = "bfloat16"
     config.model.precision_amp_jvp = "float32"
     config.model.cond_dropout_prob = 0.1
-    config.model.guidance_mixture_ratio = 0.5
+    # 3-way teacher mixture (MeanFlow paper eq. 21):
+    #   guided = ω·dxt_dt + κ·pos + (1-ω-κ)·neg
+    # where dxt_dt is the analytical cond_velocity, ``pos``/``neg`` are the
+    # network cond/uncond passes, ω is the coefficient on ``dxt_dt`` and κ
+    # is the coefficient on ``pos``.  Here ω=1 (cfg disabled — ``dxt_dt``
+    # passes through unscaled) and κ=0.5, so 1-ω-κ = -0.5.  Composed via
+    # ``cfg.scale=None`` (≡ ω=1) and ``mix.scale=κ+1=1.5`` (see
+    # ``apply_guidance`` identity in mean_flow._get_velocity).
+    config.model.guidance_cfg = GuidanceConfig()
+    config.model.guidance_cfg.mix.scale = 1.5
 
     config.model.sample_t_cfg.time_dist_type = "logitnormal"
     config.model.sample_t_cfg.train_p_mean = -0.4
@@ -33,7 +46,9 @@ def create_config():
     config.model.loss_config.tangent_warmup_steps = 0
     config.model.loss_config.loss_type = "l2"
 
-    config.model.net = DiT_IN256_B_Config
+    config.model.net = copy.deepcopy(DiT_IN256_B_Config)
+    # MeanFlow's JVP is incompatible with fused attention.
+    config.model.net.enable_fused_attn = False
     # remove the additional 1000 factor in JVP
     config.model.net.scale_t = False
     config.model.net.r_timestep = True
@@ -52,11 +67,12 @@ def create_config():
     config.trainer.callbacks.update(EMA_CONST_CALLBACKS)
 
     # Recommended setting for 2-step:
-    # config.model.sample_t_cfg.t_list = [0.999, 0.5, 0.0]
-    # config.model.student_sample_steps = 2
+    # config.model.student_grid_cfg.grid_type = "explicit"
+    # config.model.student_grid_cfg.grid_kwargs = {"timesteps": [0.999, 0.5, 0.0]}
+    # config.model.student_grid_cfg.steps = 2
 
     # dataloader
-    config.dataloader_train = ImageNet256_Loader_Config
+    config.dataloader_train = copy.deepcopy(ImageNet256_Loader_Config)
     config.dataloader_train.batch_size = 32
 
     # trainer

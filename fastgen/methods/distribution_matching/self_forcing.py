@@ -6,250 +6,161 @@ from __future__ import annotations
 from typing import Any, TYPE_CHECKING, List, Optional
 
 import torch
-import torch.distributed as dist
 
 from fastgen.methods import CausVidModel
+from fastgen.methods.distribution_matching.dmd2 import Generation, TrainingInputs
 
 import fastgen.utils.logging_utils as logger
-from fastgen.networks.network import CausalFastGenNetwork
-from fastgen.utils.distributed import is_rank0, world_size
+from fastgen.networks.network_causal import (
+    CausalContext,
+    CausalFastGenNetwork,
+    causal_chunk_ranges,
+    check_chunk_boundary,
+)
+from fastgen.utils.distributed.collectives import broadcast_choice
+from fastgen.utils.tree_utils import noise_from_shape
 
 if TYPE_CHECKING:
     from fastgen.configs.methods.config_self_forcing import ModelConfig
 
 
 class SelfForcingModel(CausVidModel):
-    """Self-Forcing model for distribution matching distillation
-    Inheritance hierarchy:
-    SelfForcingModel -> CausVidModel -> DMD2Model -> FastGenModel
+    """Causal distribution matching with an in-iteration self-forcing rollout.
 
-    The major difference between SelfForcingModel and DMD2Model is how we get
-    the gen_data in the single_train_step() function.  In SelfForcingModel, we
-    use self.rollout_with_gradient() to get the gen_data, which
-    does the rollout with gradient tracking at the last denoising step.  The
-    number of denoising steps is stochastic, and is sampled from the
-    denoising_step_list.
+    ``SelfForcingModel`` inherits DMD2's losses but generates ``gen_data`` with
+    an in-iteration causal rollout. Each causal block samples an exit denoising
+    step, with gradients enabled there according to the rollout configuration.
+
+    Self-Forcing requires ``backward_simulation="default"`` to select fresh-noise,
+    real-data-optional input construction. Unlike base DMD2 backward simulation,
+    it completes the rollout within the current iteration and returns no carried
+    trajectory state. Real data is used only by inherited optional objectives,
+    such as a positively weighted GAN loss.
     """
 
     def __init__(self, config: ModelConfig):
+        if config.backward_simulation != "default":
+            raise ValueError(
+                "SelfForcingModel requires backward_simulation='default': it always starts from fresh noise "
+                "and performs its complete causal rollout within the current iteration, carrying nothing."
+            )
         super().__init__(config)
-        self.config = config
 
-    def _generate_noise_and_time(
-        self, real_data: torch.Tensor, iteration: Optional[int] = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate random noises and time step
+    def _training_inputs(self, data: dict[str, Any], iteration: int = 1) -> TrainingInputs:
+        """Construct fresh-noise inputs for Self-Forcing's in-iteration rollout.
 
-        Args:
-            real_data: Real data tensor for dtype/device reference
-            iteration: Current training iteration, used only to tell a generator
-                update from a fake-score one so `fake_score_sample_t_cfg` can
-                apply on the latter. `None` always uses `sample_t_cfg`.
-
-        Returns:
-            input_student: Random noise used by the student
-            t_max: Time step used by the student
-            t: Time step for distribution matching
-            eps: Random noise used by a forward process
+        Shape and dtype come from the model configuration, so this path does
+        not depend on real data. No trajectory is carried between iterations.
+        The shared VSD/GAN noising pair always uses DMD2's main distribution;
+        an optional fake-score-only pair is sampled inside the auxiliary step.
         """
-        batch_size = real_data.shape[0]
+        del iteration
+        batch_size = self._batch_size(data)
+        noise = noise_from_shape(self.input_shape, batch_size, self.device, self.precision)
+        student_grid = self.net.noise_scheduler.student_grid(device=self.device)
+        input_student = self.net.noise_scheduler.latents(noise=noise, t_init=student_grid[0])
+        t, eps = self._sample_t_and_eps(batch_size)
+        return TrainingInputs(input_student=input_student, student_step=None, t=t, eps=eps)
 
-        eps_student = torch.randn(batch_size, *self.input_shape, device=self.device, dtype=real_data.dtype)
-        t_student = torch.full(
-            (batch_size,),
-            self.net.noise_scheduler.max_t,
-            device=self.device,
-            dtype=self.net.noise_scheduler.t_precision,
-        )
-        input_student = self.net.noise_scheduler.latents(noise=eps_student)
+    def _sample_exit_steps(self, num_blocks: int) -> List[int]:
+        """Sample one exit-step index per block."""
+        sample_steps = self.net.noise_scheduler.default_student_steps
+        if self.config.last_step_only:
+            return [sample_steps - 1] * num_blocks
 
-        t = self._sample_noising_time(batch_size, iteration)
+        if self.config.same_step_across_blocks:
+            return [broadcast_choice(sample_steps, device=self.device)] * num_blocks
 
-        eps = torch.randn_like(real_data, device=self.device, dtype=real_data.dtype)
-
-        return input_student, t_student, t, eps
-
-    def _sample_denoising_end_steps(self, num_blocks: int) -> List[int]:
-        """Sample a list of denoising end indices for each block"""
-        sample_steps = self.config.student_sample_steps
-
-        if is_rank0():
-            if self.config.last_step_only:
-                indices = torch.full((num_blocks,), sample_steps - 1, dtype=torch.long, device=self.device)
-            else:
-                indices = torch.randint(low=0, high=sample_steps, size=(num_blocks,), device=self.device)
-        else:
-            indices = torch.empty(num_blocks, dtype=torch.long, device=self.device)
-
-        # Broadcast the random indices to all ranks
-        if world_size() > 1:
-            dist.broadcast(indices, src=0)
-
-        return indices.tolist()
-
-    def rollout_with_gradient(
-        self,
-        noise: torch.Tensor,
-        condition: Optional[Any] = None,
-        enable_gradient: bool = True,
-        start_gradient_frame: int = 0,
-    ) -> torch.Tensor:
-        """
-        Perform self-forcing rollout with gradient tracking at the last step of each block.
-
-        No external KV cache is used. Instead, we update the model's internal caches
-        once per completed block using `store_kv=True` under no_grad.
-
-        Args:
-            noise: Initial noise tensor [B, C, T, H, W]
-            condition: Conditioning (dict with 'text_embeds'/'prompt_embeds' or a tensor)
-            enable_gradient: Whether to enable gradients at the exit step
-            start_gradient_frame: Frame index to start gradient tracking
-
-        Returns:
-            generated_frames: Generated video frames, same shape as noise [B, C, T, H, W]
-        """
-        assert isinstance(self.net, CausalFastGenNetwork), f"{self.net} must be a CausalFastGenNetwork"
-        self.net.clear_caches()
-
-        # Reset peak memory stats for per-rollout VRAM monitoring
-        torch.cuda.empty_cache()
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats(device=self.device)
-
-        batch_size, C, num_frames, H, W = noise.shape
-        chunk_size = self.net.chunk_size
-        num_blocks = num_frames // chunk_size
-        remaining_size = num_frames % chunk_size
-        sample_steps = self.config.student_sample_steps
-        dtype = noise.dtype
-
-        # Sample denoising end steps
-        denoising_end_steps = self._sample_denoising_end_steps(num_blocks)
-        logger.debug(f"denoising_end_steps: {denoising_end_steps}")
-
-        # t_list
-        t_list = self.config.sample_t_cfg.t_list
-        if t_list is None:
-            t_list = self.net.noise_scheduler.get_t_list(sample_steps, device=self.device)
-        else:
-            assert (
-                len(t_list) - 1 == sample_steps
-            ), f"t_list length (excluding zero) != student_sample_steps: {len(t_list) - 1} != {sample_steps}"
-            t_list = torch.tensor(t_list, device=self.device, dtype=self.net.noise_scheduler.t_precision)
-
-        # Collect denoised blocks and concatenate to preserve autograd graph
-        denoised_blocks = []
-        for block_idx in range(num_blocks):
-            if num_blocks == 0:
-                # Handle case where num_frames < chunk_size
-                cur_start_frame, cur_end_frame = 0, remaining_size
-            else:
-                # Normal chunking logic
-                cur_start_frame = 0 if block_idx == 0 else chunk_size * block_idx + remaining_size
-                cur_end_frame = chunk_size * (block_idx + 1) + remaining_size
-
-            noisy_input = noise[:, :, cur_start_frame:cur_end_frame]
-
-            # Denoising steps for current block
-            for step, t_cur in enumerate(t_list):
-                if self.config.same_step_across_blocks:
-                    exit_flag = step == denoising_end_steps[0]
-                else:
-                    exit_flag = step == denoising_end_steps[block_idx]
-
-                t_chunk_cur = t_cur.expand(batch_size)
-
-                if not exit_flag:
-                    # Non-exit steps: no grads, no cache updates
-                    with torch.no_grad():
-                        x0_pred_chunk = self.net(
-                            noisy_input,
-                            t_chunk_cur,
-                            condition=condition,
-                            cache_tag="pos",
-                            store_kv=False,
-                            cur_start_frame=cur_start_frame,
-                            fwd_pred_type="x0",
-                            is_ar=True,
-                        )
-
-                    # update to the next timestep for forward process
-                    t_next = t_list[step + 1]
-                    t_chunk_next = t_next.expand(batch_size)
-                    if self.config.student_sample_type == "sde":
-                        eps_infer = torch.randn_like(x0_pred_chunk)
-                    elif self.config.student_sample_type == "ode":
-                        eps_infer = self.net.noise_scheduler.x0_to_eps(xt=noisy_input, x0=x0_pred_chunk, t=t_chunk_cur)
-                    else:
-                        raise NotImplementedError(
-                            f"student_sample_type must be one of 'sde', 'ode' but got {self.config.student_sample_type}"
-                        )
-                    noisy_input = self.net.noise_scheduler.forward_process(x0_pred_chunk, eps_infer, t_chunk_next)
-                else:
-                    # Exit step: allow gradient if enabled
-                    enable_grad = (
-                        enable_gradient and torch.is_grad_enabled() and (cur_start_frame >= start_gradient_frame)
-                    )
-                    with torch.set_grad_enabled(enable_grad):
-                        x0_pred_chunk = self.net(
-                            noisy_input,
-                            t_chunk_cur,
-                            condition=condition,
-                            cache_tag="pos",
-                            store_kv=False,
-                            cur_start_frame=cur_start_frame,
-                            fwd_pred_type="x0",
-                            is_ar=True,
-                        )
-                    break
-
-            # Save denoised block; keep autograd path by collecting and concatenating later
-            denoised_blocks.append(x0_pred_chunk)
-
-            # Update internal KV cache for this finished block using t=0 or context noise (no grads)
-            with torch.no_grad():
-                if self.config.context_noise > 0:
-                    # Add context noise to denoised frames before caching
-                    t_cache = torch.full((batch_size,), self.config.context_noise, device=self.device, dtype=dtype)
-                    x0_pred_cache = self.net.noise_scheduler.forward_process(
-                        x0_pred_chunk,
-                        torch.randn_like(x0_pred_chunk),
-                        t_cache,
-                    )
-                else:
-                    x0_pred_cache = x0_pred_chunk
-                    t_cache = torch.zeros(batch_size, device=self.device, dtype=dtype)
-
-                # update kv-cache with generated frames
-                _ = self.net(
-                    x0_pred_cache,
-                    t_cache,
-                    condition=condition,
-                    cache_tag="pos",
-                    store_kv=True,
-                    cur_start_frame=cur_start_frame,
-                    fwd_pred_type="x0",
-                    is_ar=True,
-                )
-
-        # Concatenate blocks along the temporal dimension to form full output with gradients
-        output = torch.cat(denoised_blocks, dim=2) if len(denoised_blocks) > 0 else torch.empty_like(noise)
-
-        self.net.clear_caches()
-        return output
+        exit_steps = broadcast_choice(sample_steps, num_blocks, device=self.device)
+        return [exit_steps] if num_blocks == 1 else exit_steps
 
     def gen_data_from_net(
         self,
         input_student: torch.Tensor,
-        t_student: torch.Tensor,
+        student_step: Optional[torch.Tensor],
         condition: Optional[Any] = None,
-    ) -> torch.Tensor:
-        del t_student
-        gen_data = self.rollout_with_gradient(
-            noise=input_student,
-            condition=condition,
-            enable_gradient=self.config.enable_gradient_in_rollout,
-            start_gradient_frame=self.config.start_gradient_frame,
+        neg_condition: Optional[Any] = None,
+    ) -> Generation:
+        """Generate data with Self-Forcing's in-iteration causal rollout.
+
+        No external KV cache is used. Instead, ``_store_causal_chunk`` writes every
+        completed block but the last to the model's internal caches, under no_grad
+        unless ``grad_through_kv_cache``.
+
+        ``student_step`` is intentionally absent: Self-Forcing starts from fresh
+        noise and builds a complete per-block student trajectory here.
+        """
+        del student_step, neg_condition
+
+        assert isinstance(self.net, CausalFastGenNetwork), f"{self.net} must be a CausalFastGenNetwork"
+        self.net.clear_caches()
+
+        _, _, num_frames, _, _ = input_student.shape
+        # Training layout: the first block holds any remainder frames; fewer frames than a chunk form one block.
+        blocks = causal_chunk_ranges(num_frames, self.net.chunk_size)
+        check_chunk_boundary(self.config.start_gradient_frame, blocks, "start_gradient_frame")
+        main_engine = self.net.transformer.kv_cache_engines["main"]
+
+        ctx = CausalContext(
+            cache_tag="pos",
+            is_ar=True,
+            chunk_size=self.net.chunk_size,
+            total_num_frames=self.net.total_num_frames,
+            cache_engines={"main": main_engine},
+            grad_through_kv_cache=self.config.grad_through_kv_cache,
         )
-        return gen_data
+
+        exit_steps = self._sample_exit_steps(len(blocks))
+        logger.debug(f"exit_steps: {exit_steps}")
+
+        # student_grid, for however many steps this rollout was asked for
+        student_grid = self.net.noise_scheduler.student_grid(device=self.device)
+
+        # Collect denoised blocks and concatenate to preserve autograd graph
+        denoised_blocks = []
+        for block_idx, (cur_start_frame, cur_end_frame) in enumerate(blocks):
+            ctx.cur_start_frame = cur_start_frame
+            enable_exit_grad = torch.is_grad_enabled() and (cur_start_frame >= self.config.start_gradient_frame)
+            with torch.set_grad_enabled(enable_exit_grad):
+                x0_pred_chunk = self._denoise_causal_chunk(
+                    self.net,
+                    input_student[:, :, cur_start_frame:cur_end_frame],
+                    student_grid,
+                    condition,
+                    ctx,
+                    cur_start_frame,
+                    stop_step=exit_steps[block_idx],
+                    grad_only_at_stop=True,
+                )
+
+            # Save denoised block; keep autograd path by collecting and concatenating later
+            denoised_blocks.append(x0_pred_chunk)
+
+            # Update internal KV cache for this finished block. The final
+            # block's cache is never read: nothing follows it in this rollout
+            # and the next call starts from clear_caches(). Skipping its store
+            # saves one chunk forward per rollout and, with
+            # grad_through_kv_cache, avoids retaining an unused graph.
+            if block_idx == len(blocks) - 1:
+                continue
+            enable_cache_grad = ctx.grad_through_kv_cache and torch.is_grad_enabled()
+            with torch.set_grad_enabled(enable_cache_grad):
+                self._store_causal_chunk(
+                    self.net,
+                    x0_pred_chunk,
+                    student_grid,
+                    condition,
+                    ctx,
+                    cur_start_frame,
+                )
+
+        # Concatenate blocks along the temporal dimension to form full output with gradients
+        output = torch.cat(denoised_blocks, dim=2)
+
+        generation_metrics = {
+            "avg_denoising_steps": torch.tensor(
+                sum(step + 1 for step in exit_steps) / len(exit_steps),
+                device=self.device,
+            ),
+        }
+        return Generation(data=output, x0=output, metrics=generation_metrics)

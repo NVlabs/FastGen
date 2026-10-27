@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""SFT config for LTX-2.5 (video + audio), aligned with Diffusers LTX-2.5 checkpoints."""
+
+import copy
+
+import fastgen.configs.methods.config_sft as config_sft_default
+from fastgen.configs.data import VideoAudioLoaderConfig
+from fastgen.configs.net import LTX2_5_Config
+from fastgen.networks.LTX2.network import LTX2
+from fastgen.configs.config_utils import model_pixel_shape
+
+
+def create_config():
+    config = config_sft_default.create_config()
+
+    config.trainer.logging_iter = 100
+    config.trainer.save_ckpt_iter = 1000
+
+    config.trainer.fsdp = True
+    config.model.meta_init = True
+    config.model.net_optimizer.lr = 2e-5
+    # Full / SFT DiT: LTX2Pipeline's own default step count.
+    config.model.student_grid_cfg.steps = 30
+    config.model.precision = "bfloat16"
+    config.model.precision_opt = "float32"
+
+    config.model.net = copy.deepcopy(LTX2_5_Config)
+    # LTX2Pipeline defaults: cfg 3.0 (audio 7.0), stg 1.0 in the pipeline (= 2.0 here) @ block [28],
+    # modality 3.0, rescale 0.7.
+    config.model.guidance_cfg = LTX2.default_guidance_cfg(version="2.5")
+
+    config.model.input_shape = {"video": [128, 31, 22, 40], "audio": None}
+
+    # Use tiled VAE encode/decode path to reduce peak memory
+    config.model.net.enable_vae_tiling = True
+
+    config.model.sample_t_cfg.time_dist_type = "uniform"
+    config.model.sample_t_cfg.min_t = 0.001
+    config.model.sample_t_cfg.max_t = 0.999
+
+    config.dataloader_train = copy.deepcopy(VideoAudioLoaderConfig)
+    config.dataloader_train.batch_size = 1
+    # LTX-2's own negative prompt, as used at inference.
+    config.dataloader_train.presets_map = {"neg_condition_raw": "neg_prompt_ltx2"}
+    num_frames, height, width = model_pixel_shape(config.model)
+    config.dataloader_train.img_size = (width, height)
+    config.dataloader_train.sequence_length = num_frames
+    # Resample onto the model's fps if the dataset is not already preprocessed at it.
+    # config.dataloader_train.target_fps = config.model.net.fps
+
+    config.log_config.group = "ltx2_5_sft"
+    return config

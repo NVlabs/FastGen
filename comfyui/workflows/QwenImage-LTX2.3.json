@@ -1,0 +1,1712 @@
+{
+    "id": "5c3c360e-4319-48fd-b20c-320db907a033",
+    "revision": 0,
+    "last_node_id": 36,
+    "last_link_id": 58,
+    "nodes": [
+      {
+        "id": 7,
+        "type": "FastGenPreprocess",
+        "pos": [
+          -632.7876786947427,
+          -242.09455545922765
+        ],
+        "size": [
+          320,
+          300
+        ],
+        "flags": {},
+        "order": 25,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 6
+          },
+          {
+            "name": "prompt",
+            "type": "STRING",
+            "link": 47
+          },
+          {
+            "name": "negative_prompt",
+            "shape": 7,
+            "type": "STRING",
+            "link": 5
+          },
+          {
+            "name": "image",
+            "shape": 7,
+            "type": "IMAGE",
+            "link": 9
+          },
+          {
+            "name": "video",
+            "shape": 7,
+            "type": "VIDEO",
+            "link": null
+          },
+          {
+            "name": "camera",
+            "shape": 7,
+            "type": "FASTGEN_CAMERA",
+            "link": null
+          },
+          {
+            "name": "depth_latent",
+            "shape": 7,
+            "type": "FASTGEN_DEPTH_LATENT",
+            "link": null
+          }
+        ],
+        "outputs": [
+          {
+            "name": "conditioning",
+            "type": "FASTGEN_CONDITIONING",
+            "links": [
+              18,
+              22
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenPreprocess"
+        },
+        "widgets_values": [
+          1,
+          0
+        ]
+      },
+      {
+        "id": 19,
+        "type": "FastGenConfigLoader",
+        "pos": [
+          -3820.1624593074366,
+          -47.225308983851164
+        ],
+        "size": [
+          269.33654979810217,
+          105.70451504223229
+        ],
+        "flags": {},
+        "order": 10,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "config_overrides",
+            "shape": 7,
+            "type": "STRING",
+            "link": 32
+          },
+          {
+            "name": "env_vars",
+            "shape": 7,
+            "type": "STRING",
+            "link": 33
+          }
+        ],
+        "outputs": [
+          {
+            "name": "config",
+            "type": "FASTGEN_CONFIG",
+            "links": [
+              14
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenConfigLoader"
+        },
+        "widgets_values": [
+          "fastgen/configs/experiments/QwenImage/config_dmd2.py",
+          "INFO"
+        ]
+      },
+      {
+        "id": 18,
+        "type": "FastGenConfigLoader",
+        "pos": [
+          -1628.4891385586768,
+          -482.97408585711986
+        ],
+        "size": [
+          273.87213663289367,
+          111.89872738176757
+        ],
+        "flags": {},
+        "order": 9,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "config_overrides",
+            "shape": 7,
+            "type": "STRING",
+            "link": 30
+          },
+          {
+            "name": "env_vars",
+            "shape": 7,
+            "type": "STRING",
+            "link": 31
+          }
+        ],
+        "outputs": [
+          {
+            "name": "config",
+            "type": "FASTGEN_CONFIG",
+            "links": [
+              2
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenConfigLoader"
+        },
+        "widgets_values": [
+          "fastgen/configs/experiments/LTX2I2V/config_dmd2_ltx23.py",
+          "INFO"
+        ]
+      },
+      {
+        "id": 27,
+        "type": "PrimitiveStringMultiline",
+        "pos": [
+          -1428.754973714619,
+          -286.4867920371946
+        ],
+        "size": [
+          391.04589130102204,
+          114.02991891828162
+        ],
+        "flags": {},
+        "order": 0,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              42
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PrimitiveStringMultiline"
+        },
+        "widgets_values": [
+          "You are an expert AI Video Director specializing in Image-to-Video (I2V) prompt engineering for generative video models. \n\nYour task is to take a given image context and a user's short motion idea, then expand it into a precise, cinematographically grounded prompt that dictates movement, physics, and camera action over time.\n\n### Core Philosophy\n* **Do NOT redundantly describe visual details already present in the image** (e.g., character hair color, clothing style, aesthetic) unless describing a change or interaction.\n* **Focus on temporal evolution:** Describe what moves, how it moves, how the camera moves, and how the environment reacts.\n\n### Prompt Expansion Checklist\nWhen expanding an I2V prompt, structure the response across these four dimensions:\n\n1. **Subject Action & Physics:** Describe specific, natural physical actions (e.g., \"slowly turns head to camera right,\" \"chest heaves with heavy breathing,\" \"hand reaches out to grab the mug\"). Define speed and rhythm (e.g., slow motion, sudden jerk, fluid drift).\n2. **Camera Motion (Cinematography):** Specify clear camera paths (e.g., \"slow dolly in,\" \"static camera,\" \"handheld tracking shot following from behind,\" \"orbit around the subject\").\n3. **Environmental & Background Dynamic:** Describe secondary motion to add realism (e.g., \"wind blowing through trees,\" \"rain flickering across the glass,\" \"smoke rising steadily,\" \"dust motes drifting in light\").\n4. **Lighting & Atmosphere Shifts:** Note subtle changes over time, if applicable (e.g., \"neon lights flicker in sequence,\" \"sunlight breaks through clouds,\" \"shadows lengthen\").\n\n### Execution Rules\n* **Avoid Vague Wording:** Avoid generic phrases like \"cool motion,\" \"cinematic transition,\" or \"photorealistic movement.\" Use literal, directional motion verbs (e.g., \"pans left,\" \"swings open,\" \"ripples\").\n* **Keep Prompts Action-Dense and Concise:** I2V models perform best with structured, focused descriptions (60–100 words). Do not clutter with unnecessary narrative backstory.\n* **Maintain Continuity:** Ensure motion respects the logical boundaries and implied physics of the source image.\n\n---\n\n### Examples\n\n* **Image Description:** A close-up of a medieval knight in armor standing on a wet battlefield.\n* **User Input:** \"He looks up.\"\n* **Expanded I2V Prompt:** \"Slow dolly-in towards the knight's face as he slowly lifts his head up to face the sky. Raindrops splatter realistically off his metallic visor. Rain continuously streams down the screen while soft embers drift upward in the smoky, out-of-focus background. The camera remains locked-off and stable, creating a dramatic, heavy-pacing atmosphere.\"\n\n* **Image Description:** A sleek sports car parked on a damp city street at night with neon signs in the background.\n* **User Input:** \"Car drives off.\"\n* **Expanded I2V Prompt:** \"Low-angle static camera shot. The car's tail lights ignite bright red, and smoke rolls smoothly out from under the rear tires. The sports car accelerates rapidly forward, driving down the wet asphalt into the distance. Neon light reflections stretch and distort dynamically across the damp street and car body as it speeds away.\"\n\n---\n\n### Task\nYou will be provided with a description/context of the input image and a short user prompt. Convert this into an optimized, motion-focused Image-to-Video generation prompt."
+        ]
+      },
+      {
+        "id": 12,
+        "type": "PrimitiveStringMultiline",
+        "pos": [
+          -2775.6019247164604,
+          -364.6374594226343
+        ],
+        "size": [
+          391.04589130102204,
+          114.02991891828162
+        ],
+        "flags": {},
+        "order": 1,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              16,
+              43
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PrimitiveStringMultiline"
+        },
+        "widgets_values": [
+          "A running kid"
+        ]
+      },
+      {
+        "id": 26,
+        "type": "PrimitiveStringMultiline",
+        "pos": [
+          -3878.901110549903,
+          187.22054632861304
+        ],
+        "size": [
+          391.04589130102204,
+          114.02991891828162
+        ],
+        "flags": {},
+        "order": 2,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              41
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PrimitiveStringMultiline"
+        },
+        "widgets_values": [
+          "You are an expert AI Prompt Engineer specializing in generative text-to-image models. Your sole mission is to take simple, minimal user inputs and expand them into rich, vivid, highly descriptive image generation prompts that produce stunning visual results.\n\n### Expansion Guidelines\nWhen extending a prompt, enrich it across these key visual dimensions:\n\n1. **Subject Details:** Specify micro-textures, attire, expressions, poses, materials, and distinct physical traits.\n2. **Art Style & Medium:** Define the artistic medium (e.g., 35mm photograph, oil painting, 3D Octane render, watercolor) and style aesthetics (e.g., cyberpunk, art nouveau, cinematic realism).\n3. **Lighting & Atmosphere:** Detail the light source, quality, and mood (e.g., volumetric neon haze, dramatic chiaroscuro, soft diffused morning mist, golden hour backlighting).\n4. **Composition & Camera:** Indicate framing, angle, and lens choices (e.g., Dutch angle, extreme close-up, 85mm portrait lens, shallow depth of field with creamy bokeh).\n5. **Color Palette:** Mention distinct color relationships (e.g., muted earthy tones, vibrant jewel-toned palette, cyberpunk magenta and teal contrast).\n\n### Rules\n* **Preserve Intent:** Always respect the core subject and mood requested by the user. Do not introduce completely unrelated elements.\n* **Avoid Buzzwords:** Do not use empty quality descriptors like \"hyperrealistic,\" \"photorealistic,\" \"4K,\" or \"masterpiece.\" Instead, describe the tangible details that produce high quality naturally.\n* **Format for Usability:** Output the generated prompt directly in a clean format that is easy to copy and paste.\n\n### Examples\n\n* **Input:** \"A wizard reading a book\"\n* **Expanded Prompt:** \"An elderly wizard with a long silver beard in elaborate velvet robes, intently studying a glowing ancient leather-bound grimoire. Set inside a towering stone library filled with floating magical scrolls and dusty hourglasses. Soft candlelight intermingling with shimmering ethereal blue luminescence emanating from the book pages. Cinematic wide shot, shallow depth of field, warm cozy lighting, rich mahogany and gold color palette.\"\n\n* **Input:** \"A futuristic sports car\"\n* **Expanded Prompt:** \"A sleek futuristic electric supercar with aerodynamic carbon-fiber bodywork, parked on a rain-soaked cyberpunk street at night. Dynamic low-angle 35mm photo, reflection of vibrant pink and cyan neon lights streaking across the wet asphalt and glossy metallic surface. Dense atmospheric fog, shallow depth of field, sharp focus on glowing LED headlights.\"\n\n---\n\n### Task\nAnalyze the user's input prompt and generate a refined, expanded version following the guidelines above."
+        ]
+      },
+      {
+        "id": 25,
+        "type": "FastGenPromptExpand",
+        "pos": [
+          -3452.8210204852903,
+          184.9069269738287
+        ],
+        "size": [
+          300,
+          130
+        ],
+        "flags": {},
+        "order": 8,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "prompt",
+            "type": "STRING",
+            "link": 16
+          },
+          {
+            "name": "image",
+            "shape": 7,
+            "type": "IMAGE",
+            "link": null
+          },
+          {
+            "name": "system_prompt",
+            "shape": 7,
+            "type": "STRING",
+            "link": 41
+          }
+        ],
+        "outputs": [
+          {
+            "name": "prompt",
+            "type": "STRING",
+            "links": [
+              44
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenPromptExpand"
+        },
+        "widgets_values": [
+          "Qwen2.5_3B",
+          347
+        ]
+      },
+      {
+        "id": 28,
+        "type": "PreviewAny",
+        "pos": [
+          -3445.003580140552,
+          358.55375398738533
+        ],
+        "size": [
+          291.7579340830116,
+          152.10941269298246
+        ],
+        "flags": {},
+        "order": 11,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "source",
+            "type": "*",
+            "link": 44
+          }
+        ],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              45
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PreviewAny"
+        },
+        "widgets_values": [
+          null,
+          null,
+          null
+        ]
+      },
+      {
+        "id": 24,
+        "type": "FastGenPromptExpand",
+        "pos": [
+          -997.1074866957298,
+          -480.2543203339433
+        ],
+        "size": [
+          300,
+          130
+        ],
+        "flags": {},
+        "order": 22,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "prompt",
+            "type": "STRING",
+            "link": 43
+          },
+          {
+            "name": "image",
+            "shape": 7,
+            "type": "IMAGE",
+            "link": 40
+          },
+          {
+            "name": "system_prompt",
+            "shape": 7,
+            "type": "STRING",
+            "link": 42
+          }
+        ],
+        "outputs": [
+          {
+            "name": "prompt",
+            "type": "STRING",
+            "links": [
+              46
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenPromptExpand"
+        },
+        "widgets_values": [
+          "QwenVL2.5_3B",
+          26
+        ]
+      },
+      {
+        "id": 8,
+        "type": "ComfySwitchNode",
+        "pos": [
+          -982.3845069150065,
+          -111.27199606098556
+        ],
+        "size": [
+          266.77925083806053,
+          87.015666926942
+        ],
+        "flags": {},
+        "order": 21,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "on_false",
+            "type": "IMAGE",
+            "link": 10
+          },
+          {
+            "name": "on_true",
+            "type": "IMAGE",
+            "link": 11
+          }
+        ],
+        "outputs": [
+          {
+            "name": "output",
+            "type": "IMAGE",
+            "links": [
+              9,
+              40
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "ComfySwitchNode"
+        },
+        "widgets_values": [
+          false
+        ]
+      },
+      {
+        "id": 13,
+        "type": "FastGenPreprocess",
+        "pos": [
+          -3117.322901997224,
+          187.19867258207475
+        ],
+        "size": [
+          320,
+          300
+        ],
+        "flags": {},
+        "order": 15,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 15
+          },
+          {
+            "name": "prompt",
+            "type": "STRING",
+            "link": 45
+          },
+          {
+            "name": "negative_prompt",
+            "shape": 7,
+            "type": "STRING",
+            "link": 58
+          },
+          {
+            "name": "image",
+            "shape": 7,
+            "type": "IMAGE",
+            "link": null
+          },
+          {
+            "name": "video",
+            "shape": 7,
+            "type": "VIDEO",
+            "link": null
+          },
+          {
+            "name": "camera",
+            "shape": 7,
+            "type": "FASTGEN_CAMERA",
+            "link": null
+          },
+          {
+            "name": "depth_latent",
+            "shape": 7,
+            "type": "FASTGEN_DEPTH_LATENT",
+            "link": null
+          }
+        ],
+        "outputs": [
+          {
+            "name": "conditioning",
+            "type": "FASTGEN_CONDITIONING",
+            "links": [
+              26,
+              49
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenPreprocess"
+        },
+        "widgets_values": [
+          1,
+          0
+        ]
+      },
+      {
+        "id": 21,
+        "type": "PrimitiveStringMultiline",
+        "pos": [
+          -4114.418407619079,
+          -45.15625701935895
+        ],
+        "size": [
+          266.2303452010183,
+          91.47160970048844
+        ],
+        "flags": {},
+        "order": 3,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              32
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PrimitiveStringMultiline"
+        },
+        "widgets_values": [
+          "trainer.seed=1 trainer.ddp=False model.torch_compile_mode=Null\nmodel.input_shape=[16,128,128]\n"
+        ]
+      },
+      {
+        "id": 5,
+        "type": "PrimitiveStringMultiline",
+        "pos": [
+          -1924.9720037796524,
+          -476.8095875610651
+        ],
+        "size": [
+          270.73577520845106,
+          88
+        ],
+        "flags": {},
+        "order": 4,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              30
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PrimitiveStringMultiline"
+        },
+        "widgets_values": [
+          "trainer.seed=1 trainer.ddp=False model.torch_compile_mode=Null"
+        ]
+      },
+      {
+        "id": 11,
+        "type": "FastGenModelLoader",
+        "pos": [
+          -3530.17082716373,
+          -58.96522915372267
+        ],
+        "size": [
+          379.91916098434376,
+          132.854052702697
+        ],
+        "flags": {},
+        "order": 13,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "config",
+            "type": "FASTGEN_CONFIG",
+            "link": 14
+          }
+        ],
+        "outputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "links": [
+              12,
+              15,
+              25,
+              29,
+              51,
+              53
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenModelLoader"
+        },
+        "widgets_values": [
+          true,
+          false,
+          "(pretrained)",
+          ""
+        ]
+      },
+      {
+        "id": 2,
+        "type": "PrimitiveStringMultiline",
+        "pos": [
+          -1509.8190783751895,
+          -43.171533766685464
+        ],
+        "size": [
+          416.83365861806556,
+          261.1730657710748
+        ],
+        "flags": {},
+        "order": 5,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              5
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PrimitiveStringMultiline"
+        },
+        "widgets_values": [
+          "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts."
+        ]
+      },
+      {
+        "id": 9,
+        "type": "LoadImage",
+        "pos": [
+          -983.1924904990052,
+          34.69971379087544
+        ],
+        "size": [
+          282.796875,
+          340
+        ],
+        "flags": {},
+        "order": 6,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "IMAGE",
+            "type": "IMAGE",
+            "links": [
+              11
+            ]
+          },
+          {
+            "name": "MASK",
+            "type": "MASK",
+            "links": null
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "LoadImage"
+        },
+        "widgets_values": [
+          "example.png",
+          "image"
+        ]
+      },
+      {
+        "id": 20,
+        "type": "PrimitiveStringMultiline",
+        "pos": [
+          -4113.125939904893,
+          -461.61000605277945
+        ],
+        "size": [
+          307.72831602182305,
+          126.30469944348482
+        ],
+        "flags": {},
+        "order": 7,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              31,
+              33
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PrimitiveStringMultiline"
+        },
+        "widgets_values": [
+          "PYTHONOPTIMIZE=1\nTORCHINDUCTOR_FX_GRAPH_CACHE=1 TORCHINDUCTOR_COORDINATE_DESCENT_TUNING=1 TORCHINDUCTOR_MAX_AUTOTUNE_GEMM=1\nPYTORCH_ALLOC_CONF=expandable_segments:True"
+        ]
+      },
+      {
+        "id": 29,
+        "type": "PreviewAny",
+        "pos": [
+          -995.9857789215966,
+          -724.8484589163919
+        ],
+        "size": [
+          379.09012595692525,
+          180.85176066589213
+        ],
+        "flags": {},
+        "order": 23,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "source",
+            "type": "*",
+            "link": 46
+          }
+        ],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              47
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PreviewAny"
+        },
+        "widgets_values": [
+          null,
+          null,
+          null
+        ]
+      },
+      {
+        "id": 3,
+        "type": "FastGenNoiseGenerator",
+        "pos": [
+          -639.719862288156,
+          -390.0766170128729
+        ],
+        "size": [
+          270,
+          104
+        ],
+        "flags": {},
+        "order": 14,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 1
+          }
+        ],
+        "outputs": [
+          {
+            "name": "noise",
+            "type": "FASTGEN_NOISE",
+            "links": [
+              20,
+              24
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenNoiseGenerator"
+        },
+        "widgets_values": [
+          610,
+          "fixed"
+        ]
+      },
+      {
+        "id": 17,
+        "type": "FastGenNoiseGenerator",
+        "pos": [
+          -3056.45038382711,
+          26.454692922297383
+        ],
+        "size": [
+          265.7297932459678,
+          86.61760471028163
+        ],
+        "flags": {},
+        "order": 16,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 29
+          }
+        ],
+        "outputs": [
+          {
+            "name": "noise",
+            "type": "FASTGEN_NOISE",
+            "links": [
+              28,
+              48
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenNoiseGenerator"
+        },
+        "widgets_values": [
+          586,
+          "fixed"
+        ]
+      },
+      {
+        "id": 4,
+        "type": "FastGenModelLoader",
+        "pos": [
+          -1339.3669167791713,
+          -483.1503982795766
+        ],
+        "size": [
+          303.73674852862496,
+          134.67552507517962
+        ],
+        "flags": {},
+        "order": 12,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "config",
+            "type": "FASTGEN_CONFIG",
+            "link": 2
+          }
+        ],
+        "outputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "links": [
+              1,
+              6,
+              17,
+              21,
+              55,
+              57
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenModelLoader"
+        },
+        "widgets_values": [
+          true,
+          false,
+          "(pretrained)",
+          ""
+        ]
+      },
+      {
+        "id": 15,
+        "type": "FastGenTeacherSample",
+        "pos": [
+          -247.8748964279202,
+          -867.375265301067
+        ],
+        "size": [
+          347.8320716591502,
+          162
+        ],
+        "flags": {},
+        "order": 27,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 21
+          },
+          {
+            "name": "conditioning",
+            "type": "FASTGEN_CONDITIONING",
+            "link": 22
+          },
+          {
+            "name": "noise",
+            "type": "FASTGEN_NOISE",
+            "link": 24
+          },
+          {
+            "name": "config_overrides",
+            "shape": 7,
+            "type": "STRING",
+            "link": null
+          }
+        ],
+        "outputs": [
+          {
+            "name": "video_latent",
+            "type": "FASTGEN_VIDEO",
+            "links": [
+              54
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenTeacherSample"
+        },
+        "widgets_values": [
+          0
+        ]
+      },
+      {
+        "id": 14,
+        "type": "FastGenStudentSample",
+        "pos": [
+          -256.42566162745123,
+          -285.4494970597684
+        ],
+        "size": [
+          339.9537941173462,
+          162
+        ],
+        "flags": {},
+        "order": 26,
+        "mode": 2,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 17
+          },
+          {
+            "name": "conditioning",
+            "type": "FASTGEN_CONDITIONING",
+            "link": 18
+          },
+          {
+            "name": "noise",
+            "type": "FASTGEN_NOISE",
+            "link": 20
+          },
+          {
+            "name": "config_overrides",
+            "shape": 7,
+            "type": "STRING",
+            "link": null
+          }
+        ],
+        "outputs": [
+          {
+            "name": "video_latent",
+            "type": "FASTGEN_VIDEO",
+            "links": [
+              56
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenStudentSample"
+        },
+        "widgets_values": []
+      },
+      {
+        "id": 30,
+        "type": "FastGenStudentSample",
+        "pos": [
+          -2727.8612351909296,
+          182.2226785756219
+        ],
+        "size": [
+          270,
+          162
+        ],
+        "flags": {},
+        "order": 18,
+        "mode": 2,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 51
+          },
+          {
+            "name": "conditioning",
+            "type": "FASTGEN_CONDITIONING",
+            "link": 49
+          },
+          {
+            "name": "noise",
+            "type": "FASTGEN_NOISE",
+            "link": 48
+          },
+          {
+            "name": "config_overrides",
+            "shape": 7,
+            "type": "STRING",
+            "link": null
+          }
+        ],
+        "outputs": [
+          {
+            "name": "video_latent",
+            "type": "FASTGEN_VIDEO",
+            "links": [
+              52
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenStudentSample"
+        },
+        "widgets_values": []
+      },
+      {
+        "id": 16,
+        "type": "FastGenTeacherSample",
+        "pos": [
+          -2730.198490013315,
+          -41.01698573020292
+        ],
+        "size": [
+          281.26055933584485,
+          162
+        ],
+        "flags": {},
+        "order": 17,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 25
+          },
+          {
+            "name": "conditioning",
+            "type": "FASTGEN_CONDITIONING",
+            "link": 26
+          },
+          {
+            "name": "noise",
+            "type": "FASTGEN_NOISE",
+            "link": 28
+          },
+          {
+            "name": "config_overrides",
+            "shape": 7,
+            "type": "STRING",
+            "link": null
+          }
+        ],
+        "outputs": [
+          {
+            "name": "video_latent",
+            "type": "FASTGEN_VIDEO",
+            "links": [
+              13
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenTeacherSample"
+        },
+        "widgets_values": [
+          0
+        ]
+      },
+      {
+        "id": 35,
+        "type": "FastGenDecodeVideo",
+        "pos": [
+          159.92027778612368,
+          -429.7924940584328
+        ],
+        "size": [
+          1088.7297042541732,
+          740.8013373397953
+        ],
+        "flags": {},
+        "order": 28,
+        "mode": 2,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 57
+          },
+          {
+            "name": "video_latent",
+            "type": "FASTGEN_VIDEO",
+            "link": 56
+          }
+        ],
+        "outputs": [
+          {
+            "name": "image",
+            "type": "IMAGE",
+            "links": null
+          },
+          {
+            "name": "saved_path",
+            "type": "STRING",
+            "links": null
+          },
+          {
+            "name": "audio",
+            "type": "AUDIO",
+            "links": null
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenDecodeVideo"
+        },
+        "widgets_values": [
+          0,
+          "mp4",
+          true,
+          "fastgen/student"
+        ]
+      },
+      {
+        "id": 31,
+        "type": "FastGenDecodeVideo",
+        "pos": [
+          -2413.6886831187194,
+          671.5438884056563
+        ],
+        "size": [
+          857.6976886858719,
+          598.1553485379416
+        ],
+        "flags": {},
+        "order": 20,
+        "mode": 2,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 53
+          },
+          {
+            "name": "video_latent",
+            "type": "FASTGEN_VIDEO",
+            "link": 52
+          }
+        ],
+        "outputs": [
+          {
+            "name": "image",
+            "type": "IMAGE",
+            "links": null
+          },
+          {
+            "name": "saved_path",
+            "type": "STRING",
+            "links": null
+          },
+          {
+            "name": "audio",
+            "type": "AUDIO",
+            "links": null
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenDecodeVideo"
+        },
+        "widgets_values": [
+          -2,
+          "mp4",
+          false,
+          "fastgen/student"
+        ]
+      },
+      {
+        "id": 10,
+        "type": "FastGenDecodeVideo",
+        "pos": [
+          -2419.3309522749782,
+          -48.521653371336924
+        ],
+        "size": [
+          865.765625,
+          673.265625
+        ],
+        "flags": {},
+        "order": 19,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 12
+          },
+          {
+            "name": "video_latent",
+            "type": "FASTGEN_VIDEO",
+            "link": 13
+          }
+        ],
+        "outputs": [
+          {
+            "name": "image",
+            "type": "IMAGE",
+            "links": [
+              10
+            ]
+          },
+          {
+            "name": "saved_path",
+            "type": "STRING",
+            "links": null
+          },
+          {
+            "name": "audio",
+            "type": "AUDIO",
+            "links": null
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenDecodeVideo"
+        },
+        "widgets_values": [
+          0,
+          "mp4",
+          false,
+          "fastgen/teacher"
+        ]
+      },
+      {
+        "id": 34,
+        "type": "FastGenDecodeVideo",
+        "pos": [
+          157.96195625070303,
+          -1223.9413223468234
+        ],
+        "size": [
+          1088.7297042541732,
+          740.8013373397953
+        ],
+        "flags": {},
+        "order": 29,
+        "mode": 0,
+        "inputs": [
+          {
+            "name": "model_bundle",
+            "type": "FASTGEN_MODEL",
+            "link": 55
+          },
+          {
+            "name": "video_latent",
+            "type": "FASTGEN_VIDEO",
+            "link": 54
+          }
+        ],
+        "outputs": [
+          {
+            "name": "image",
+            "type": "IMAGE",
+            "links": null
+          },
+          {
+            "name": "saved_path",
+            "type": "STRING",
+            "links": null
+          },
+          {
+            "name": "audio",
+            "type": "AUDIO",
+            "links": null
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "FastGenDecodeVideo"
+        },
+        "widgets_values": [
+          0,
+          "mp4",
+          true,
+          "fastgen/teacher"
+        ]
+      },
+      {
+        "id": 36,
+        "type": "PrimitiveStringMultiline",
+        "title": "Negative Prompt (empty)",
+        "pos": [
+          -3445.003580140552,
+          545.0
+        ],
+        "size": [
+          291.7579340830116,
+          88
+        ],
+        "flags": {},
+        "order": 30,
+        "mode": 0,
+        "inputs": [],
+        "outputs": [
+          {
+            "name": "STRING",
+            "type": "STRING",
+            "links": [
+              58
+            ]
+          }
+        ],
+        "properties": {
+          "Node name for S&R": "PrimitiveStringMultiline"
+        },
+        "widgets_values": [
+          ""
+        ]
+      }
+    ],
+    "links": [
+      [
+        1,
+        4,
+        0,
+        3,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        2,
+        18,
+        0,
+        4,
+        0,
+        "FASTGEN_CONFIG"
+      ],
+      [
+        5,
+        2,
+        0,
+        7,
+        2,
+        "STRING"
+      ],
+      [
+        6,
+        4,
+        0,
+        7,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        9,
+        8,
+        0,
+        7,
+        3,
+        "IMAGE"
+      ],
+      [
+        10,
+        10,
+        0,
+        8,
+        0,
+        "IMAGE"
+      ],
+      [
+        11,
+        9,
+        0,
+        8,
+        1,
+        "IMAGE"
+      ],
+      [
+        12,
+        11,
+        0,
+        10,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        13,
+        16,
+        0,
+        10,
+        1,
+        "FASTGEN_VIDEO"
+      ],
+      [
+        14,
+        19,
+        0,
+        11,
+        0,
+        "FASTGEN_CONFIG"
+      ],
+      [
+        15,
+        11,
+        0,
+        13,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        16,
+        12,
+        0,
+        25,
+        0,
+        "STRING"
+      ],
+      [
+        17,
+        4,
+        0,
+        14,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        18,
+        7,
+        0,
+        14,
+        1,
+        "FASTGEN_CONDITIONING"
+      ],
+      [
+        20,
+        3,
+        0,
+        14,
+        2,
+        "FASTGEN_NOISE"
+      ],
+      [
+        21,
+        4,
+        0,
+        15,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        22,
+        7,
+        0,
+        15,
+        1,
+        "FASTGEN_CONDITIONING"
+      ],
+      [
+        24,
+        3,
+        0,
+        15,
+        2,
+        "FASTGEN_NOISE"
+      ],
+      [
+        25,
+        11,
+        0,
+        16,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        26,
+        13,
+        0,
+        16,
+        1,
+        "FASTGEN_CONDITIONING"
+      ],
+      [
+        28,
+        17,
+        0,
+        16,
+        2,
+        "FASTGEN_NOISE"
+      ],
+      [
+        29,
+        11,
+        0,
+        17,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        30,
+        5,
+        0,
+        18,
+        0,
+        "STRING"
+      ],
+      [
+        31,
+        20,
+        0,
+        18,
+        1,
+        "STRING"
+      ],
+      [
+        32,
+        21,
+        0,
+        19,
+        0,
+        "STRING"
+      ],
+      [
+        33,
+        20,
+        0,
+        19,
+        1,
+        "STRING"
+      ],
+      [
+        40,
+        8,
+        0,
+        24,
+        1,
+        "IMAGE"
+      ],
+      [
+        41,
+        26,
+        0,
+        25,
+        2,
+        "STRING"
+      ],
+      [
+        42,
+        27,
+        0,
+        24,
+        2,
+        "STRING"
+      ],
+      [
+        43,
+        12,
+        0,
+        24,
+        0,
+        "STRING"
+      ],
+      [
+        44,
+        25,
+        0,
+        28,
+        0,
+        "STRING"
+      ],
+      [
+        45,
+        28,
+        0,
+        13,
+        1,
+        "STRING"
+      ],
+      [
+        46,
+        24,
+        0,
+        29,
+        0,
+        "STRING"
+      ],
+      [
+        47,
+        29,
+        0,
+        7,
+        1,
+        "STRING"
+      ],
+      [
+        48,
+        17,
+        0,
+        30,
+        2,
+        "FASTGEN_NOISE"
+      ],
+      [
+        49,
+        13,
+        0,
+        30,
+        1,
+        "FASTGEN_CONDITIONING"
+      ],
+      [
+        51,
+        11,
+        0,
+        30,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        52,
+        30,
+        0,
+        31,
+        1,
+        "FASTGEN_VIDEO"
+      ],
+      [
+        53,
+        11,
+        0,
+        31,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        54,
+        15,
+        0,
+        34,
+        1,
+        "FASTGEN_VIDEO"
+      ],
+      [
+        55,
+        4,
+        0,
+        34,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        56,
+        14,
+        0,
+        35,
+        1,
+        "FASTGEN_VIDEO"
+      ],
+      [
+        57,
+        4,
+        0,
+        35,
+        0,
+        "FASTGEN_MODEL"
+      ],
+      [
+        58,
+        36,
+        0,
+        13,
+        2,
+        "STRING"
+      ]
+    ],
+    "groups": [],
+    "config": {},
+    "extra": {
+      "ds": {
+        "scale": 0.8140274938684013,
+        "offset": [
+          654.2808739733505,
+          1503.667190634631
+        ]
+      },
+      "frontendVersion": "1.42.11"
+    },
+    "version": 0.4
+  }

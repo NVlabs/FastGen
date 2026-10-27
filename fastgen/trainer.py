@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, Iterable, Mapping
+from itertools import islice
 import os
 import time
 import gc
@@ -11,41 +12,87 @@ from torch.utils.data import DataLoader
 
 from fastgen.methods import FastGenModel
 from fastgen.utils.basic_utils import set_random_seed, set_tmp_random_seed
-from fastgen.utils.checkpointer import Checkpointer, FSDPCheckpointer
+from fastgen.utils.checkpointer import Checkpointer, is_dcp_checkpoint
+from fastgen.utils.io_utils import path_exists
 import fastgen.utils.logging_utils as logger
 from fastgen.configs.config import BaseConfig
 from fastgen.callbacks.callback import CallbackDict
-from fastgen.utils import instantiate, basic_utils
+from fastgen.configs.instantiate import instantiate
+from fastgen.utils import basic_utils
+from fastgen.utils.tree_utils import detach
 import fastgen.utils.distributed.ddp as ddp
 import fastgen.utils.distributed.fsdp as fsdp
-from fastgen.utils.distributed import synchronize, is_rank0, world_size
-import torch.distributed as dist
-from fastgen.utils import set_global_vars, set_temp_global_vars
-from fastgen.utils import global_vars
-from fastgen.utils.autoresume import AutoResumeInterface, create_auto_resume
+from fastgen.utils.distributed import is_rank0, world_size
+from fastgen.utils.distributed.collectives import (
+    broadcast_rank0_result,
+    raise_across_ranks,
+    synced_iter,
+    synchronize,
+    warn_on_rng_state_drift,
+)
+import fastgen.utils.global_vars as global_vars
+from fastgen.utils.global_vars import set_global_vars, set_temp_global_vars
+from fastgen.utils.autoresume import create_auto_resume
+
+
+def should_load_after_fsdp(path: str | None, model_keys: Iterable[str], fsdp_enabled: bool) -> bool:
+    """Whether checkpoint loading should wait until after FSDP wrapping.
+
+    All ranks must call with the same path and FSDP setting. Only rank 0 probes the file;
+    its decision or error is shared with every rank. An unset path or disabled FSDP skips the probe.
+    """
+    if not fsdp_enabled or not path:
+        return False
+    return broadcast_rank0_result(lambda: is_dcp_checkpoint(path, model_keys), "checkpoint load order")
+
+
+def _validate_ema_key_map(key_map: Mapping[str, str], ema_names: Iterable[str]) -> None:
+    """Warn when ``key_map`` loads ``net`` but not every EMA clone of it.
+
+    The clones were copied from ``net`` before the pretrained load and keep its old weights unless the EMA
+    callback re-initializes them, which constant beta with ``start_iter=0`` never does and a non-zero
+    ``resume_iter`` can skip.
+    """
+    unmapped_ema = [name for name in ema_names if name not in key_map]
+    if "net" in key_map and unmapped_ema:
+        logger.warning(
+            f"pretrained_ckpt_key_map loads net but not the EMA module(s) {unmapped_ema}; map them too "
+            "(e.g. {'net': 'net', 'ema': 'ema'}) unless the stale clone is intended."
+        )
 
 
 class Trainer:
-    def __init__(self, config: BaseConfig, auto_resume: Optional[AutoResumeInterface] = None):
+    def __init__(self, config: BaseConfig):
         """
         Initialize the Trainer.
 
         Args:
-            config (BaseConfig): FastGen config
-            auto_resume (Optional[AutoResumeInterface]): Custom auto-resume implementation.
-                If None, defaults to NoOpAutoResume (auto-resume disabled).
+            config (BaseConfig): FastGen config. Auto-resume is built from
+                ``config.trainer.auto_resume`` (defaults to None -> NoOpAutoResume).
                 See fastgen.utils.autoresume for the interface and examples.
         """
+        if config.trainer.ddp and config.trainer.fsdp:
+            raise ValueError("trainer.ddp and trainer.fsdp are mutually exclusive; enable only one of them.")
+        if config.trainer.fsdp and config.trainer.checkpointer.save_adapter_only:
+            raise NotImplementedError("save_adapter_only is not supported with FSDP (DCP checkpointing)")
 
         self.config = config
+        self.fsdp_context: fsdp.FSDPContext | None = None
         set_global_vars(self.config.trainer.global_vars)
 
-        # Initialize auto-resume (defaults to NoOpAutoResume if not provided)
-        self.auto_resume = create_auto_resume(auto_resume)
+        # Initialize auto-resume from ``config.trainer.auto_resume`` (None -> NoOpAutoResume).
+        self.auto_resume = create_auto_resume(self.config.trainer.auto_resume)
         logger.info(f"Auto-resume: {type(self.auto_resume).__name__}")
 
-        # Set random seed
-        set_random_seed(config.trainer.seed, by_rank=True)
+        # Set the random seed identically on every rank. ``train.py`` calls
+        # ``Trainer(config)`` *before* model construction, so this seed also
+        # gates model construction — every rank builds the same initial weights
+        # rather than diverging on PyTorch's non-deterministic process-default
+        # seed. Per-rank-distinct seeding is re-applied below via
+        # ``set_random_seed(..., by_rank=True)`` right before the dataloader and
+        # training loop, which is where data shuffle / augmentation / diffusion
+        # noise / timestep sampling actually need rank-divergent RNG.
+        set_random_seed(config.trainer.seed, by_rank=False)
 
         # Initialize the callback functions.
         logger.info("Initializing callbacks (including wandb)...")
@@ -58,10 +105,7 @@ class Trainer:
 
         # Initialize the checkpointer.
         logger.info("Initializing checkpointer...")
-        if self.config.trainer.fsdp:
-            self.checkpointer = FSDPCheckpointer(self.config.trainer.checkpointer)
-        else:
-            self.checkpointer = Checkpointer(self.config.trainer.checkpointer)
+        self.checkpointer = Checkpointer(self.config.trainer.checkpointer, save_sharded=self.config.trainer.fsdp)
         logger.success("Checkpointer initialized successfully")
 
     def run(
@@ -75,49 +119,60 @@ class Trainer:
             model (FastGenModel): Distillation model.
         """
         logger.info("Starting training")
+        if world_size() > 1 and not (self.config.trainer.ddp or self.config.trainer.fsdp):
+            raise ValueError(
+                f"{world_size()} ranks are running without trainer.ddp or trainer.fsdp, so each rank would train "
+                "an independent replica; enable one of them or launch a single process."
+            )
 
         iter_start = 0
         logger.info("Initializing callbacks and model ...")
         self.callbacks.on_model_init_start(model)
-        if self.config.trainer.checkpointer.pretrained_ckpt_path:
+        pretrained_ckpt_path = self.config.trainer.checkpointer.pretrained_ckpt_path
+        # Monolithic weights load into ordinary modules before wrapping. DCP loads directly into
+        # the prepared shards; inspect once on rank 0 so every rank takes the same setup path.
+        defer_pretrained_ckpt = should_load_after_fsdp(
+            pretrained_ckpt_path,
+            self.config.trainer.checkpointer.pretrained_ckpt_key_map.values(),
+            fsdp_enabled=self.config.trainer.fsdp,
+        )
+        if pretrained_ckpt_path and not defer_pretrained_ckpt:
             # This typically only affects the first job in the auto-resume chain
             self.load_pretrained_ckpt(model)
 
-        if self.config.trainer.fsdp and (
-            self.config.model.precision_amp is not None
-            and self.config.model.precision_amp != self.config.model.precision
-        ):
+        if self.config.trainer.fsdp and self.config.model.precision_amp is not None:
             logger.warning(
-                f"Autocast to {self.config.model.precision_amp} is enabled and FSDP is enabled. "
-                f"While this is possible, it is not recommended."
+                f"Autocast to {self.config.model.precision_amp} is enabled together with FSDP, which already "
+                f"casts parameters to precision_model={model.precision_model} per forward. While this is "
+                "possible, it is not recommended."
+            )
+
+        self.fsdp_context = None
+        if self.config.trainer.fsdp:
+            logger.info("Preparing FSDP context ..")
+            self.fsdp_context = fsdp.create_fsdp_context(
+                reduce_dtype=model.precision_fsdp_reduce,
+                min_num_params=self.config.trainer.fsdp_min_num_params,
+                apply_cpu_offload=self.config.trainer.fsdp_cpu_offload,
+                sharding_group_size=self.config.trainer.fsdp_sharding_group_size,
             )
 
         logger.info("Starting model.on_train_begin ...")
-        synchronize()
-        model.on_train_begin(is_fsdp=self.config.trainer.fsdp)
-        synchronize()
+        model.on_train_begin(fsdp_context=self.fsdp_context)
         logger.info("model.on_train_begin completed")
 
-        # wrap model into DDP or FSDP
-        assert not (
-            self.config.trainer.ddp and self.config.trainer.fsdp
-        ), "Model cannot be wrapped into both DDP and FSDP"
+        # DDP wraps the complete method object. FSDP2 has already modified each selected
+        # component in place during ``on_train_begin``.
         if self.config.trainer.ddp:
             logger.info("Wrapping model into ddp ..")
             model_ddp = ddp.model_to_ddp(model)
             logger.info("DDP wrapping completed")
-        elif self.config.trainer.fsdp:
-            logger.info("Wrapping model into fsdp ..")
-            model_ddp = fsdp.model_to_fsdp(
-                model,
-                min_num_params=self.config.trainer.fsdp_min_num_params,
-                apply_cpu_offload=self.config.trainer.fsdp_cpu_offload,
-                sync_module_states=self.config.model.fsdp_meta_init,
-                sharding_group_size=self.config.trainer.fsdp_sharding_group_size,
-            )
-            logger.info("FSDP wrapping completed")
         else:
             model_ddp = model
+
+        if defer_pretrained_ckpt:
+            logger.info("Loading pretrained checkpoint after FSDP wrapping ..")
+            self.load_pretrained_ckpt(model)
 
         # Compile networks after DDP/FSDP wrapping so torch.compile composes
         # with the distributed wrappers (no-op if torch_compile_mode is None).
@@ -138,7 +193,17 @@ class Trainer:
         logger.info(f"Auto-Resume Details: {auto_resume_details}")
         autoresume_ckpt = auto_resume_details["save_path"] if auto_resume_details else None
 
-        if self.config.trainer.resume or autoresume_ckpt is not None:
+        resume_requested = self.config.trainer.resume or autoresume_ckpt is not None
+        if autoresume_ckpt is not None and not path_exists(self.checkpointer.resolve_load_path(autoresume_ckpt)):
+            # A preemption during the ``latest_ar`` publication leaves the continuation pointing at a
+            # checkpoint that never completed; resume from the newest complete one instead.
+            logger.warning(
+                f"Autoresume checkpoint {autoresume_ckpt} not found; resuming from the latest checkpoint in "
+                f"{self.config.trainer.checkpointer.save_dir}"
+            )
+            autoresume_ckpt = None
+
+        if resume_requested:
             logger.info("Loading checkpoints for resuming ..")
 
             # load previous checkpoint
@@ -153,41 +218,47 @@ class Trainer:
             )
         self.callbacks.on_load_checkpoint_end(model, iteration=iter_start)
 
+        basic_utils.clear_gpu_memory()
+        synchronize()
+
+        # ``reset_parameters`` hooks should not consume randomness, so after the identical seed in
+        # ``__init__`` only rank 0's real meta-init construction may leave the CPU generators unequal.
+        warn_on_rng_state_drift("Before the per-rank reseed", cpu=not self.config.model.meta_init)
+
         # re-seed based on the current iteration for resuming
         set_random_seed(self.config.trainer.seed, iteration=iter_start, by_rank=True)
 
         # resume samplers and initiate the dataloaders
         self.callbacks.on_dataloader_init_start(model, iteration=iter_start)
-        nimg = (
-            iter_start * self.config.dataloader_train.batch_size * self.config.trainer.grad_accum_rounds * world_size()
-        )
-        for loader in ["dataloader_train", "dataloader_val"]:
-            dataloader_config = getattr(self.config, loader, None)
-            if getattr(dataloader_config, "sampler_start_idx", 0) is None:
-                logger.info(f"Setting sampler start index to {nimg} images for {loader}")
-                dataloader_config.sampler_start_idx = nimg
+        self.resolve_sampler_start_idx(iter_start)
 
         logger.info("Instantiating dataloader...")
         dataloader_train = instantiate(self.config.dataloader_train)
-        dataloader_val = (
-            instantiate(self.config.dataloader_val) if getattr(self.config, "dataloader_val", None) else None
-        )
+        dataloader_val = instantiate(self.config.dataloader_val) if self.config.dataloader_val else None
         augment_pipe = instantiate(self.config.trainer.augment_pipe)
         self.callbacks.on_dataloader_init_end(model, dataloader_train, dataloader_val, iteration=iter_start)
 
         self.callbacks.on_train_begin(model, iteration=iter_start)
         logger.info(f"iter_start: {iter_start}")
+        if iter_start > 0 and iter_start >= self.config.trainer.max_iter:
+            logger.warning(
+                f"Resumed at iteration {iter_start}, which already reaches trainer.max_iter="
+                f"{self.config.trainer.max_iter}; nothing is left to train."
+            )
 
         if iter_start == 0 and dataloader_val is not None:
             # validation before first training step
             self.validate(model_ddp, model, dataloader_val, iteration=iter_start)
 
-        dataloader_train_iter = iter(dataloader_train)
-        for iter_cur in range(iter_start + 1, self.config.trainer.max_iter):
+        dataloader_train_iter = synced_iter(dataloader_train, device=model.device)
+        # ``max_iter`` is inclusive, so the final checkpoint, labelled with the last completed iteration,
+        # holds the state after ``max_iter`` optimizer iterations.
+        iter_cur = iter_start
+        for iter_cur in range(iter_start + 1, self.config.trainer.max_iter + 1):
             self.callbacks.on_training_step_begin(model, iteration=iter_cur)
             for grad_accum_iter in range(self.config.trainer.grad_accum_rounds):
                 data = next(dataloader_train_iter)
-                data = self.preprocess_data(model, data, augment_pipe)
+                data = model.prepare_batch(data, augment_pipe)
                 logger.debug(
                     f"iteration: {iter_cur} | grad_accum_iter: {grad_accum_iter} | data: {basic_utils.to_str(data)}"
                 )
@@ -195,7 +266,14 @@ class Trainer:
                 # single training step
                 self.callbacks.on_training_accum_step_begin(model, data, iteration=iter_cur, accum_iter=grad_accum_iter)
                 loss_map, outputs = self.train_step(model_ddp, model, data, iter_cur, grad_accum_iter)
+                self.callbacks.on_training_accum_step_end(
+                    model, data, outputs, iteration=iter_cur, accum_iter=grad_accum_iter
+                )
 
+            # Not every root forwarded during a training step participates in backward. In
+            # particular, auxiliary updates may run a frozen student under no_grad. Establish
+            # sharded callback inputs once at this phase boundary.
+            model.reshard_fsdp_modules()
             self.callbacks.on_training_step_end(
                 model=model,
                 data_batch=data,
@@ -203,19 +281,21 @@ class Trainer:
                 loss_dict=loss_map,
                 iteration=iter_cur,
             )
+            is_final_iter = iter_cur == self.config.trainer.max_iter
 
             # validation
-            if iter_cur % self.config.trainer.validation_iter == 0 and dataloader_val is not None:
+            if (is_final_iter or iter_cur % self.config.trainer.validation_iter == 0) and dataloader_val is not None:
                 self.validate(model_ddp, model, dataloader_val, iteration=iter_cur)
 
             # save checkpoint
             just_saved_checkpoint = False
             latest_checkpoint_path = None
-            if iter_cur % self.config.trainer.save_ckpt_iter == 0:
+            if is_final_iter or iter_cur % self.config.trainer.save_ckpt_iter == 0:
                 latest_checkpoint_path = self.save_checkpoint(model, iter_cur)
                 just_saved_checkpoint = True
 
-            if self.auto_resume_exit(
+            # The run is complete and saved after the final iteration, so a termination request needs no continuation.
+            if not is_final_iter and self.auto_resume_exit(
                 model, iter_cur, skip_if_just_saved=just_saved_checkpoint, recent_checkpoint_path=latest_checkpoint_path
             ):
                 # termination requested
@@ -226,12 +306,8 @@ class Trainer:
                 return
 
         logger.info("Training complete.")
-        # validation in the end
-        if dataloader_val is not None:
-            self.validate(model_ddp, model, dataloader_val, iteration=self.config.trainer.max_iter)
-        self.save_checkpoint(model, self.config.trainer.max_iter)
-        self.callbacks.on_train_end(model, iteration=self.config.trainer.max_iter)
-        self.callbacks.on_app_end(model, iteration=self.config.trainer.max_iter)
+        self.callbacks.on_train_end(model, iteration=iter_cur)
+        self.callbacks.on_app_end(model, iteration=iter_cur)
         logger.info("Taking a 10 sec nap and exiting training.")
         time.sleep(10)
 
@@ -240,35 +316,47 @@ class Trainer:
         Load pretrained model weights from a checkpoint.
         """
         key_map = self.config.trainer.checkpointer.pretrained_ckpt_key_map
-        # use FSDP checkpointer to load the pretrained checkpoint
-        # (which falls back to the basic checkpointer if the checkpoint ends with .pth)
-        _checkpointer = FSDPCheckpointer(self.config.trainer.checkpointer)
+        _validate_ema_key_map(key_map, getattr(model, "use_ema", None) or ())
+        # The format-aware checkpointer accepts the same .pth path for both formats.
+        pretrained_ckpt_path = self.config.trainer.checkpointer.pretrained_ckpt_path
         resume_iter = None
         for k_model, k_ckpt in key_map.items():
             if hasattr(model, k_model):
                 model_dict = torch.nn.ModuleDict({k_ckpt: getattr(model, k_model)})
-                resume_iter = _checkpointer.load(
+                resume_iter = self.checkpointer.load(
                     model_dict,
-                    path=self.config.trainer.checkpointer.pretrained_ckpt_path,
+                    path=pretrained_ckpt_path,
                     device=device,
+                    strict=False,
                 )
                 logger.info(
-                    f"Loaded {k_model} model from {k_ckpt} in {self.config.trainer.checkpointer.pretrained_ckpt_path} "
-                    f"at iteration {resume_iter}"
+                    f"Loaded {k_model} model from {k_ckpt} in {pretrained_ckpt_path} at iteration {resume_iter}"
                 )
             else:
                 logger.warning(
-                    f"Model does not have submodule {k_model}. Skipping loading {k_ckpt} from "
-                    f"{self.config.trainer.checkpointer.pretrained_ckpt_path}."
+                    f"Model does not have submodule {k_model}. Skipping loading {k_ckpt} from {pretrained_ckpt_path}."
                 )
         if resume_iter is not None:
             logger.info(f"Setting resume_iter for model to {resume_iter}.")
             model.resume_iter = resume_iter
 
+    def resolve_sampler_start_idx(self, iteration: int) -> None:
+        """
+        Resolve unset (``None``) dataloader sampler start indices for a run starting at ``iteration``.
+        """
+        nimg = (
+            iteration * self.config.dataloader_train.batch_size * self.config.trainer.grad_accum_rounds * world_size()
+        )
+        if getattr(self.config.dataloader_train, "sampler_start_idx", 0) is None:
+            logger.info(f"Setting sampler start index to {nimg} images for dataloader_train")
+            self.config.dataloader_train.sampler_start_idx = nimg
+        # Only the training stream consumed ``nimg`` samples, so the validation loader starts at its beginning.
+        if self.config.dataloader_val and getattr(self.config.dataloader_val, "sampler_start_idx", 0) is None:
+            self.config.dataloader_val.sampler_start_idx = 0
+
     def save_checkpoint(self, model: FastGenModel, iteration: int, path: str | None = None) -> str:
         logger.info(f"Saving checkpoint iteration {iteration}")
         self.callbacks.on_save_checkpoint_start(model, iteration=iteration)
-        # awaken the dataloader to avoid timeout
         path = self.checkpointer.save(
             model.model_dict,
             optimizer_dict=model.optimizer_dict,
@@ -299,7 +387,7 @@ class Trainer:
         Single training step
 
         Args:
-            model_ddp (FastGenModel | torch.nn.parallel.DistributedDataParallel): Distillation model with ddp wraaper.
+            model_ddp (FastGenModel | torch.nn.parallel.DistributedDataParallel): Distillation model with ddp wrapper.
             model (FastGenModel): Distillation model.
             data (Dict[str, Any]): Data dict for the current iteration.
             iteration: Current training iteration
@@ -341,7 +429,7 @@ class Trainer:
             model.optimizers_zero_grad(iteration)
 
         # detach loss_map and outputs
-        return basic_utils.detach(loss_map), basic_utils.detach(outputs)
+        return detach(loss_map), detach(outputs)
 
     @torch.no_grad()
     def validate(
@@ -359,14 +447,10 @@ class Trainer:
             ):
                 self.callbacks.on_validation_begin(model, iteration=iteration, idx=idx)
                 logger.info(f"Validation iteration {iteration}")
-                for step, data in enumerate(dataloader_val):
-                    if getattr(global_vars, "MAX_VAL_STEPS", None) is not None and step >= getattr(
-                        global_vars, "MAX_VAL_STEPS"
-                    ):
-                        break
-
+                batches = synced_iter(dataloader_val, device=model.device)
+                for step, data in enumerate(islice(batches, getattr(global_vars, "MAX_VAL_STEPS", None))):
+                    data = model.prepare_batch(data)
                     self.callbacks.on_validation_step_begin(model, data, step=step, iteration=iteration, idx=idx)
-                    data = self.preprocess_data(model, data)
                     logger.debug(f"iteration: {iteration} | validation step: {step} | data: {basic_utils.to_str(data)}")
                     with model.autocast():
                         loss_map, outputs = model_ddp.single_train_step(data, iteration)
@@ -376,118 +460,16 @@ class Trainer:
                 self.callbacks.on_validation_end(model, iteration=iteration, idx=idx)
                 synchronize()
 
-    @torch.no_grad()
-    def preprocess_data(
-        self, model: FastGenModel, data: Dict[str, Any], augment_pipe: Optional[Callable] = None
-    ) -> Dict[str, Any]:
-        """
-        Preprocess the data before passing to the model.
-        Args:
-            model: FastGenModel
-            data: Dict[str, Any]
-
-        Returns:
-            Dict[str, Any]: Preprocessed data
-
-        """
-        ctx = dict(device=model.device, dtype=model.precision)
-        data = basic_utils.to(data, **ctx)
-        if augment_pipe is not None:
-            data = augment_pipe(data)
-
-        # we do not use torch.inference_mode here since resulting inference tensors
-        # give runtime errors with gradient computations/checkpointing
-        with torch.autocast(
-            device_type=model.device.type, dtype=model.precision_amp_enc, enabled=model.precision_amp_enc is not None
-        ):
-            # Data/noise
-            raw = "{}_raw".format
-            for k in ["real", "noise"]:
-                if k in data and raw(k) not in data:
-                    data[raw(k)] = data[k]
-                    # dataloader returns real of shape [B, C, T, H, W]
-                    if hasattr(model.net, "vae") and data[k].shape[1] != model.input_shape[0]:
-                        # Encode the data/noise to latent space
-                        data[k] = model.net.vae.encode(data[k])
-
-            # Text conditions
-            for k in ["condition", "neg_condition"]:
-                if k in data and raw(k) not in data:
-                    data[raw(k)] = data[k]
-                    if hasattr(model.net, "text_encoder") and isinstance(data[k], List):
-                        # Encode the prompt to embedding
-                        data[k] = model.net.text_encoder.encode(data[k])
-
-            # Context for i2v/vid2vid
-            if "real_raw" in data:
-                if getattr(model.net, "is_i2v", False):  # extra vid context for i2v
-                    # compute input for I2V models
-                    real_raw_first_frame = data["real_raw"][:, :, 0:1]
-                    bsz, channels = real_raw_first_frame.shape[0:2]
-                    num_frames, height, width = data["real_raw"].shape[2:]
-                    first_frame_cond = real_raw_first_frame
-
-                    # Wan 2.1 I2V model concatenates first_frame_cond with noisy latents and mask.
-                    # Wan 2.2 5B model replaces the first noisy latent frame with the first clean latent frame.
-                    if model.net.concat_mask:
-                        padding_shape = (bsz, channels, num_frames - 1, height, width)
-                        first_frame_cond = torch.cat(
-                            [real_raw_first_frame, real_raw_first_frame.new_zeros(*padding_shape)], dim=2
-                        )
-
-                    if hasattr(model.net, "vae"):
-                        # Official Wan I2V implementation uses the VAE encoder with "argmax" mode to avoid stochasticity
-                        data["first_frame_cond"] = model.net.vae.encode(first_frame_cond, mode="argmax")
-                    else:
-                        data["first_frame_cond"] = first_frame_cond
-                        if model.net.concat_mask:
-                            logger.debug(
-                                "Consider using a pixel-space dataloader: "
-                                "Current latent dataloader uses latent zeros for image condition "
-                                "while pretrained Wan2.1 I2V uses VAE-encoded zeros."
-                            )
-
-                if hasattr(model.net, "image_encoder"):
-                    # Encode the first video frame with CLIP
-                    data["encoder_hidden_states_image"] = model.net.image_encoder.encode(data["real_raw"][:, :, 0])
-
-                if getattr(model.net, "is_vid2vid", False):  # extra vid context for vid2vid
-                    assert hasattr(
-                        model.net, "prepare_vid_conditioning"
-                    ), "model.net must have prepare_vid_conditioning method"
-                    if "depth_latent" in data:
-                        data["vid_context"] = model.net.prepare_vid_conditioning(
-                            data["real_raw"], condition_latents=data["depth_latent"]
-                        )
-                    else:
-                        data["vid_context"] = model.net.prepare_vid_conditioning(data["real_raw"])
-
-                # Cosmos video2world conditioning: use first a few frames as conditioning
-                if getattr(model.net, "is_video2world", False):
-                    num_cond_frames = getattr(model.net, "num_conditioning_frames", 1)
-                    real_raw_first_frames = data["real_raw"][:, :, :num_cond_frames]
-                    bsz, channels, _, height, width = data["real_raw"].shape
-
-                    # Encode conditioning frames with VAE
-                    if hasattr(model.net, "vae"):
-                        data["conditioning_latents"] = model.net.vae.encode(real_raw_first_frames, mode="argmax")
-                    else:
-                        data["conditioning_latents"] = real_raw_first_frames
-
-                    # Create condition mask: 1 for conditioning frames, 0 for generated frames
-                    t_latent = data["real"].shape[2]
-                    t_cond_latent = data["conditioning_latents"].shape[2]
-                    condition_mask = torch.zeros(bsz, 1, t_latent, height // 8, width // 8, device=data["real"].device)
-                    condition_mask[:, :, :t_cond_latent] = 1.0
-                    data["condition_mask"] = condition_mask
-
-        # Move encoded data to dtype and device
-        data = basic_utils.to(data, **ctx)
-
-        return data
+        # Validation has no backward pass to release roots configured with
+        # reshard_after_forward=False. Restore shards before checkpointing or training resumes.
+        model.reshard_fsdp_modules()
 
     def auto_resume_exit(
-        self, model: FastGenModel, iteration: int, skip_if_just_saved: bool = False, recent_checkpoint_path: str = None
+        self,
+        model: FastGenModel,
+        iteration: int,
+        skip_if_just_saved: bool = False,
+        recent_checkpoint_path: str | None = None,
     ) -> bool:
         """
         Check if the training should be terminated and auto-resume should be triggered.
@@ -502,23 +484,11 @@ class Trainer:
             bool: True if the training should be terminated, False otherwise
 
         """
-        # Check termination on rank 0 and broadcast to all ranks
-        termination_requested = False
-
-        # Ensure all ranks are ready before rank 0 checks termination
-        synchronize()
-
-        if is_rank0():
-            termination_requested = self.auto_resume.termination_requested()
-
-        # Broadcast the decision from rank 0 to all other ranks
-        if world_size() > 1:
-            termination_tensor = torch.tensor([1.0 if termination_requested else 0.0], device=model.device)
-            dist.broadcast(termination_tensor, src=0)
-            termination_requested = termination_tensor.item() > 0.5
-
-        # Ensure all ranks have received the broadcast before proceeding
-        synchronize()
+        termination_requested = broadcast_rank0_result(
+            lambda: bool(self.auto_resume.termination_requested()),
+            "autoresume termination poll",
+            device=model.device,
+        )
 
         if not termination_requested:
             return False
@@ -541,14 +511,13 @@ class Trainer:
             else:
                 # Fallback: construct the path (this should rarely happen)
                 logger.warning("No recent checkpoint path provided, constructing path")
-                if isinstance(self.checkpointer, FSDPCheckpointer):
-                    save_path = os.path.join(self.config.trainer.checkpointer.save_dir, f"{iteration:07d}")
-                else:
-                    save_path = os.path.join(self.config.trainer.checkpointer.save_dir, f"{iteration:07d}.pth")
+                save_path = self.checkpointer.resolve_save_path(path=None, iteration=iteration)
             ar_details["save_path"] = save_path
 
-        if is_rank0():
-            self.auto_resume.request_resume(user_dict=ar_details)
+        # Rank-0-only I/O: fail every rank together instead of letting the peers run the end-of-training callbacks.
+        with raise_across_ranks("autoresume resume request"):
+            if is_rank0():
+                self.auto_resume.request_resume(user_dict=ar_details)
 
         logger.info("Autoresume requested. Terminating training.")
         return True

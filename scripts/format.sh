@@ -1,20 +1,16 @@
 #!/bin/bash
+
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 # Script to automatically format code and files
 
-fastgen_root=$(git rev-parse --show-toplevel)
+# Run from the repository root, wherever the script is called from.
+fastgen_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$fastgen_root" || exit 1
 echo "Formatting $fastgen_root"
 
-dependencies=($(pip3 freeze | grep -E 'black==23.10.0|ruff==0.6.9|mypy==1.9.0|types-psutil'))
-if [ "${#dependencies[@]}" -ne 6 ]; then
-    python3 -m pip install --upgrade pip
-    python3 -m pip install black==23.10.0
-    python3 -m pip install ruff==0.6.9
-    python3 -m pip install mypy==1.9.0
-    python3 -m pip install types-psutil
-fi
 set -e
 
+make install-linters
 make format

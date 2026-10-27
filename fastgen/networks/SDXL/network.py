@@ -14,11 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Any, Optional, List, Set
 import types
 import torch
-from torch import dtype
 from torch.distributed.fsdp import fully_shard
 
 from diffusers import UNet2DConditionModel, AutoencoderKL
@@ -30,46 +28,47 @@ from diffusers.models.unets.unet_2d_blocks import (
     UNetMidBlock2DCrossAttn,
 )
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
-from fastgen.networks.network import FastGenNetwork
+from fastgen.networks.network import FastGenNetwork, FastGenModule
 from fastgen.networks.SD15.network import classify_forward
-from fastgen.networks.noise_schedule import NET_PRED_TYPES
-from fastgen.utils.basic_utils import str2bool
 from fastgen.utils.distributed.fsdp import apply_fsdp_checkpointing
+from fastgen.utils.guidance import GuidanceConfig, predict_with_guidance
+from fastgen.utils.tree_utils import OutputDtype, assert_same
+from fastgen.utils.env import hf_load
 import fastgen.utils.logging_utils as logger
 
 
-class SDXLTextEncoder:
-    def __init__(self, model_id):
-        self.text_encoder_one = CLIPTextModel.from_pretrained(
-            model_id,
+class SDXLTextEncoder(FastGenModule):
+    def __init__(self, model_id_or_local_path):
+        super().__init__()
+        self.text_encoder_one = hf_load(
+            CLIPTextModel.from_pretrained,
+            model_id_or_local_path,
             subfolder="text_encoder",
-            cache_dir=os.environ["HF_HOME"],
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
+            # Reference is fp16 (StableDiffusionXLPipeline); `dtype="auto"` would also give
+            # fp16 (fp16 checkpoint). Keeping fp32 for parity with prior FastGen versions.
+            dtype=torch.float32,
         )
-        self.text_encoder_one.eval().requires_grad_(False)
 
-        self.text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
-            model_id,
+        self.text_encoder_two = hf_load(
+            CLIPTextModelWithProjection.from_pretrained,
+            model_id_or_local_path,
             subfolder="text_encoder_2",
-            cache_dir=os.environ["HF_HOME"],
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
+            # Same as text_encoder above: reference fp16, `dtype="auto"` fp16, kept fp32.
+            dtype=torch.float32,
         )
-        self.text_encoder_two.eval().requires_grad_(False)
 
-        self.tokenizer_one = CLIPTokenizer.from_pretrained(
-            model_id,
+        self.tokenizer_one = hf_load(
+            CLIPTokenizer.from_pretrained,
+            model_id_or_local_path,
             subfolder="tokenizer",
-            cache_dir=os.environ["HF_HOME"],
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
         )
-        self.tokenizer_two = CLIPTokenizer.from_pretrained(
-            model_id,
+        self.tokenizer_two = hf_load(
+            CLIPTokenizer.from_pretrained,
+            model_id_or_local_path,
             subfolder="tokenizer_2",
-            cache_dir=os.environ["HF_HOME"],
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
         )
 
-    def encode(self, conditioning: Optional[Any] = None, precision: dtype = torch.float32) -> List[torch.Tensor]:
+    def encode(self, conditioning: Optional[Any] = None) -> List[torch.Tensor]:
         text_input_ids_one = self.tokenizer_one(
             conditioning,
             padding="max_length",
@@ -86,19 +85,26 @@ class SDXLTextEncoder:
             return_tensors="pt",
         ).input_ids
 
+        return self(text_input_ids_one.to(self.device), text_input_ids_two.to(self.device))
+
+    def forward(
+        self,
+        text_input_ids_one: torch.Tensor,
+        text_input_ids_two: torch.Tensor,
+    ) -> List[torch.Tensor]:
         prompt_embeds_list = []
 
         for text_input_ids, text_encoder in zip(
             [text_input_ids_one, text_input_ids_two], [self.text_encoder_one, self.text_encoder_two]
         ):
             prompt_embeds = text_encoder(
-                text_input_ids.to(text_encoder.device),
+                text_input_ids,
                 output_hidden_states=True,
             )
 
-            pooled_prompt_embeds = prompt_embeds[0].to(precision)
+            pooled_prompt_embeds = prompt_embeds[0]
 
-            prompt_embeds = prompt_embeds.hidden_states[-2].to(precision)
+            prompt_embeds = prompt_embeds.hidden_states[-2]
             bs_embed, seq_len, _ = prompt_embeds.shape
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
             prompt_embeds_list.append(prompt_embeds)
@@ -110,64 +116,75 @@ class SDXLTextEncoder:
 
         return [prompt_embeds, pooled_prompt_embeds]
 
-    def to(self, *args, **kwargs):
-        """
-        Moves the model to the specified device.
-        """
-        self.text_encoder_one.to(*args, **kwargs)
-        self.text_encoder_two.to(*args, **kwargs)
-        return self
 
+class SDXLImageEncoder(FastGenModule):
+    """SDXL VAE with the reference FP32 latent-normalization boundary.
 
-class SDXLImageEncoder:
+    The original Stability SGM first stage remains FP32 with first-stage autocast
+    explicitly disabled. ``DiffusionEngine`` owns the scale outside ``AutoencoderKL``
+    and applies it in FP32. FastGen keeps a released ``force_upcast`` VAE at that
+    boundary, scales in the VAE dtype and returns the result in it, and enters the VAE
+    dtype before reversing the scale.
+    """
+
     def __init__(
         self,
-        model_id: str,
+        model_id_or_local_path: str,
     ):
-        self.vae: AutoencoderKL = AutoencoderKL.from_pretrained(
-            model_id,
-            subfolder="vae",
-            cache_dir=os.environ["HF_HOME"],
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        # We never update the encoder, so freeze it
-        self.vae.eval().requires_grad_(False)
+        super().__init__()
+        self.vae: AutoencoderKL = hf_load(AutoencoderKL.from_pretrained, model_id_or_local_path, subfolder="vae")
+
+    @property
+    def precision_model(self) -> Optional[torch.dtype]:
+        """Keep VAEs that require upcasting in FP32; otherwise honor the requested precision."""
+        if getattr(self.vae.config, "force_upcast", False):
+            return torch.float32
+        return super().precision_model
+
+    @property
+    def latent_compression_factors(self) -> tuple[int, int]:
+        """Pixel-to-latent ``(H, W)`` downsampling of the VAE: 8x for SDXL (a 1024x1024 image -> 128x128 latent).
+
+        Every down block but the last halves the resolution, as in the reference pipeline's ``vae_scale_factor``.
+        """
+        factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        return (factor, factor)
 
     def encode(self, real_images: torch.Tensor) -> torch.Tensor:
-        latent_images = self.vae.encode(real_images, return_dict=False)[0].sample()
-
-        return latent_images * self.vae.config.scaling_factor
+        return self(real_images, operation="encode")
 
     def decode(self, latent_images: torch.Tensor) -> torch.Tensor:
-        latents = 1 / self.vae.config.scaling_factor * latent_images
-        images = self.vae.decode(latents, return_dict=False)[0].clip_(-1.0, 1.0)
-        return images
+        return self(latent_images, operation="decode")
 
-    def to(self, *args, **kwargs):
-        """
-        Moves the model to the specified device.
-        """
-        self.vae.to(*args, **kwargs)
-        return self
+    def forward(self, data: torch.Tensor, operation: str) -> torch.Tensor:
+        if operation == "encode":
+            latent_images = self.vae.encode(data.to(dtype=self.precision_model), return_dict=False)[0].sample()
+            return latent_images * self.vae.config.scaling_factor
+        if operation == "decode":
+            latents = 1 / self.vae.config.scaling_factor * data.to(dtype=self.precision_model)
+            images = self.vae.decode(latents, return_dict=False)[0]
+            return images.clip_(-1.0, 1.0)
+        raise ValueError(f"Unsupported preprocessor operation: {operation!r}")
 
 
 class StableDiffusionXL(FastGenNetwork):
     """A StableDiffusion XL teacher model for text-to-image diffusion distillation."""
 
     MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+    latent_compression_factors = (8, 8)
 
     def __init__(
         self,
-        model_id: str = MODEL_ID,
+        model_id_or_local_path: str = MODEL_ID,
         net_pred_type="eps",
         schedule_type="sdxl",
         load_pretrained: bool = True,
-        **model_kwargs,
+        **schedule_kwargs,
     ):
         """StableDiffusion score model constructor.
 
         Args:
-            model_id (str, optional): The huggingface model ID to load.
+            model_id_or_local_path (str, optional): The huggingface model ID or local path to load.
                 Defaults to "stabilityai/stable-diffusion-xl-base-1.0".
             net_pred_type (str, optional): Prediction type. Defaults to "eps".
             schedule_type (str, optional): Schedule type. Defaults to "sdxl".
@@ -175,25 +192,23 @@ class StableDiffusionXL(FastGenNetwork):
                 Defaults to True.
         """
         # Initialize FastGenNetwork with SDXL-specific defaults
-        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **model_kwargs)
+        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **schedule_kwargs)
 
-        self.model_id = model_id
+        self.model_id_or_local_path = model_id_or_local_path
 
         # Initialize the network (handles meta device and pretrained loading)
-        self._initialize_network(model_id, load_pretrained)
-
-        self.add_time_ids = self.build_condition_input(1024)
+        self._initialize_network(model_id_or_local_path, load_pretrained)
 
         self.unet.forward = types.MethodType(classify_forward, self.unet)
         self.unet.enable_gradient_checkpointing()
 
         torch.cuda.empty_cache()
 
-    def _initialize_network(self, model_id: str, load_pretrained: bool) -> None:
+    def _initialize_network(self, model_id_or_local_path: str, load_pretrained: bool) -> None:
         """Initialize the UNet network.
 
         Args:
-            model_id: The HuggingFace model ID or local path.
+            model_id_or_local_path: The HuggingFace model ID or local path.
             load_pretrained: Whether to load pretrained weights.
         """
         # Check if we're in a meta context (for FSDP memory-efficient loading)
@@ -202,20 +217,18 @@ class StableDiffusionXL(FastGenNetwork):
 
         if should_load_weights:
             logger.info("Loading SDXL UNet from pretrained")
-            self.unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
-                model_id,
+            self.unet: UNet2DConditionModel = hf_load(
+                UNet2DConditionModel.from_pretrained,
+                model_id_or_local_path,
                 subfolder="unet",
-                cache_dir=os.environ["HF_HOME"],
-                local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
             )
         else:
             # Load config and create model structure
             # If we're in a meta context, tensors will automatically be on meta device
-            config = UNet2DConditionModel.load_config(
-                model_id,
-                cache_dir=os.environ["HF_HOME"],
+            config = hf_load(
+                UNet2DConditionModel.load_config,
+                model_id_or_local_path,
                 subfolder="unet",
-                local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
             )
             if in_meta_context:
                 logger.info("Initializing SDXL UNet on meta device (zero memory, will receive weights via FSDP sync)")
@@ -224,39 +237,11 @@ class StableDiffusionXL(FastGenNetwork):
                 logger.warning("SDXL UNet being initialized from config. No weights are loaded!")
             self.unet: UNet2DConditionModel = UNet2DConditionModel.from_config(config)
 
-        # Add logvar_linear layer
-        self.unet.logvar_linear = torch.nn.Linear(1280, 1)
-
-    def reset_parameters(self):
-        """Reinitialize parameters for FSDP meta device initialization.
-
-        This is required when using meta device initialization for FSDP2.
-        Reinitializes all linear and convolutional layers.
-        """
-        import torch.nn as nn
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.02)
-
-        super().reset_parameters()
-
-        logger.debug("Reinitialized SDXL parameters")
+        # Logvar head on the time embedding (``time_embed_dim`` wide; 1280 for the released UNets).
+        self.unet.logvar_linear = torch.nn.Linear(self.unet.time_embedding.linear_2.out_features, 1)
 
     def fully_shard(self, **kwargs):
-        """Fully shard the SDXL network for FSDP.
-
-        Note: We shard `self.unet` instead of `self` because the network wrapper
-        class may have complex multiple inheritance with ABC, which causes Python's
-        __class__ assignment to fail due to incompatible memory layouts.
+        """Shard ``self.unet``; see ``FastGenNetwork.fully_shard``.
 
         SDXL uses a U-Net architecture with:
         - down_blocks: Encoder blocks (CrossAttnDownBlock2D, DownBlock2D)
@@ -271,71 +256,57 @@ class StableDiffusionXL(FastGenNetwork):
             UNetMidBlock2DCrossAttn,
         )
 
-        # Note: Checkpointing has to happen first, for proper casting during backward pass recomputation.
-        if hasattr(self.unet, "gradient_checkpointing") and self.unet.gradient_checkpointing:
+        # Checkpointing has to happen first, for proper casting during backward pass recomputation.
+        # Diffusers keeps the checkpointing flag on the blocks, so query the U-Net root's property.
+        if self.unet.is_gradient_checkpointing:
             self.unet.disable_gradient_checkpointing()
-            apply_fsdp_checkpointing(self.unet, check_fn=lambda block: isinstance(block, unet_block_types))
-            logger.info("Applied FSDP activation checkpointing to SDXL U-Net blocks")
+            apply_fsdp_checkpointing(self.unet, unet_block_types)
 
-        # Shard down blocks
         for block in self.unet.down_blocks:
             fully_shard(block, **kwargs)
-
-        # Shard mid block
-        if hasattr(self.unet, "mid_block") and self.unet.mid_block is not None:
+        if self.unet.mid_block is not None:
             fully_shard(self.unet.mid_block, **kwargs)
-
-        # Shard up blocks
         for block in self.unet.up_blocks:
             fully_shard(block, **kwargs)
-
         fully_shard(self.unet, **kwargs)
 
     def init_preprocessors(self):
         """Initialize the text and image encoders for the SDXL model."""
-        if not hasattr(self, "text_encoder"):
+        if "text_encoder" not in self.preprocessors:
             self.init_text_encoder()
-        if not hasattr(self, "vae"):
+        if "vae" not in self.preprocessors:
             self.init_vae()
 
     def init_text_encoder(self):
         """Initialize the text encoder for SDXL model."""
-        self.text_encoder = SDXLTextEncoder(model_id=self.model_id)
+        self.preprocessors["text_encoder"] = SDXLTextEncoder(model_id_or_local_path=self.model_id_or_local_path)
 
     def init_vae(self):
         """Initialize the image encoder for SDXL model."""
-        self.vae = SDXLImageEncoder(model_id=self.model_id)
+        self.preprocessors["vae"] = SDXLImageEncoder(model_id_or_local_path=self.model_id_or_local_path)
 
-    def to(self, *args, **kwargs):
-        """
-        Moves the model to the specified device.
-        """
-        super().to(*args, **kwargs)
-        if hasattr(self, "text_encoder"):
-            self.text_encoder.to(*args, **kwargs)
-        if hasattr(self, "vae"):
-            self.vae.to(*args, **kwargs)
-        return self
+    def build_condition_input(self, height: int, width: int, device: Optional[torch.device] = None) -> torch.Tensor:
+        """Return SDXL's micro-conditioning ``time_ids`` for ``height x width`` pixel images, ``[1, 6]``.
 
-    def build_condition_input(self, resolution):
-        original_size = (resolution, resolution)
-        target_size = (resolution, resolution)
+        Original and target size are ``(height, width)`` and the crop is ``(0, 0)``, the reference
+        pipeline's defaults.
+        """
+        original_size = (height, width)
+        target_size = (height, width)
         crop_top_left = (0, 0)
-
-        add_time_ids = list(original_size + crop_top_left + target_size)
-        add_time_ids = torch.tensor([add_time_ids], dtype=torch.float32)
-        return add_time_ids
+        return torch.tensor([original_size + crop_top_left + target_size], dtype=torch.float32, device=device)
 
     def forward(
         self,
         x_t: torch.FloatTensor,
         t: torch.Tensor,
         condition: Optional[List[torch.Tensor]] = None,
-        r: Optional[torch.Tensor] = None,
         return_features_early: bool = False,
         feature_indices: Optional[Set[int]] = None,
         return_logvar: bool = False,
         fwd_pred_type: Optional[str] = None,
+        apply_output_conditioning: bool = True,
+        output_dtype: OutputDtype = "same",
         **fwd_kwargs,
     ):
         """Forward pass of the StableDiffusion latent diffusion score model.
@@ -344,41 +315,46 @@ class StableDiffusionXL(FastGenNetwork):
             x_t (torch.Tensor): The diffused data sample.
             t (torch.Tensor): The current timestep.
             condition (list[torch.Tensor]): Optional conditioning information.  Defaults to None.
-            r (torch.Tensor): Another timestep mainly used by meanflow.
             return_features_early: If true, the forward pass returns the features once the set is complete.
                 This means the forward pass will not finish completely and no final output is returned.
             feature_indices: A set of feature indices (a set of integers) decides which blocks
-                to extract features from. If the set is non-empty, then features will be returned.
-                By default, feature_indices=None means extract no features.
-            return_logvar: If true, the foward pass returns the logvar.
+                to extract features from. Any provided set returns a feature list alongside the output,
+                including an empty list for an empty set. None returns only the model output.
+            return_logvar: If true, the forward pass returns the logvar.
             fwd_pred_type: Update the network prediction type, must be in ['x0', 'eps', 'v', 'flow'].
                 None means using the original net_pred_type.
-
+            apply_output_conditioning: Apply the output constraint after the conversion.
+            output_dtype: ``"same"`` rounds the prediction to the state dtype; ``None`` keeps it in high precision.
         Returns:
             torch.Tensor: The score model output.
         """
-        if r is not None:
-            # TODO: add support for SDXL
-            raise NotImplementedError("r is not yet supported for SDXL")
-        if feature_indices is None:
-            feature_indices = {}
-        if return_features_early and len(feature_indices) == 0:
-            # Exit immediately if user requested this.
+        self._validate_forward_kwargs(
+            fwd_kwargs,
+            return_features_early=return_features_early,
+            feature_indices=feature_indices,
+            num_features=len(self.unet.down_blocks) + 1,
+        )
+        if return_features_early and feature_indices is not None and not feature_indices:
             return []
-        if fwd_pred_type is None:
-            fwd_pred_type = self.net_pred_type
-        else:
-            assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
 
+        x_t_model = self.cast_to_model_precision(x_t)
         # Get prompt embeddings
-        text_embedding, pooled_text_embedding = condition[0], condition[1]
-        add_time_ids = self.add_time_ids.repeat(x_t.shape[0], 1)
-        unet_added_conditions = {"time_ids": add_time_ids.to(x_t.device), "text_embeds": pooled_text_embedding}
+        text_embedding, pooled_text_embedding = condition
+        assert_same(
+            dtype=self.precision_model,
+            device=x_t_model.device,
+            text_embedding=text_embedding,
+            pooled_text_embedding=pooled_text_embedding,
+        )
+        # The micro-conditioning sizes are in pixels.
+        height, width = self.pixel_shape(x_t_model.shape[1:])
+        add_time_ids = self.build_condition_input(height, width, device=x_t_model.device).repeat(x_t_model.shape[0], 1)
+        unet_added_conditions = {"time_ids": add_time_ids, "text_embeds": pooled_text_embedding}
 
-        # Note: Don't cast timestep to x_t.dtype here - the UNet's time_embedding expects
-        # float32 input, and autocast will handle dtype conversions inside the UNet
+        # Stability AI and Diffusers both project the raw timestep in FP32, then
+        # cast the sinusoidal features to the UNet activation dtype.
         model_outputs = self.unet(
-            x_t,
+            x_t_model,
             self.noise_scheduler.rescale_t(t),
             text_embedding,
             added_cond_kwargs=unet_added_conditions,
@@ -395,74 +371,85 @@ class StableDiffusionXL(FastGenNetwork):
         else:
             out = model_outputs
 
-        if len(feature_indices) == 0:
+        if feature_indices is None:
             assert isinstance(out, torch.Tensor)
-            out = self.noise_scheduler.convert_model_output(
-                x_t, out, t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
+            out = self.transform_output(out, x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning)
         else:
             assert isinstance(out, list)
-            out[0] = self.noise_scheduler.convert_model_output(
-                x_t, out[0], t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
+            out[0] = self.transform_output(
+                out[0], x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning
             )
 
         if return_logvar:
-            return out, logvar
+            return out, logvar.to(dtype=x_t.dtype)
         return out
+
+    @staticmethod
+    def default_guidance_cfg() -> GuidanceConfig:
+        """Default guidance recipe: CFG only at scale 7.5.
+
+        Experiments may override via ``config.model.guidance_cfg``.
+        """
+        g = GuidanceConfig()
+        g.cfg.scale = 7.5
+        return g
 
     def sample(
         self,
         noise: torch.Tensor,
         condition: Optional[List[torch.Tensor]] = None,
         neg_condition: Optional[List[torch.Tensor]] = None,
-        guidance_scale: Optional[float] = 7.5,
-        num_steps: int = 50,
-        **kwargs,
+        sample_steps: int = 50,
+        sample_type: str = "ode",
+        guidance_cfg: Optional[GuidanceConfig] = None,
     ) -> torch.Tensor:
         """Generate samples using DDIM-style sampling.
 
+        Uses ``predict_with_guidance`` to fuse the cond +
+        cfg-uncond pair into one batched forward.
+
         Args:
-            noise: Initial noise tensor [B, C, H, W] (should be scaled by max sigma).
+            noise: Initial standard-normal noise tensor [B, C, H, W]; the sampler scales it to the first sigma.
             condition: List of [text_embedding, pooled_text_embedding].
             neg_condition: List of negative [text_embedding, pooled_text_embedding] for CFG.
-            guidance_scale: CFG guidance scale. None disables guidance.
-            num_steps: Number of sampling steps.
-            **kwargs: Additional keyword arguments.
+            sample_steps: Number of sampling steps.
+            sample_type: Integration policy; only ``"ode"`` is supported.
+            guidance_cfg: Composite guidance config; ``None`` →
+                ``default_guidance_cfg()`` (CFG at 7.5).
 
         Returns:
             Generated samples in latent space.
         """
+        self._validate_sample_kwargs(
+            sample_type,
+            supported_schedule_types=("sdxl",),
+            supported_sample_types=("ode",),
+        )
+        if guidance_cfg is None:
+            guidance_cfg = self.default_guidance_cfg()
+
         # Get timestep schedule (SDXL uses t in [0, 1], mapped to [0, 1000])
-        t_list = self.noise_scheduler.get_t_list(num_steps, device=noise.device)
+        grid = self.noise_scheduler.grid(sample_steps, device=noise.device)
 
-        x = self.noise_scheduler.latents(noise=noise, t_init=t_list[0])
+        x = self.noise_scheduler.latents(noise=noise, t_init=grid[0])
 
-        for t, t_next in zip(t_list[:-1], t_list[1:]):
+        for t, t_next in zip(grid[:-1], grid[1:]):
             # Expand t for batch
             t_batch = t.expand(x.shape[0])
 
-            # Get noise prediction with optional CFG
-            if guidance_scale is not None and guidance_scale > 1.0 and neg_condition is not None:
-                # CFG: predict with both conditions
-                x_input = torch.cat([x, x], dim=0)
-                t_input = torch.cat([t_batch, t_batch], dim=0)
-                cond_input = [
-                    torch.cat([neg_condition[0], condition[0]], dim=0),
-                    torch.cat([neg_condition[1], condition[1]], dim=0),
-                ]
+            eps_pred = predict_with_guidance(
+                self,
+                x,
+                t_batch,
+                batched=True,
+                guidance_cfg=guidance_cfg,
+                condition=condition,
+                neg_condition=neg_condition,
+                output_dtype=None,
+                fwd_pred_type="eps",
+            )
 
-                eps_pred = self(x_input, t_input, condition=cond_input, fwd_pred_type="eps")
-                eps_uncond, eps_cond = eps_pred.chunk(2)
-                eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-            else:
-                eps_pred = self(x, t_batch, condition=condition, fwd_pred_type="eps")
-
-            # Convert to x0 prediction
-            x0_pred = self.noise_scheduler.eps_to_x0(x, eps_pred, t_batch)
-
-            # DDIM step: x_next = alpha_next * x0 + sigma_next * eps
-            alpha_next = self.noise_scheduler.alpha(t_next.expand(x.shape[0])).view(-1, 1, 1, 1).to(x.dtype)
-            sigma_next = self.noise_scheduler.sigma(t_next.expand(x.shape[0])).view(-1, 1, 1, 1).to(x.dtype)
-            x = alpha_next * x0_pred + sigma_next * eps_pred
+            # DDIM step: x_next = alpha_next * x0 + sigma_next * eps, and x0 at the grid's clean end.
+            x = self.noise_scheduler.step(x, eps_pred, t_batch, t_next, pred_type="eps")
 
         return x

@@ -2,34 +2,39 @@
 
 The VACE WAN model requires pretrained weights for Depth Anything V2 to extract depth information from video frames.
 
-### Download Instructions
+### Automatic download
 
-Download the pretrained weights from the [official repository](https://github.com/DepthAnything/Depth-Anything-V2) and place them in `${CKPT_ROOT_DIR}/annotators/`:
-
-```bash
-mkdir -p ${CKPT_ROOT_DIR}/annotators
-wget -O ${CKPT_ROOT_DIR}/annotators/depth_anything_v2_vitl.pth \
-    "https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth?download=true"
-```
-
-### Configuration
-
-The experiment configs use `CKPT_ROOT_DIR` by default:
+On first use, FastGen automatically downloads the
+[official Depth Anything V2 Large checkpoint](https://huggingface.co/depth-anything/Depth-Anything-V2-Large)
+from a pinned Hugging Face revision. Rank 0 publishes it in the shared cache
+under `$FASTGEN_OUTPUT_ROOT/MODEL`; other ranks and later runs reuse that local
+mirror. Enabling VACE preprocessors loads the annotator during model setup,
+including when requests supply precomputed depth latents. For a custom
+checkpoint, override the default with a local path, S3 URI, or HTTP(S) URL:
 
 ```python
-config.model.net.depth_model_path = f"{CKPT_ROOT_DIR}/annotators/depth_anything_v2_vitl.pth"
+config.model.net.depth_model_path = "/path/to/depth_anything_v2_vitl.pth"
 ```
-
-You can override `CKPT_ROOT_DIR` via environment variable or specify a custom path directly.
 
 ### Notes
 
-- The depth model is used by VACE (Visibility-Aware Context Encoding) to enhance video generation
-- The model will be loaded automatically when running VACE WAN training or inference
-- Ensure the weights file has proper read permissions
+- The depth model is used by VACE (All-in-One Video Creation and Editing) as the depth control signal
+- The model is loaded when VACE preprocessors are initialized
 
-The module is imported by `networks/VaceWan/modules/vace_depth_annotator.py` and is essential for VACE WAN functionality.
+The module is imported by
+`fastgen/networks/VaceWan/modules/vace_depth_annotator.py` and is essential for
+VACE WAN functionality.
 
+### Source
+
+Code from [ali-vilab/VACE](https://github.com/ali-vilab/VACE) at commit [7d316a4](https://github.com/ali-vilab/VACE/tree/7d316a4cb19107dac3a85cd4beab815660f18af6/vace/annotators/depth_anything_v2) (`vace/annotators/depth_anything_v2`), which adapts [Depth Anything V2](https://github.com/DepthAnything/Depth-Anything-V2). We made the following changes to the original code:
+
+1. Replace the OpenCV-based `infer_image`/`image2tensor` with `infer_tensor`,
+   which preprocesses tensors on their device, and delete the unused `util/transform.py`.
+2. Log the missing-xFormers message at debug instead of warning level.
+3. Reformat the code and apply lint fixes (explicit re-exports, no `== True`
+   comparisons, one unused import).
+4. Add headers.
 
 ### License
 
