@@ -17,8 +17,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -167,7 +167,8 @@ cython_debug/
 
 # large files
 *.zip
-core
+/core
+core.[0-9]*
 
 # temporal folder
 tmp/
@@ -179,6 +180,11 @@ credentials
 FASTGEN_OUTPUT/
 wandb/
 *.err
+*.out
 
 # vscode
 *.vscode/
+
+# home-directory files when the container runs with HOME=/workspace
+.local/
+.bash_history

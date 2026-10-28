@@ -1,0 +1,5 @@
+# setup.py reads requirements.txt at metadata time, so a source distribution must ship it.
+include requirements.txt
+
+# Keep repository tests out of the source distribution.
+prune tests

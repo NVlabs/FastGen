@@ -1,16 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+
 from omegaconf import DictConfig
 
 import fastgen.configs.methods.config_cm as config_cm_default
 from fastgen.configs.data import ImageNet64_Loader_Config
 from fastgen.configs.net import EDM_ImageNet64_Config, CKPT_ROOT_DIR
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
 from fastgen.utils.lr_scheduler import LambdaInverseSquareRootScheduler
 from fastgen.configs.callbacks import EMA_POWER_CALLBACKS
 
-""" Configs for the CM model, on EDM2 and ImageNet-64 dataset. """
+""" Configs for the CM model, on EDM (ADM U-Net) and ImageNet-64 dataset. """
 
 
 def create_config():
@@ -30,10 +32,6 @@ def create_config():
     config.trainer.callbacks.update(EMA_POWER_CALLBACKS)
 
     # model
-    config.model.precision_amp = "float16"
-    config.model.grad_scaler_enabled = True
-    config.model.grad_scaler_init_scale = 16
-    config.model.grad_scaler_growth_interval = 20000
     config.model.pretrained_model_path = f"{CKPT_ROOT_DIR}/imagenet-64/edm-imagenet-64x64-cond-adm.pth"
     config.model.input_shape = [3, 64, 64]
     config.model.sample_t_cfg.train_p_mean = -0.8
@@ -41,12 +39,20 @@ def create_config():
     config.model.loss_config.huber_const = 0.06
     config.model.loss_config.weighting_ct_loss = "c_out_sq"
 
-    # Recommended setting for 2-step:
-    # config.model.sample_t_cfg.t_list = [80.0, 1.526, 0.0]
-    # config.model.student_sample_steps = 2
+    # (optional) EDM's typical FP16 training: EDM's FP16 mode casts the network input and weights to FP16
+    # without autocast, and keeps FP32 master weights.
+    # config.model.precision_model = "float16"
+    # config.model.precision_opt = "float32"
+    # config.model.grad_scaler_enabled = True
+    # config.model.grad_scaler_growth_interval = 20000
 
-    config.model.net = EDM_ImageNet64_Config
-    config.model.net.dropout = 0.2
+    # Recommended setting for 2-step:
+    # config.model.student_grid_cfg.grid_type = "explicit"
+    # config.model.student_grid_cfg.grid_kwargs = {"timesteps": [80.0, 1.526, 0.0]}
+    # config.model.student_grid_cfg.steps = 2
+
+    config.model.net = copy.deepcopy(EDM_ImageNet64_Config)
+    config.model.net.backbone.dropout = 0.2
     config.model.net_optimizer.optim_type = "adam"
     config.model.net_optimizer.lr = 1e-3
     config.model.net_optimizer.betas = (0.9, 0.99)
@@ -59,7 +65,7 @@ def create_config():
     # config.model.net.sigma_shift = 0.003
 
     # dataloader
-    config.dataloader_train = ImageNet64_Loader_Config
+    config.dataloader_train = copy.deepcopy(ImageNet64_Loader_Config)
 
     config.log_config.group = "edm_imagenet64_cm"
     return config

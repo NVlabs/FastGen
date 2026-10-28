@@ -41,7 +41,7 @@ make lint    # Check compliance
 
 ## Continuous Integration
 
-The GitHub CI pipeline (currently disabled) consists of three stages:
+The CI pipeline runs automatically on every push to `main` and every pull request targeting `main`:
 
 | Stage | Commands |
 |-------|----------|
@@ -50,6 +50,10 @@ The GitHub CI pipeline (currently disabled) consists of three stages:
 | Install | `make install-fastgen` |
 
 **Note:** Before submitting a pull request, ensure all checks pass locally.
+
+The test suite also checks that the built wheel includes configs and runtime
+data and works outside the checkout. Run only this check with
+`python -m pytest tests/test_packaging.py`.
 
 ## Pull Request Process
 

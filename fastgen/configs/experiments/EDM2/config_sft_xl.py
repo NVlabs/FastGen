@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import copy
+
 import fastgen.configs.experiments.EDM2.config_sft_s as config_sft_edm2_s
 from fastgen.configs.net import EDM2_IN64_XL_Config, CKPT_ROOT_DIR
 
@@ -12,7 +14,7 @@ def create_config():
     config = config_sft_edm2_s.create_config()
 
     # Override network config for XL model
-    config.model.net = EDM2_IN64_XL_Config
+    config.model.net = copy.deepcopy(EDM2_IN64_XL_Config)
 
     # Pretrained model path
     # EDM2-XL ImageNet64 checkpoint from https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/

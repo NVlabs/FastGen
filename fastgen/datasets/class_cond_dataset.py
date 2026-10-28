@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import numpy as np
-from omegaconf import DictConfig
-import os
-import PIL.Image
-import zipfile
 import json
+import os
+import zipfile
+
+import numpy as np
+import PIL.Image
 
 try:
     import pyspng
@@ -15,8 +15,9 @@ except ImportError:
 
 
 import fastgen.utils.logging_utils as logger
-from fastgen.utils.distributed import get_rank, synchronize
-from fastgen.utils.io_utils import s3_load
+from fastgen.utils.cache_utils import cache, file_extension, resolve_cached_path
+from fastgen.utils.distributed import get_rank
+from fastgen.utils.distributed.collectives import raise_across_ranks
 from torch.utils.data import Dataset
 
 
@@ -30,11 +31,16 @@ class ImageDataset(Dataset):
         xflip=False,  # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed=0,  # Random seed to use when applying max_size.
         cache=False,  # Cache images in CPU memory?
+        state_key="real_raw",  # Output key; use "real" for already-materialized model-space data.
     ):
+        if state_key not in ("real", "real_raw"):
+            raise ValueError(f"state_key must be 'real' or 'real_raw', got {state_key!r}")
+
         self._name = name
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
         self._cache = cache
+        self._state_key = state_key
         self._cached_images = dict()  # {raw_idx: np.ndarray, ...}
         self._raw_labels = None
         self._label_shape = None
@@ -55,6 +61,12 @@ class ImageDataset(Dataset):
         if self._raw_labels is None:
             self._raw_labels = self._load_raw_labels() if self._use_labels else None
             if self._raw_labels is None:
+                if self._use_labels:
+                    logger.warning(
+                        f"use_labels=True but no labels found for dataset '{self._name}' "
+                        "(missing dataset.json or null labels); treating as unconditional "
+                        "(empty condition, no neg_condition)."
+                    )
                 self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
             assert isinstance(self._raw_labels, np.ndarray)
             assert self._raw_labels.shape[0] == self._raw_shape[0]
@@ -80,8 +92,7 @@ class ImageDataset(Dataset):
         try:
             self.close()
         except Exception as e:  # Catch 'Exception', not everything
-            print(f"Error closing in __del__: {e}")  # Log the error
-            # Optionally re-raise if critical: raise
+            logger.warning(f"Error closing in __del__: {e}")
 
     def __len__(self):
         return self._raw_idx.size
@@ -99,16 +110,18 @@ class ImageDataset(Dataset):
             assert image.ndim == 3  # CHW
             image = image[:, :, ::-1]
 
-        if image.dtype == np.uint8:
+        is_pixel_data = image.dtype == np.uint8
+        if is_pixel_data:
             # this pathway is for pixel data
             image = image.astype(np.float32) / 127.5 - 1
         else:
             # this pathway is for latent data
             image = image.astype(np.float32)
 
-        neg_condition = np.zeros(self.label_shape, dtype=np.float32)
-
-        return dict(real=image.copy(), condition=self.get_label(idx), neg_condition=neg_condition, idx=idx)
+        item = {self._state_key: image.copy(), "condition": self.get_label(idx), "idx": idx}
+        if self.has_labels:
+            item["neg_condition"] = np.zeros(self.label_shape, dtype=np.float32)
+        return item
 
     def get_label(self, idx):
         label = self._get_raw_labels()[self._raw_idx[idx]]
@@ -117,13 +130,6 @@ class ImageDataset(Dataset):
             onehot[label] = 1
             label = onehot
         return label.copy()
-
-    def get_details(self, idx) -> DictConfig:
-        d = DictConfig()
-        d.raw_idx = int(self._raw_idx[idx])
-        d.xflip = int(self._xflip[idx]) != 0
-        d.raw_label = self._get_raw_labels()[d.raw_idx].copy()
-        return d
 
     @property
     def name(self):
@@ -163,10 +169,6 @@ class ImageDataset(Dataset):
     def has_labels(self):
         return any(x != 0 for x in self.label_shape)
 
-    @property
-    def has_onehot_labels(self):
-        return self._get_raw_labels().dtype == np.int64
-
 
 # ----------------------------------------------------------------------------
 # Dataset subclass that loads images recursively from the specified directory
@@ -177,7 +179,7 @@ class ImageFolderDataset(ImageDataset):
     def __init__(
         self,
         path,  # Path to directory or zip.
-        s3_path=None,  # Path to s3 bucket, to download the zip file
+        remote_path=None,  # S3 or HTTP(S) path from which to download the zip file.
         resolution=None,  # Ensure specific resolution, None = highest available.
         use_pyspng=True,  # Use pyspng if available?
         **super_kwargs,  # Additional arguments for the Dataset base class.
@@ -185,8 +187,9 @@ class ImageFolderDataset(ImageDataset):
         self._path = path
         self._use_pyspng = use_pyspng
         self._zipfile = None
+        self._zipfile_owner_pid = None
 
-        if self._file_ext(self._path) == ".zip" and os.path.isfile(self._path):
+        if file_extension(self._path) == ".zip" and os.path.isfile(self._path):
             self._type = "zip"
             self._all_fnames = set(self._get_zipfile().namelist())
         elif os.path.isdir(self._path):
@@ -196,33 +199,27 @@ class ImageFolderDataset(ImageDataset):
                 for root, _dirs, files in os.walk(self._path)
                 for fname in files
             }
-        elif s3_path is not None and self._file_ext(s3_path) == ".zip":
-            key = s3_path.split("/")[-1]
-            local_path = os.path.join(os.path.dirname(self._path), key)
+        elif remote_path is not None and file_extension(remote_path) == ".zip":
+            # Only rank 0 populates the shared mirror; leaving the block publishes it to the other ranks
+            # and raises a cache failure on every rank instead of stalling a barrier.
+            with raise_across_ranks(f"cache dataset {remote_path}"):
+                if get_rank() == 0:
+                    cache(remote_path, strict=True)
 
-            # Only rank 0 downloads the file to avoid race conditions
-            if get_rank() == 0:
-                if not os.path.isfile(local_path):
-                    logger.info("Dataset not found locally, downloading from s3")
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    zip_content = s3_load(s3_path).getvalue()
-                    logger.info(f"Saving the zip file to {local_path}")
-                    with open(local_path, "wb") as f:
-                        f.write(zip_content)
-                else:
-                    logger.info(f"Dataset already exists at {local_path}")
-            synchronize()
-
-            self._path = local_path
+            self._path = resolve_cached_path(remote_path)
             self._type = "zip"
             self._all_fnames = set(self._get_zipfile().namelist())
 
         else:
-            raise IOError("Path must point to zip, or s3 path must be provided to download the zip")
+            raise IOError(
+                f"Dataset not found at {self._path}: expected a ZIP file or a directory there, or a remote_path ZIP "
+                f"to download (got {remote_path!r}). The dataset configs look under $DATA_ROOT_DIR; prepare the "
+                "datasets there with scripts/download_data.py."
+            )
 
         PIL.Image.init()
         supported_ext = PIL.Image.EXTENSION.keys() | {".npy"}
-        self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in supported_ext)
+        self._image_fnames = sorted(fname for fname in self._all_fnames if file_extension(fname) in supported_ext)
         if len(self._image_fnames) == 0:
             raise IOError("No image files found in the specified path")
 
@@ -232,14 +229,14 @@ class ImageFolderDataset(ImageDataset):
             raise IOError("Image files do not match the specified resolution")
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
 
-    @staticmethod
-    def _file_ext(fname):
-        return os.path.splitext(fname)[1].lower()
-
     def _get_zipfile(self):
         assert self._type == "zip"
+        current_pid = os.getpid()
+        if self._zipfile is not None and self._zipfile_owner_pid != current_pid:
+            self.close()
         if self._zipfile is None:
             self._zipfile = zipfile.ZipFile(self._path)
+            self._zipfile_owner_pid = current_pid
         return self._zipfile
 
     def _open_file(self, fname):
@@ -255,18 +252,19 @@ class ImageFolderDataset(ImageDataset):
                 self._zipfile.close()
         finally:
             self._zipfile = None
+            self._zipfile_owner_pid = None
 
     def __getstate__(self):
-        return dict(super().__getstate__(), _zipfile=None)
+        return dict(super().__getstate__(), _zipfile=None, _zipfile_owner_pid=None)
 
     def _load_raw_image(self, raw_idx):
         fname = self._image_fnames[raw_idx]
-        ext = self._file_ext(fname)
+        ext = file_extension(fname)
         with self._open_file(fname) as f:
             if ext == ".npy":
                 image = np.load(f)
                 image = image.reshape(-1, *image.shape[-2:])
-            elif ext == ".png" and pyspng is not None:
+            elif ext == ".png" and self._use_pyspng and pyspng is not None:
                 image = pyspng.load(f.read())
                 image = image.reshape(*image.shape[:2], -1).transpose(2, 0, 1)
             else:

@@ -7,18 +7,16 @@ Main network classes for Cosmos Predict2.
 
 This module contains the main network classes:
 - CosmosPredict2DiT: The core DiT transformer model
-- CosmosPredict2VideoEncoder: Video VAE for encode/decode
 - CosmosPredict2TextEncoder: Text encoder wrapper
 - CosmosPredict2: Main network class inheriting from FastGenNetwork
 """
 
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, Mapping
-import inspect
-import os
+import contextlib
+import numpy as np
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple, Union
 from tqdm.auto import tqdm
 from einops import rearrange
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,8 +26,8 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from fastgen.networks.Wan import WanVideoEncoder
 from diffusers import UniPCMultistepScheduler
 
-from fastgen.networks.network import FastGenNetwork
-from fastgen.networks.noise_schedule import NET_PRED_TYPES
+from fastgen.networks.network import FastGenNetwork, FastGenModule, validate_conditioning
+from fastgen.networks.time_distributions import polynomial_spacing, time_shift
 
 # Import all modules from modules.py
 from fastgen.networks.cosmos_predict2.modules import (
@@ -50,48 +48,14 @@ from fastgen.networks.cosmos_predict2.modules import (
     Block,
 )
 import fastgen.utils.logging_utils as logger
-from fastgen.utils.basic_utils import str2bool
+from fastgen.utils.tree_utils import OutputDtype, assert_same
+from fastgen.utils.tensor import assert_tensor, expand_like
+from fastgen.utils.module import module_state_names
+from fastgen.utils.guidance import GuidanceConfig, predict_with_guidance
+from fastgen.utils.env import hf_load
 
 
 # ---------------------- DiT Network -----------------------
-
-
-class FlowKarrasUniPCScheduler(UniPCMultistepScheduler):
-    """UniPC whose sigmas follow the official Cosmos Predict2.5 Karras ramp.
-
-    A Karras schedule over ``[sigma_min, sigma_max]`` mapped into flow-matching
-    units by ``sigma / (sigma + 1)``. Built here rather than through diffusers'
-    ``use_karras_sigmas``, which only gained that conversion in 0.37.0.
-    """
-
-    # Hardcoded in diffusers' _convert_to_karras; left unconfigurable to match.
-    _rho: float = 7.0
-
-    def __init__(self, *args, sigma_min: float = 0.01, sigma_max: float = 200.0, **kwargs):
-        # diffusers >= 0.37 declares these itself. Forward them there so they are not
-        # recorded in the config's `_use_default_values`, which `from_config` discards;
-        # register them ourselves on older versions that lack the parameters.
-        base_params = inspect.signature(UniPCMultistepScheduler.__init__).parameters
-        forwarded = {k: v for k, v in (("sigma_min", sigma_min), ("sigma_max", sigma_max)) if k in base_params}
-        super().__init__(*args, **forwarded, **kwargs)
-        if not forwarded:
-            self.register_to_config(sigma_min=sigma_min, sigma_max=sigma_max)
-
-    def set_timesteps(
-        self, num_inference_steps: Optional[int] = None, device: Union[str, torch.device] = None, **kwargs
-    ):
-        if kwargs.get("sigmas") is not None:
-            raise ValueError("FlowKarrasUniPCScheduler builds its own ramp; an explicit `sigmas` is unsupported.")
-        assert num_inference_steps is not None, "num_inference_steps is required"
-        super().set_timesteps(num_inference_steps=num_inference_steps, device=device, **kwargs)
-        ramp = np.linspace(0.0, 1.0, num_inference_steps)
-        min_inv_rho = self.config.sigma_min ** (1 / self._rho)
-        max_inv_rho = self.config.sigma_max ** (1 / self._rho)
-        sigmas = (max_inv_rho + ramp * (min_inv_rho - max_inv_rho)) ** self._rho
-        sigmas = sigmas / (sigmas + 1)
-        # sigmas stay on CPU to avoid per-step host/device traffic, as in diffusers.
-        self.sigmas = torch.from_numpy(np.concatenate([sigmas, [0.0]]).astype(np.float32))
-        self.timesteps = torch.from_numpy(sigmas * self.config.num_train_timesteps).to(device=device, dtype=torch.int64)
 
 
 class CosmosPredict2DiT(nn.Module):
@@ -152,7 +116,8 @@ class CosmosPredict2DiT(nn.Module):
         sac_config: Optional[SACConfig] = None,
         use_crossattn_projection: bool = True,  # Whether to use crossattn_proj for text embeddings
         crossattn_proj_in_channels: int = 100352,  # Input dim: full_concat = 28 * 3584 = 100352
-        use_wan_fp32_strategy: bool = True,  # Use fp32 for modulation computation and RoPE (numerical stability)
+        use_wan_fp32_strategy: bool = True,  # FP32 timestep, modulation and final projection
+        skip_custom_init: bool = False,  # Skip the custom weight init; only safe when a checkpoint overwrites all params
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -171,6 +136,7 @@ class CosmosPredict2DiT(nn.Module):
         self.use_crossattn_projection = use_crossattn_projection
         self.crossattn_proj_in_channels = crossattn_proj_in_channels
         self.use_wan_fp32_strategy = use_wan_fp32_strategy
+        self.skip_custom_init = skip_custom_init
 
         self.pos_emb_cls = pos_emb_cls
         self.pos_emb_interpolation = pos_emb_interpolation
@@ -188,7 +154,12 @@ class CosmosPredict2DiT(nn.Module):
 
         self.t_embedder = nn.Sequential(
             Timesteps(model_channels),
-            TimestepEmbedding(model_channels, model_channels, use_adaln_lora=use_adaln_lora),
+            TimestepEmbedding(
+                model_channels,
+                model_channels,
+                use_adaln_lora=use_adaln_lora,
+                use_wan_fp32_strategy=use_wan_fp32_strategy,
+            ),
         )
 
         self.blocks = nn.ModuleList(
@@ -213,6 +184,7 @@ class CosmosPredict2DiT(nn.Module):
             out_channels=self.out_channels,
             use_adaln_lora=self.use_adaln_lora,
             adaln_lora_dim=self.adaln_lora_dim,
+            use_wan_fp32_strategy=use_wan_fp32_strategy,
         )
 
         self.t_embedding_norm = RMSNorm(model_channels, eps=1e-6)
@@ -225,7 +197,12 @@ class CosmosPredict2DiT(nn.Module):
                 nn.GELU(),
             )
 
-        self.init_weights()
+        # Skip the custom trunc-normal init when skip_custom_init is set: each submodule's
+        # construction already applies PyTorch's default init, and these weights are
+        # overwritten by the checkpoint anyway. Buffers (e.g. RoPE tables) are built in the
+        # submodule __init__ regardless of this flag, so they stay initialized.
+        if not self.skip_custom_init:
+            self.init_weights()
 
         # Apply selective activation checkpointing if configured
         if sac_config is None:
@@ -271,20 +248,18 @@ class CosmosPredict2DiT(nn.Module):
             return self
 
         if not HAS_CHECKPOINT_WRAPPER:
-            print(
-                "Warning: torch.distributed checkpoint_wrapper not available. "
-                "Selective activation checkpointing disabled."
+            logger.warning(
+                "torch.distributed checkpoint_wrapper not available. Selective activation checkpointing disabled."
             )
             return self
 
         context_fn = sac_config.get_context_fn()
-        if context_fn is None and sac_config.mode != CheckpointMode.NONE:
+        if context_fn is None:
             # Fall back to basic checkpointing without selective policy
-            print(
-                f"Warning: Selective checkpoint contexts not available for mode {sac_config.mode}. "
+            logger.warning(
+                f"Selective checkpoint contexts not available for mode {sac_config.mode}. "
                 "Using basic block-wise checkpointing."
             )
-            context_fn = None
 
         # Wrap blocks with checkpoint wrapper
         for block_id, block in self.blocks.named_children():
@@ -394,7 +369,7 @@ class CosmosPredict2DiT(nn.Module):
                     padding_mask.float(),
                     size=x_B_C_T_H_W.shape[-2:],
                     mode="nearest",
-                ).type_as(x_B_C_T_H_W)
+                ).to(dtype=x_B_C_T_H_W.dtype)
                 # Repeat over time and concat as channel
                 # unsqueeze(2) adds time dimension before repeat to preserve batch dimension
                 x_B_C_T_H_W = torch.cat(
@@ -460,20 +435,20 @@ class CosmosPredict2DiT(nn.Module):
             skip_layers: List of block indices to skip (for skip-layer guidance)
             feature_indices: Set of block indices to extract features from
             return_features_early: If True, return features once collected without final output
-            return_logvar: If True, return log variance for uncertainty estimation
+            return_logvar: If True, return one log variance per sample, (B, 1), for uncertainty estimation
             adaln_lora_scale: Scale factor for AdaLN LoRA (numerical stability)
             crossattn_gate_scale: Scale factor for cross-attention gating
 
         Returns:
             Depending on arguments:
-            - torch.Tensor: Model output if no features or logvar requested
+            - torch.Tensor: Model output if feature_indices is None and logvar is not requested
             - List[torch.Tensor]: Features if return_features_early=True
-            - [output, features]: If feature_indices is non-empty
+            - [output, features]: If feature_indices is not None
             - (output, logvar): If return_logvar=True
         """
-        if feature_indices is None:
-            feature_indices = set()
-        if return_features_early and len(feature_indices) == 0:
+        if return_features_early and feature_indices is None:
+            raise ValueError("CosmosPredict2DiT.forward requires feature_indices when return_features_early=True")
+        if return_features_early and not feature_indices:
             return []
 
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb = self.prepare_embedded_sequence(
@@ -483,8 +458,14 @@ class CosmosPredict2DiT(nn.Module):
             video_condition_mask=video_condition_mask,
         )
 
-        # Timestep embedding (in fp32 if use_wan_fp32_strategy for numerical stability)
-        with torch.amp.autocast("cuda", enabled=self.use_wan_fp32_strategy, dtype=torch.float32):
+        # The reference computes timestep features in FP32 even with BF16 stored weights.
+        # The selected linear layers cast their operands explicitly, without relying on FP32 autocast.
+        timestep_context = (
+            torch.amp.autocast(device_type=x_B_T_H_W_D.device.type, enabled=False)
+            if self.use_wan_fp32_strategy
+            else contextlib.nullcontext()
+        )
+        with timestep_context:
             if timesteps_B_T.ndim == 1:
                 timesteps_B_T = timesteps_B_T.unsqueeze(1)
 
@@ -496,43 +477,38 @@ class CosmosPredict2DiT(nn.Module):
             adaln_lora_B_T_3D = adaln_lora_B_T_3D * adaln_lora_scale
 
         # Apply cross-attention projection for Cosmos-Reason1 embeddings
-        if self.use_crossattn_projection and hasattr(self, "crossattn_proj"):
+        if self.use_crossattn_projection:
             crossattn_emb = self.crossattn_proj(crossattn_emb)
 
         if extra_pos_emb is not None:
-            assert x_B_T_H_W_D.shape == extra_pos_emb.shape
+            assert_same(shape=True, device=True, x_B_T_H_W_D=x_B_T_H_W_D, extra_pos_emb=extra_pos_emb)
 
         # Block forward with feature extraction
         features = []
         for idx, block in enumerate(self.blocks):
-            if skip_layers is not None and idx in skip_layers:
-                continue
-
-            x_B_T_H_W_D = block(
-                x_B_T_H_W_D,
-                t_embedding_B_T_D,
-                crossattn_emb,
-                rope_emb_L_1_1_D=rope_emb_L_1_1_D,
-                adaln_lora_B_T_3D=adaln_lora_B_T_3D,
-                extra_per_block_pos_emb=extra_pos_emb,
-                crossattn_gate_scale=crossattn_gate_scale,
-            )
+            # A skipped block acts as the identity; still record its feature so each requested index yields one.
+            if skip_layers is None or idx not in skip_layers:
+                x_B_T_H_W_D = block(
+                    x_B_T_H_W_D,
+                    t_embedding_B_T_D,
+                    crossattn_emb,
+                    rope_emb_L_1_1_D=rope_emb_L_1_1_D,
+                    adaln_lora_B_T_3D=adaln_lora_B_T_3D,
+                    extra_per_block_pos_emb=extra_pos_emb,
+                    crossattn_gate_scale=crossattn_gate_scale,
+                )
 
             if feature_indices and idx in feature_indices:
-                features.append(x_B_T_H_W_D.clone())
+                features.append(x_B_T_H_W_D)
 
             # Early exit if we have all requested features
-            if return_features_early and len(features) == len(feature_indices):
+            if return_features_early and feature_indices is not None and len(features) == len(feature_indices):
                 return features
 
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
         output = self.unpatchify(x_B_T_H_W_O)
 
-        # Prepare output based on requested returns
-        if len(feature_indices) == 0:
-            out = output
-        else:
-            out = [output, features]
+        out = [output, features] if feature_indices is not None else output
 
         if return_logvar:
             if not hasattr(self, "logvar_linear"):
@@ -540,7 +516,14 @@ class CosmosPredict2DiT(nn.Module):
                     "logvar_linear layer is required when return_logvar=True. "
                     "Set enable_logvar_linear=True in model config."
                 )
-            logvar = self.logvar_linear(t_embedding_B_T_D)
+            # One value per sample: average the time embeddings of the generated frames. Video2world
+            # conditioning frames are excluded, as their timestep is not the sample's.
+            if video_condition_mask is None:
+                logvar_emb_B_D = t_embedding_B_T_D.mean(dim=1)
+            else:
+                generated_B_T_1 = video_condition_mask[:, 0, :, 0, 0, None].logical_not()
+                logvar_emb_B_D = (t_embedding_B_T_D * generated_B_T_1).sum(dim=1) / generated_B_T_1.sum(dim=1)
+            logvar = self.logvar_linear(logvar_emb_B_D.to(x_B_C_T_H_W.dtype))
             return out, logvar
 
         return out
@@ -549,7 +532,7 @@ class CosmosPredict2DiT(nn.Module):
 # ---------------------- Text Encoder -----------------------
 
 
-class CosmosPredict2TextEncoder:
+class CosmosPredict2TextEncoder(FastGenModule):
     """
     Text Encoder for Cosmos Predict2 using Cosmos-Reason1 (Qwen2.5-VL based).
 
@@ -576,7 +559,6 @@ class CosmosPredict2TextEncoder:
         self,
         model_name: str = "nvidia/Cosmos-Reason1-7B",
         max_length: int = 512,
-        device: str = "cuda",
         embedding_concat_strategy: str = "full_concat",  # Checkpoint uses full_concat -> 100352 dims
         n_layers_per_group: int = 5,
     ):
@@ -588,7 +570,6 @@ class CosmosPredict2TextEncoder:
                 - HuggingFace: "nvidia/Cosmos-Reason1-7B"
                 - Local path: "/path/to/Cosmos-Reason1-7B"
             max_length: Maximum sequence length for text tokenization.
-            device: Device to load the model on.
             embedding_concat_strategy: How to combine layer embeddings:
                 - "full_concat": Concatenate all 28 layers -> 100,352 dims
                 - "mean_pooling": Mean across layers -> 3584 dims
@@ -596,54 +577,58 @@ class CosmosPredict2TextEncoder:
             n_layers_per_group: Number of layers per group for pool_every_n strategy.
         """
 
+        super().__init__()
         self.max_length = max_length
-        self.device = device
         self.embedding_concat_strategy = embedding_concat_strategy
         self.n_layers_per_group = n_layers_per_group
 
-        # Check if using local path
-        local_files_only = os.path.isdir(model_name) or str2bool(os.getenv("LOCAL_FILES_ONLY", "false"))
-
         # Load processor and tokenizer
-        self.processor = AutoProcessor.from_pretrained(
+        self.processor = hf_load(
+            AutoProcessor.from_pretrained,
             model_name,
-            cache_dir=os.getenv("HF_HOME", None),
-            local_files_only=local_files_only,
         )
         self.tokenizer = self.processor.tokenizer
 
         # Load model (requires transformers >= 4.49.0)
         logger.info(f"Loading Cosmos-Reason1 model from {model_name}")
-        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        self.model = hf_load(
+            Qwen2_5_VLForConditionalGeneration.from_pretrained,
             model_name,
-            cache_dir=os.getenv("HF_HOME", None),
-            local_files_only=local_files_only,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            # The reference extracts Reason1 features with FA2; SDPA materially changes the conditioning.
+            attn_implementation="flash_attention_2",
             output_hidden_states=True,
         )
 
-        self.model.to(device)
-        self.model.eval()
-        self.model.requires_grad_(False)
+        # transformers>=5 dropped the flattened `hidden_size`/`num_hidden_layers` aliases on
+        # `Qwen2_5_VLConfig`; the nested `text_config` works on both 4.x and 5.x.
+        text_config = getattr(self.model.config, "text_config", self.model.config)
+        self.hidden_size = text_config.hidden_size  # 3584 for Qwen2.5-7B
+        self.num_layers = text_config.num_hidden_layers  # 28 for Qwen2.5-7B
 
-        # Store model config
-        self.hidden_size = self.model.config.hidden_size  # 3584 for Qwen2.5-7B
-        self.num_layers = self.model.config.num_hidden_layers  # 28 for Qwen2.5-7B
+    def _fixed_precision_overrides(self) -> Dict[str, torch.dtype]:
+        # Qwen constructs these in FP32. Casting them to BF16 and back permanently rounds
+        # the frequencies, so pin them before preparation casts the rest of the encoder.
+        return {
+            **super()._fixed_precision_overrides(),
+            **{
+                name: torch.float32
+                for name, _ in self.named_buffers(remove_duplicate=False)
+                if name.rsplit(".", 1)[-1] in ("inv_freq", "original_inv_freq")
+            },
+        }
 
     @staticmethod
     def mean_normalize(tensor: torch.Tensor) -> torch.Tensor:
         """Mean normalize tensor by subtracting mean and dividing by std."""
         return (tensor - tensor.mean(dim=-1, keepdim=True)) / (tensor.std(dim=-1, keepdim=True) + 1e-8)
 
-    @torch.no_grad()
-    def encode(self, text: Union[str, List[str]], precision: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    def encode(self, text: Union[str, List[str]]) -> torch.Tensor:
         """
         Encode text prompts to embeddings using Cosmos-Reason1 style.
 
         Args:
             text: Single text prompt or list of prompts
-            precision: Output dtype
-
         Returns:
             Text embeddings of shape (B, max_length, embedding_dim)
         """
@@ -675,6 +660,11 @@ class CosmosPredict2TextEncoder:
                 add_vision_id=False,
                 return_tensors="pt",
             )
+            # transformers 5 returns a BatchEncoding here for multimodal
+            # tokenizers, while transformers 4 returned the input-id tensor
+            # directly. Normalize both APIs before padding.
+            if not isinstance(formatted, torch.Tensor):
+                formatted = formatted["input_ids"]
 
             # Pad or truncate to max_length
             if formatted.shape[1] < self.max_length:
@@ -685,10 +675,19 @@ class CosmosPredict2TextEncoder:
                 formatted = formatted[:, : self.max_length]
             input_ids_batch.append(formatted)
 
+        # Keep the compiled/FSDP-visible module boundary accelerator-only: tokenization
+        # happens on CPU, then the completed batch is placed before ``self(...)`` runs.
         input_ids = torch.cat(input_ids_batch, dim=0).to(self.device)
+        return self(input_ids)
 
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Forward pass with hidden states
-        outputs = self.model(input_ids=input_ids, output_hidden_states=True, return_dict=True)
+        outputs = self.model(
+            input_ids=input_ids,
+            output_hidden_states=True,
+            return_dict=True,
+            logits_to_keep=1,  # only hidden_states is used; skips the full-vocabulary lm_head projection
+        )
         hidden_states = outputs.hidden_states  # Tuple of (num_layers + 1) tensors
 
         # Skip embedding layer (index 0), normalize and combine layers
@@ -707,7 +706,7 @@ class CosmosPredict2TextEncoder:
         else:
             raise ValueError(f"Invalid embedding_concat_strategy: {self.embedding_concat_strategy}")
 
-        return text_embeddings.to(dtype=precision)
+        return text_embeddings
 
     @property
     def embedding_dim(self) -> int:
@@ -720,15 +719,6 @@ class CosmosPredict2TextEncoder:
             n_groups = (self.num_layers + self.n_layers_per_group - 1) // self.n_layers_per_group
             return n_groups * self.hidden_size
         return self.hidden_size
-
-    def to(self, *args, **kwargs):
-        """Move model to device."""
-        self.model.to(*args, **kwargs)
-        if args and isinstance(args[0], (str, torch.device)):
-            self.device = args[0]
-        if "device" in kwargs:
-            self.device = kwargs["device"]
-        return self
 
 
 # ---------------------- Main Network Class -----------------------
@@ -759,6 +749,9 @@ class CosmosPredict2(FastGenNetwork):
         net_pred_type: Network prediction type ('flow', 'eps', 'v', 'x0')
         schedule_type: Noise schedule type
     """
+
+    # The Wan2.1 VAE that ``init_vae`` loads.
+    latent_compression_factors = (4, 8, 8)
 
     def __init__(
         self,
@@ -799,7 +792,7 @@ class CosmosPredict2(FastGenNetwork):
         # Selective activation checkpointing
         sac_config: Optional[SACConfig] = None,
         # Enable logvar for distillation
-        enable_logvar_linear: bool = True,
+        enable_logvar_linear: bool = False,
         # Noise schedule
         net_pred_type: str = "flow",
         schedule_type: str = "rf",
@@ -808,7 +801,9 @@ class CosmosPredict2(FastGenNetwork):
         crossattn_proj_in_channels: int = 100352,  # full_concat: 28 layers * 3584 = 100352
         # Text encoder: HuggingFace model name or local path to Cosmos-Reason1-7B
         text_encoder_model_name: str = "nvidia/Cosmos-Reason1-7B",
-        # WAN fp32 strategy: use fp32 for RoPE and modulation computation
+        # The native default; the released 2B post-trained checkpoint overrides it with Karras.
+        sample_sigma_schedule: str = "linear",
+        # WAN fp32 strategy: use fp32 for modulation computation
         use_wan_fp32_strategy: bool = True,
         # FPS for temporal position embeddings
         fps: float = 24.0,
@@ -816,16 +811,19 @@ class CosmosPredict2(FastGenNetwork):
         # Video2world (image-to-video) mode settings
         is_video2world: bool = False,
         num_conditioning_frames: int = 1,
-        **model_kwargs,
+        # Skip the transformer's custom weight init (safe only when a checkpoint overwrites all params)
+        skip_custom_init: bool = False,
+        **schedule_kwargs,
     ):
-        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **model_kwargs)
+        # The native linear preset's shifted grid starts above the RF default of 0.999, so the raw-time bound defaults
+        # to 1.0 (configs may lower it).
+        schedule_kwargs.setdefault("max_t", 1.0)
+        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **schedule_kwargs)
 
         # Scale factor for adaln_lora values
         self.adaln_lora_scale = adaln_lora_scale
 
         # Scale factor for cross-attention gate
-        # The checkpoint has small gate values (~0.09) which weakens text conditioning
-        # Setting this to 10.0 can improve text conditioning from ~1% to ~15%
         self.crossattn_gate_scale = crossattn_gate_scale
 
         self.transformer = CosmosPredict2DiT(
@@ -855,6 +853,7 @@ class CosmosPredict2(FastGenNetwork):
             rope_t_extrapolation_ratio=rope_t_extrapolation_ratio,
             rope_enable_fps_modulation=rope_enable_fps_modulation,
             use_wan_fp32_strategy=use_wan_fp32_strategy,
+            skip_custom_init=skip_custom_init,
         )
 
         # Add logvar_linear layer for uncertainty estimation (used by some loss functions)
@@ -863,6 +862,9 @@ class CosmosPredict2(FastGenNetwork):
 
         # Store text encoder model name/path for init_preprocessors
         self.text_encoder_model_name = text_encoder_model_name
+        if sample_sigma_schedule not in ("karras", "linear"):
+            raise ValueError("sample_sigma_schedule must be 'karras' or 'linear'")
+        self.sample_sigma_schedule = sample_sigma_schedule
 
         # Video2world attributes
         self.is_video2world = is_video2world
@@ -884,20 +886,95 @@ class CosmosPredict2(FastGenNetwork):
 
         Skips initialization if preprocessors already exist.
         """
-        if not hasattr(self, "text_encoder"):
+        if "text_encoder" not in self.preprocessors:
             self.init_text_encoder()
-        if not hasattr(self, "vae"):
+        if "vae" not in self.preprocessors:
             self.init_vae()
 
     def init_text_encoder(self):
         """Initialize text encoder (Cosmos-Reason1)."""
-        self.text_encoder = CosmosPredict2TextEncoder(
+        self.preprocessors["text_encoder"] = CosmosPredict2TextEncoder(
             model_name=self.text_encoder_model_name,
         )
 
     def init_vae(self):
         """Initialize video encoder (Wan VAE)."""
-        self.vae = WanVideoEncoder(model_id_or_local_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers")
+        # Unlike native Wan's default FP32 path, the native Cosmos tokenizer constructs this VAE
+        # with dtype=BF16 and is_amp=False. Its weights, inputs, and internal mean/std normalization
+        # therefore stay in BF16 without autocast.
+        self.preprocessors["vae"] = WanVideoEncoder(
+            model_id_or_local_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            fixed_precision_model=torch.bfloat16,
+        )
+
+    def build_conditioning(self, data, input_shape=None, precision=None):
+        """Build the conditioning fields for CosmosPredict2.
+
+        Two regimes, gated by ``self.is_video2world``:
+
+        * **T2V (default, video2world=False)** — return the ordinary text
+          branches resolved by the inherited builder.
+        * **V2W (video2world=True)** — slice the first
+          ``self.num_conditioning_frames`` pixel frames, VAE-encode them
+          deterministically (``mode="argmax"``), and build a binary
+          condition mask in latent space marking those frames, both in the
+          state ``precision``.  Latent dims come from ``input_shape``.
+
+        V2W requires both ``data["real_raw"]`` (pixel) and ``input_shape``;
+        raises ``ValueError`` otherwise.  When the caller supplies fewer
+        pixel frames than ``num_conditioning_frames`` (typical at
+        inference: a single seed image), the input is replicated along T
+        to fill — the inference script can therefore always load 1 frame.
+
+        V2W enriches the resolved positive branch and a non-``None`` resolved
+        negative branch without mutating ``data``.
+        """
+        out = super().build_conditioning(data, input_shape=input_shape, precision=precision)
+        # Complete conditions are builder outputs and are never prepared again, in T2V mode too.
+        validate_conditioning(out, required_fields=("condition",) if self.is_video2world else ())
+        if not self.is_video2world:
+            return out
+
+        text_embeds = out.get("condition")
+
+        real_raw = data.get("real_raw")
+        if real_raw is None:
+            raise ValueError(
+                f"{type(self).__name__} V2W requires data['real_raw'] (pixel-space). " "Use a pixel-space dataloader."
+            )
+        if input_shape is None:
+            raise ValueError(
+                "CosmosPredict2 V2W requires input_shape to derive latent "
+                "spatial / temporal dims for the condition mask."
+            )
+
+        n_cond = self.num_conditioning_frames
+        n_missing = n_cond - real_raw.shape[2]
+        if n_missing > 0:
+            # Prepend repeats of the first frame so the user-supplied frames
+            # land at the *end* of the conditioning window — the model sees
+            # a held initial state evolving into the user clip rather than a
+            # backward jump.
+            pad = real_raw[:, :, :1].expand(-1, -1, n_missing, -1, -1)
+            real_raw = torch.cat([pad, real_raw], dim=2)
+        cond_frames = real_raw[:, :, :n_cond]
+        vae = self.get_preprocessor("vae", "encode the V2W conditioning frames")
+        cond_frames = vae.encode(cond_frames, mode="argmax").to(dtype=precision)
+
+        _, t_latent, h_latent, w_latent = input_shape
+        bsz, _, t_cond_latent, _, _ = cond_frames.shape
+        condition_mask = torch.zeros(bsz, 1, t_latent, h_latent, w_latent, device=cond_frames.device, dtype=torch.bool)
+        condition_mask[:, :, :t_cond_latent] = True
+
+        extras = {
+            "conditioning_latents": cond_frames,
+            "condition_mask": condition_mask,
+        }
+        out["condition"] = {"text_embeds": text_embeds, **extras}
+        neg_text_embeds = out.get("neg_condition")
+        if neg_text_embeds is not None:
+            out["neg_condition"] = {"text_embeds": neg_text_embeds, **extras}
+        return out
 
     @staticmethod
     def remap_checkpoint_keys(state_dict: Mapping[str, Any]) -> Dict[str, torch.Tensor]:
@@ -996,88 +1073,12 @@ class CosmosPredict2(FastGenNetwork):
 
         return super().load_state_dict(state_dict, **kwargs)
 
-    def to(self, *args, **kwargs):
-        """Move model to device."""
-        super().to(*args, **kwargs)
-        if hasattr(self, "text_encoder") and self.text_encoder is not None:
-            self.text_encoder.to(*args, **kwargs)
-        if hasattr(self, "vae") and self.vae is not None:
-            self.vae.to(*args, **kwargs)
-        return self
-
-    def reset_parameters(self):
-        """Reinitialize parameters and non-persistent buffers for FSDP meta device initialization.
-
-        This method is called after to_empty() when using FSDP2 with meta device initialization.
-        It reinitializes:
-        1. All Linear layer weights and biases
-        2. Embedding layers (patch embedder, timestep embedder)
-        3. Output layers (final_layer)
-        4. Non-persistent buffers (RoPE, etc.)
-
-        Example usage in FSDP initialization:
-            model.to_empty(device=torch.cuda.current_device())
-            model.reset_parameters()  # Reinitialize weights and buffers
-            set_model_state_dict(model, state_dict, options=options)
-        """
-        # Initialize all Linear layers with Xavier uniform
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-        # Initialize patch embedder
-        if hasattr(self.transformer, "x_embedder"):
-            self.transformer.x_embedder.init_weights()
-
-        # Initialize timestep embedder
-        if hasattr(self.transformer, "t_embedder"):
-            # t_embedder is a Sequential: [nn.Linear, TimestepEmbedder, nn.Linear]
-            # TimestepEmbedder has its own init_weights method
-            for submodule in self.transformer.t_embedder.modules():
-                if hasattr(submodule, "init_weights"):
-                    submodule.init_weights()
-
-        # Initialize final layer
-        if hasattr(self.transformer, "final_layer"):
-            self.transformer.final_layer.init_weights()
-
-        # Initialize cross-attention projection if it exists
-        if hasattr(self.transformer, "crossattn_proj"):
-            for m in self.transformer.crossattn_proj.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.normal_(m.weight, std=0.02)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
-
-        # Reinitialize RoPE buffers (non-persistent buffers must be recomputed)
-        if hasattr(self.transformer, "pos_embedder") and self.transformer.pos_embedder is not None:
-            rope = self.transformer.pos_embedder
-            device = next(rope.buffers()).device
-
-            # Recompute the sequence buffer
-            max_len = max(rope.max_h, rope.max_w, rope.max_t)
-            rope.seq.copy_(torch.arange(max_len, dtype=torch.float, device=device))
-
-            logger.debug("Reinitialized Cosmos RoPE buffers")
-
-        super().reset_parameters()
-
-        logger.info("Reset parameters for Cosmos Predict2 network")
-
     def fully_shard(self, **kwargs):
-        """Fully shard the Cosmos Predict2 network for FSDP.
+        """Shard ``self.transformer``; see ``FastGenNetwork.fully_shard``.
 
-        Note: We shard `self.transformer` instead of `self` because the network wrapper
-        class may have complex multiple inheritance with ABC, which causes Python's
-        __class__ assignment to fail due to incompatible memory layouts.
-
-        FSDP2's fully_shard works by dynamically modifying __class__, so we apply it only
-        to the transformer submodule which is a standard torch.nn.Module.
+        Cosmos already applies selective activation checkpointing through ``ptd_checkpoint_wrapper``,
+        so no checkpoint conversion happens here.
         """
-        # Note: Cosmos already has SAC (selective activation checkpointing) via ptd_checkpoint_wrapper
-        # We don't need to re-apply checkpointing here
 
         # First, shard each transformer block for fine-grained parallelism
         for block in self.transformer.blocks:
@@ -1085,6 +1086,17 @@ class CosmosPredict2(FastGenNetwork):
 
         # Then shard the entire transformer
         fully_shard(self.transformer, **kwargs)
+
+    def _fixed_precision_overrides(self) -> Dict[str, torch.dtype]:
+        """Pin the RoPE tables to FP32 before preparation casts the rest of the DiT.
+
+        The reference computes the exponent tables in FP32 and FSDP mixed precision never casts buffers.
+        """
+        prefix = "transformer.pos_embedder."
+        return {
+            **super()._fixed_precision_overrides(),
+            **{name: torch.float32 for name in module_state_names(self) if name.startswith(prefix)},
+        }
 
     def _get_conditioning_tensors(
         self, x: torch.Tensor, condition: Optional[Any]
@@ -1098,14 +1110,19 @@ class CosmosPredict2(FastGenNetwork):
         Returns:
             Tuple of (conditioning_latents_full, condition_mask, condition_mask_C) or None
         """
-        if not isinstance(condition, dict):
+        if not isinstance(condition, Mapping):
             return None
 
         conditioning_latents = condition.get("conditioning_latents")
         condition_mask = condition.get("condition_mask")
 
-        if conditioning_latents is None or condition_mask is None:
+        if (conditioning_latents is None) != (condition_mask is None):
+            raise ValueError("conditioning_latents and condition_mask must be provided together")
+        if conditioning_latents is None:
             return None
+
+        assert_same(device=True, x=x, conditioning_latents=conditioning_latents)
+        assert_same(dtype=torch.bool, device=x.device, condition_mask=condition_mask)
 
         # Pad conditioning_latents to full temporal dimension
         T_cond = conditioning_latents.shape[2]
@@ -1118,137 +1135,248 @@ class CosmosPredict2(FastGenNetwork):
         return conditioning_latents_full, condition_mask, condition_mask_C
 
     def preserve_conditioning(self, x: torch.Tensor, condition: Optional[Any]) -> torch.Tensor:
-        """Preserve conditioning frames for video2world during student sampling.
+        """Replace the video2world conditioning frames of ``x`` with the clean latents.
 
-        This hook is called by _student_sample_loop to ensure conditioning frames
-        are preserved after each denoising step.
+        ``forward()`` applies this to its input, so the DiT sees clean conditioning
+        frames while samplers keep evolving the raw latent state.
 
         Args:
-            x: The tensor to modify (either x0 prediction or noisy latents)
+            x: Noisy latent state, shape (B, C, T, H, W)
             condition: The condition dict containing conditioning_latents and condition_mask
 
         Returns:
-            The tensor with conditioning frames preserved
+            ``x`` with its conditioning frames replaced
         """
         tensors = self._get_conditioning_tensors(x, condition)
         if tensors is None:
             return x
 
         conditioning_latents_full, _, condition_mask_C = tensors
-        return conditioning_latents_full * condition_mask_C + x * (1 - condition_mask_C)
+        return torch.where(condition_mask_C, conditioning_latents_full, x)
+
+    def _conditioned_inputs(
+        self, x_t: torch.Tensor, t: torch.Tensor, condition: Any, conditional_frame_timestep: float
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """The transformer's input and timesteps: Video2World frames clean, with one timestep per frame.
+
+        Conditioning frames take ``conditional_frame_timestep`` unless it is negative. Without a
+        Video2World condition, these are the caller's ``x_t`` and ``t``.
+        """
+        conditioning_latents = condition.get("conditioning_latents") if isinstance(condition, Mapping) else None
+        condition_mask = condition.get("condition_mask") if isinstance(condition, Mapping) else None
+        if (conditioning_latents is None) != (condition_mask is None):
+            raise ValueError("conditioning_latents and condition_mask must be provided together")
+        if condition_mask is None:
+            return x_t, t
+        model_input = self.preserve_conditioning(x_t, condition)
+        B, _, T = x_t.shape[:3]
+        if t.ndim == 1:
+            t_expanded = t.unsqueeze(1).expand(B, T)
+        elif t.ndim == 2:
+            t_expanded = t.expand(B, T)
+        else:
+            raise ValueError(f"Expected t with rank 1 or 2, got shape {tuple(t.shape)}")
+        if conditional_frame_timestep >= 0:
+            mask_B_T = condition_mask[:, 0, :, 0, 0]  # (B, T)
+            t_expanded = torch.where(mask_B_T, torch.full_like(t_expanded, conditional_frame_timestep), t_expanded)
+        return model_input, t_expanded
+
+    def _convert_output(self, prediction, x_t, t, condition, fwd_pred_type, conditional_frame_timestep=1e-4, **context):
+        """Convert against the input and per-frame timesteps the transformer saw.
+
+        These equal the caller's ``x_t`` and ``t`` on the generated frames; ``_condition_output`` then re-pins the
+        Video2World frames against the caller's ``x_t`` and ``t`` in every prediction type. A ``(B, T)`` time is
+        reshaped to ``(B, 1, T, 1, 1)`` because the schedule's ``expand_like`` only pads trailing dims.
+        """
+        model_input, transformer_t = self._conditioned_inputs(x_t, t, condition, conditional_frame_timestep)
+        if transformer_t.ndim == 2:
+            transformer_t = transformer_t.reshape(x_t.shape[0], 1, -1, 1, 1)
+        return super()._convert_output(prediction, model_input, transformer_t, condition, fwd_pred_type)
+
+    def _condition_output(self, prediction, x_t, t, condition, fwd_pred_type, **context):
+        """Pin clean Video2World frames in the requested prediction space after guidance.
+
+        The reference's ``denoise_replace_gt_frames`` flow is ``noise - gt_frames``.
+        Converting the clean target against the caller's raw state gives that same
+        constraint in every prediction domain. At sigma zero a non-x0 prediction
+        cannot carry it, which raises at the Video2World frames.
+        """
+        tensors = self._get_conditioning_tensors(x_t, condition)
+        if tensors is None:
+            return prediction
+        clean, _, mask = tensors
+        if fwd_pred_type != "x0":
+            B, _, T = x_t.shape[:3]
+            t_out = t if t.ndim == 1 else t.expand(B, T).reshape(B, 1, T, 1, 1)
+            noised = self.noise_scheduler.sigma(t_out) > 0
+            assert_tensor(
+                (expand_like(noised, prediction) | ~mask).all(),
+                "A non-x0 prediction cannot carry the output constraint at sigma = 0; request fwd_pred_type='x0' "
+                "or apply_output_conditioning=False there",
+                error_type=ValueError,
+            )
+            # Other frames keep the prediction, so their target only needs to be finite at sigma = 0.
+            t_safe = torch.where(noised, t_out, torch.full_like(t_out, self.noise_scheduler.max_t))
+            clean = self.noise_scheduler.convert_model_output(
+                x_t, clean, t_safe, src_pred_type="x0", target_pred_type=fwd_pred_type, output_dtype=prediction.dtype
+            )
+        return torch.where(mask, clean.to(dtype=prediction.dtype), prediction)
+
+    @staticmethod
+    def default_guidance_cfg() -> GuidanceConfig:
+        """Default guidance recipe: CFG only at scale 5.0.
+
+        Experiments may override via ``config.model.guidance_cfg``.
+        """
+        g = GuidanceConfig()
+        g.cfg.scale = 5.0
+        return g
+
+    def sample_scheduler_and_grid(
+        self, sample_steps: int, flow_shift: float = 5.0, device: Optional[torch.device] = None
+    ) -> Tuple[UniPCMultistepScheduler, torch.Tensor]:
+        """Set UniPC to the native preset and return the times to query the network at.
+
+        Karras evaluates ``sample_steps + 1`` times; shifted linear evaluates ``sample_steps``
+        times, shifted by ``flow_shift``, which the Karras preset ignores like the reference. The
+        network is queried at the FP32 sigmas the solver integrates, in ``t_precision``: the time
+        the reference trains it on. The reference sampler instead truncates them to integer
+        timesteps, which offsets the network's time from the solver's by up to 0.001.
+        """
+        if not isinstance(sample_steps, int) or isinstance(sample_steps, bool) or sample_steps <= 0:
+            raise ValueError("sample_steps must be a positive integer")
+        if not np.isfinite(flow_shift) or flow_shift <= 0:
+            raise ValueError("flow_shift must be finite and positive")
+        if self.sample_sigma_schedule == "karras":
+            # The native scheduler interpolates down from sigma_max, so the bounds run high to low.
+            sigmas = polynomial_spacing(np.arange(sample_steps + 1) / sample_steps, 7, 200.0, 0.01)
+            sigmas = sigmas / (1 + sigmas)
+        else:
+            # The native scheduler stores its training endpoints in FP32 before interpolating in NumPy.
+            sigmas = np.linspace(float(np.float32(1 - 1 / 1000)), 0.0, sample_steps + 1)[:-1]
+            sigmas = time_shift(sigmas, flow_shift)
+        if self.sample_scheduler is None:
+            self.sample_scheduler = UniPCMultistepScheduler(
+                num_train_timesteps=1000,
+                prediction_type="flow_prediction",
+                use_flow_sigmas=True,
+                flow_shift=1.0,  # The supplied sigmas already include the native shift.
+            )
+        self.sample_scheduler.set_timesteps(num_inference_steps=len(sigmas), sigmas=sigmas, device=device)
+        # From 1058 steps the leading int64 timestep repeats; UniPC would resolve the first step to its second
+        # occurrence, skip a sigma, and step past the grid's end.
+        self.sample_scheduler.set_begin_index(0)
+        t_grid = self.noise_scheduler.safe_clamp(
+            self.sample_scheduler.sigmas[:-1].to(device=device, dtype=self.noise_scheduler.t_precision),
+            min=self.noise_scheduler.min_t,
+            max=self.noise_scheduler.max_t,
+            warn=True,
+        )
+        return self.sample_scheduler, t_grid
 
     def sample(
         self,
         noise: torch.Tensor,
         condition: Optional[Any] = None,
         neg_condition: Optional[Any] = None,
-        guidance_scale: Optional[float] = 5.0,
-        num_steps: int = 50,
-        skip_layers: Optional[List[int]] = None,
-        skip_layers_start_fraction: float = 0.0,
+        sample_steps: int = 50,
+        sample_type: str = "ode",
+        shift: float = 5.0,
         fps: Optional[torch.Tensor] = None,
-        conditioning_latents: Optional[torch.Tensor] = None,
-        num_conditioning_frames: int = 1,
         conditional_frame_timestep: float = 1e-4,
         denoise_replace_gt_frames: bool = True,
-        **kwargs,
+        guidance_cfg: Optional[GuidanceConfig] = None,
     ) -> torch.Tensor:
         """Multistep sampling using the FlowUniPC method.
 
-        This implementation matches the official Cosmos inference and supports both
-        text2world and video2world modes:
-        - NO preconditioning - model receives raw input and timesteps
+        This implementation follows the official Cosmos inference, except that, as in training,
+        it starts from noise scaled to the first sigma rather than from unscaled noise, and queries
+        the model at the solver's sigmas rather than at their truncated integer timesteps. It
+        supports both text2world and video2world modes:
+        - NO preconditioning - model receives the raw input and the solver's sigma as its time
         - Model outputs velocity directly
         - CFG is applied on velocity predictions
         - Scheduler handles the integration
 
-        For video2world mode (when conditioning_latents is provided):
-        - First N frames are replaced with conditioning latents
-        - Conditioning frames use a special timestep (conditional_frame_timestep)
-        - Predicted velocity for conditioning frames is replaced with analytical velocity
+        For video2world mode (when ``condition`` carries conditioning latents and their mask):
+        - The frames selected by ``condition["condition_mask"]`` are replaced with conditioning latents
+        - Conditioning frames are presented to the transformer with
+          `conditional_frame_timestep` (1e-4 by default, as in forward())
+        - Predicted velocity for conditioning frames is replaced with the constant velocity
+          that carries the initial latents onto the conditioning frames
 
         Args:
             noise: The noisy latents to start from, shape (B, C, T, H, W).
-            condition: The conditioning embeddings.
+            condition: The conditioning embeddings, or a dict with 'text_embeds' and, for video2world
+                mode, both 'conditioning_latents' of shape (B, C, T_cond, H, W) and a boolean
+                'condition_mask' of shape (B, 1, T, H, W) that selects only frames before T_cond.
             neg_condition: The negative/unconditional embeddings for CFG.
-            guidance_scale: Conventional classifier-free guidance scale.
-                Values greater than 1.0 enable CFG.
-            num_steps: Number of intervals in the official Karras schedule.
-                The sampler evaluates ``num_steps + 1`` timesteps.
-            skip_layers: List of transformer layers to skip (for skip-layer guidance).
-            skip_layers_start_fraction: Fraction in [0, 1] of the sampling steps to complete
-                before skip-layer guidance becomes active.
+            sample_steps: Native preset step count. Karras evaluates ``sample_steps + 1``
+                timesteps; shifted linear evaluates ``sample_steps``.
+            sample_type: Integration policy; only ``"ode"`` is supported.
+            shift: Shift of the linear sigma preset (the reference's 5.0 by default); the Karras
+                preset ignores it.
             fps: Frames per second tensor for temporal conditioning.
-            conditioning_latents: Latent frames to condition on for video2world mode,
-                shape (B, C, T, H, W). If provided, enables video2world mode.
-            num_conditioning_frames: Number of frames to use for conditioning (default 1).
             conditional_frame_timestep: Normalized conditioning-frame timestep
                 forwarded to ``forward()`` (default 1e-4).
             denoise_replace_gt_frames: Whether to replace velocity for conditioning frames
-                with analytical velocity (noise - gt_frames). Default True.
+                with the constant velocity ``(initial_latents - conditioning_latents) / t_init``.
+                False retains their guided model predictions; input conditioning still applies. Default True.
+            guidance_cfg: Composite guidance config; ``None`` →
+                ``default_guidance_cfg()`` (CFG at 5.0).
 
         Returns:
             The denoised sample tensor.
         """
-        assert self.schedule_type == "rf", f"{self.schedule_type} is not supported"
+        self._validate_sample_kwargs(
+            sample_type,
+            supported_schedule_types=("rf",),
+            supported_sample_types=("ode",),
+        )
 
-        # Match official Cosmos Predict2.5 inference: a Karras ramp over [0.01, 200] in
-        # flow-matching units, and `num_steps` denotes intervals, hence `num_steps + 1`
-        # ramp points.
-        if self.sample_scheduler is None:
-            self.sample_scheduler = FlowKarrasUniPCScheduler(
-                num_train_timesteps=1000,
-                prediction_type="flow_prediction",
-                use_flow_sigmas=True,
-                sigma_min=0.01,
-                sigma_max=200.0,
-            )
-        self.sample_scheduler.set_timesteps(num_inference_steps=num_steps + 1, device=noise.device)
-        timesteps = self.sample_scheduler.timesteps
+        if guidance_cfg is None:
+            guidance_cfg = self.default_guidance_cfg()
 
-        # Initialize latents with proper scaling based on the initial timestep
-        t_init = timesteps[0] / self.sample_scheduler.config.num_train_timesteps
-        latents = self.noise_scheduler.latents(noise=noise, t_init=t_init)
+        scheduler, t_grid = self.sample_scheduler_and_grid(sample_steps, flow_shift=shift, device=noise.device)
+
+        # Unlike native FlowUniPC, which starts from unscaled noise, start at the first query time's noise level.
+        latents = self.noise_scheduler.latents(noise=noise, t_init=t_grid[0])
+        # The conditioning-frame velocity must span the solver's first sigma; t_grid[0] matches it unless clamped.
+        t_init = scheduler.sigmas[0].to(device=noise.device, dtype=self.noise_scheduler.t_precision)
 
         # Default fps for video generation (use self.fps which can be set via model.net.fps)
         if fps is None:
             fps = torch.full((latents.shape[0],), self.fps, device=latents.device)
 
-        # Handle dict-style condition (extract conditioning info if provided this way)
-        # This allows both direct kwargs and dict-style condition to work
-        if isinstance(condition, dict):
-            if conditioning_latents is None and "conditioning_latents" in condition:
-                conditioning_latents = condition["conditioning_latents"]
-            if "condition_mask" in condition:
-                # Extract num_conditioning_frames from mask if not explicitly provided
-                mask = condition["condition_mask"]
-                if conditioning_latents is not None:
-                    num_conditioning_frames = int(mask[:, :, :, 0, 0].sum(dim=2).max().item())
+        # Video2world conditions are dicts that carry the conditioning latents and mask with the text embeddings
+        conditioning_latents = None
+        condition_mask = None
+        if isinstance(condition, Mapping):
+            conditioning_latents = condition.get("conditioning_latents")
+            condition_mask = condition.get("condition_mask")
             # Extract text embeddings for the actual forward pass
             condition = condition["text_embeds"]
-        if isinstance(neg_condition, dict):
+        if isinstance(neg_condition, Mapping):
             neg_condition = neg_condition["text_embeds"]
+        if (conditioning_latents is None) != (condition_mask is None):
+            raise ValueError("conditioning_latents and condition_mask must be provided together")
 
-        # Video2world setup: create conditioning mask and prepare conditioning latents
+        # Video2world setup: prepare the conditioning mask and latents
         video2world_mode = conditioning_latents is not None
         conditioning_latents_full = None
-        condition_mask = None
         condition_mask_C = None
         initial_latents = None
 
         if video2world_mode:
-            B, C, T, H, W = latents.shape
+            T = latents.shape[2]
             T_cond = conditioning_latents.shape[2]
 
             # Validate shapes
             assert T_cond <= T, f"Conditioning frames ({T_cond}) cannot exceed total frames ({T})"
-            assert (
-                num_conditioning_frames <= T_cond
-            ), f"num_conditioning_frames ({num_conditioning_frames}) exceeds conditioning_latents frames ({T_cond})"
-
-            # Create condition mask: 1 for conditioning frames, 0 for generated
-            condition_mask = torch.zeros(B, 1, T, H, W, device=latents.device, dtype=latents.dtype)
-            condition_mask[:, :, :num_conditioning_frames, :, :] = 1.0
+            assert_tensor(
+                ~condition_mask[:, :, T_cond:].any(),
+                f"condition_mask selects frames beyond the {T_cond} conditioning_latents frames",
+            )
 
             # Build condition dict for _get_conditioning_tensors
             v2w_condition = {"conditioning_latents": conditioning_latents, "condition_mask": condition_mask}
@@ -1259,19 +1387,13 @@ class CosmosPredict2(FastGenNetwork):
             # Store the initial latents for velocity replacement
             initial_latents = latents.clone()
 
-        for step_idx, timestep in enumerate(tqdm(timesteps, desc="Sampling")):
-            # Normalize timestep to [0, 1] range
-            t = (timestep / self.sample_scheduler.config.num_train_timesteps).expand(latents.shape[0])
-            t = self.noise_scheduler.safe_clamp(t, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t).to(
-                latents.dtype
-            )
+        for sched_step, t in tqdm(zip(scheduler.timesteps, t_grid, strict=True), total=len(t_grid), desc="Sampling"):
+            t = t.expand(latents.shape[0])
 
             if video2world_mode:
-                # Replace conditioning frames with clean latents using preserve_conditioning
-                v2w_condition = {"conditioning_latents": conditioning_latents, "condition_mask": condition_mask}
-                model_input = self.preserve_conditioning(latents, v2w_condition)
-
-                # Wrap condition with mask for forward() to use
+                # forward() replaces the conditioning frames with the clean latents and presents
+                # them with `conditional_frame_timestep`; guidance pins their prediction against
+                # the raw latent state that UniPC evolves below. No t-masking is done here.
                 cond_with_mask = {
                     "text_embeds": condition,
                     "conditioning_latents": conditioning_latents,
@@ -1283,39 +1405,33 @@ class CosmosPredict2(FastGenNetwork):
                     "condition_mask": condition_mask,
                 }
             else:
-                model_input = latents
                 cond_with_mask = condition
                 neg_cond_with_mask = neg_condition
 
-            # Forward pass
-            velocity_pred = self(
-                model_input,
+            # Forward pass with guidance. Pass the scalar timestep `t`; forward() handles
+            # the conditioning-frame timestep masking internally (using
+            # `conditional_frame_timestep` for the clean frames).
+            velocity_pred = predict_with_guidance(
+                self,
+                latents,
                 t,
-                cond_with_mask,
+                guidance_cfg=guidance_cfg,
+                condition=cond_with_mask,
+                neg_condition=neg_cond_with_mask,
+                fwd_pred_type="flow",
                 fps=fps,
                 conditional_frame_timestep=conditional_frame_timestep,
+                apply_output_conditioning=denoise_replace_gt_frames,
             )
-
-            # Classifier-free guidance
-            if guidance_scale > 1.0:
-                velocity_uncond = self(
-                    model_input,
-                    t,
-                    neg_cond_with_mask,
-                    fps=fps,
-                    conditional_frame_timestep=conditional_frame_timestep,
-                    skip_layers=skip_layers if step_idx >= skip_layers_start_fraction * len(timesteps) else None,
-                )
-                velocity_pred = velocity_uncond + guidance_scale * (velocity_pred - velocity_uncond)
 
             # Replace velocity for conditioning frames with the constant velocity that carries
             # the initial latents onto the conditioning frames over the interval [0, t_init].
             if video2world_mode and denoise_replace_gt_frames:
                 gt_velocity = (initial_latents - conditioning_latents_full) / t_init
-                velocity_pred = gt_velocity * condition_mask_C + velocity_pred * (1 - condition_mask_C)
+                velocity_pred = torch.where(condition_mask_C, gt_velocity, velocity_pred)
 
-            # Keep clean frames in the DiT input while UniPC evolves raw latents.
-            latents = self.sample_scheduler.step(velocity_pred, timestep, latents, return_dict=False)[0]
+            # UniPC evolves the raw latents; forward() feeds the DiT clean conditioning frames.
+            latents = scheduler.step(velocity_pred, sched_step, latents, return_dict=False)[0]
 
         return latents
 
@@ -1324,7 +1440,6 @@ class CosmosPredict2(FastGenNetwork):
         x_t: torch.Tensor,
         t: torch.Tensor,
         condition: Union[torch.Tensor, Dict[str, Any]] = None,
-        r: Optional[torch.Tensor] = None,
         return_features_early: bool = False,
         feature_indices: Optional[Set[int]] = None,
         return_logvar: bool = False,
@@ -1333,7 +1448,9 @@ class CosmosPredict2(FastGenNetwork):
         fps: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         skip_layers: Optional[List[int]] = None,
-        conditional_frame_timestep: float = 0.0,
+        conditional_frame_timestep: float = 1e-4,
+        apply_output_conditioning: bool = True,
+        output_dtype: OutputDtype = "same",
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -1349,93 +1466,64 @@ class CosmosPredict2(FastGenNetwork):
                 - torch.Tensor of shape (B, L, D) for text embeddings
                 - Dict with keys: 'text_embeds' (required), and optionally
                   'conditioning_latents', 'condition_mask' for video2world mode
-            r: Optional second timestep for flow matching (reserved for future use)
             return_features_early: If True, return features once all requested
                 indices are collected without completing the full forward pass
             feature_indices: Set of block indices to extract features from.
-                If non-empty, features will be returned along with the output.
-            return_logvar: If True, return log variance along with the output
+                Any provided set returns features along with the output, including
+                an empty feature list for an empty set. None returns only the output.
+            return_logvar: If True, return log variance along with the output, one (B, 1) value per sample
             unpatchify_features: If True, reshape features to (B, C, T, H, W) format
             fwd_pred_type: Override prediction type ('x0', 'eps', 'v', 'flow')
             fps: Frames per second tensor
             padding_mask: Padding mask tensor
             skip_layers: List of block indices to skip during forward pass
-            conditional_frame_timestep: Normalized timestep for conditioning frames.
-                ``forward()`` defaults to 0.0; ``sample()`` passes 1e-4, equivalent
-                to the official raw timestep 0.1 after its 0.001 network scale.
+            conditional_frame_timestep: Normalized timestep for conditioning frames (1e-4 by default,
+                the reference post-training's raw timestep 0.1 after its 0.001 network scale).
                 A negative value disables the special conditioning-frame timestep.
-
+            apply_output_conditioning: Re-pin the Video2World frames after the conversion.
+            output_dtype: ``"same"`` rounds the prediction to the state dtype; ``None`` keeps it in high precision.
         Returns:
             Depending on the arguments:
-            - torch.Tensor: Model output if no features or logvar requested
+            - torch.Tensor: Model output if feature_indices is None and logvar is not requested
             - List[torch.Tensor]: Features if return_features_early=True
-            - [output, features]: If feature_indices is non-empty
+            - [output, features]: If feature_indices is not None
             - (output, logvar): If return_logvar=True
             - ([output, features], logvar): If both features and logvar requested
         """
-        if feature_indices is None:
-            feature_indices = set()
-        if return_features_early and len(feature_indices) == 0:
-            # Exit immediately if user requested this.
+        self._validate_forward_kwargs(
+            fwd_kwargs,
+            return_features_early=return_features_early,
+            feature_indices=feature_indices,
+            skip_layers=skip_layers,
+            supports_skip_layers=True,
+            num_features=len(self.transformer.blocks),
+        )
+        if return_features_early and feature_indices is not None and not feature_indices:
             return []
 
         if fps is None:
             fps = torch.full((x_t.shape[0],), self.fps, device=x_t.device)
 
-        if fwd_pred_type is None:
-            fwd_pred_type = self.net_pred_type
-        else:
-            assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
-
         # Handle dict-style condition for video2world mode
-        # Extract: text_embeds, conditioning_latents, condition_mask (used as video_condition_mask)
-        conditioning_latents = None
+        # Extract: text_embeds and condition_mask (used as video_condition_mask)
         condition_mask = None
-        if isinstance(condition, dict):
+        if isinstance(condition, Mapping):
             text_embeds = condition["text_embeds"]
-            conditioning_latents = condition.get("conditioning_latents")
             condition_mask = condition.get("condition_mask")  # Used as video_condition_mask for transformer
         else:
             text_embeds = condition
+        model_input, transformer_t = self._conditioned_inputs(x_t, t, condition, conditional_frame_timestep)
 
-        # Video2world training: replace input frames with conditioning latents
-        model_input = x_t
-        transformer_t = t
-        conversion_t = t
-        if conditioning_latents is not None and condition_mask is not None:
-            B, C, T, H, W = x_t.shape
-            # Expand condition_mask to channel dimension
-            condition_mask_C = condition_mask.expand(-1, C, -1, -1, -1)
-            # Pad conditioning_latents to full temporal dimension if needed
-            if conditioning_latents.shape[2] < T:
-                conditioning_latents_full = torch.zeros_like(x_t)
-                conditioning_latents_full[:, :, : conditioning_latents.shape[2]] = conditioning_latents
-            else:
-                conditioning_latents_full = conditioning_latents
-            # Replace conditioning frames
-            model_input = conditioning_latents_full * condition_mask_C + x_t * (1 - condition_mask_C)
-
-            # Normalize to per-frame timesteps. Conditioning frames use the special
-            # timestep when enabled; a negative value preserves the original timestep.
-            if t.ndim == 1:
-                t_expanded = t.unsqueeze(1).expand(B, T)
-            elif t.ndim == 2:
-                t_expanded = t.expand(B, T)
-            else:
-                raise ValueError(f"Expected t with rank 1 or 2, got shape {tuple(t.shape)}")
-
-            if conditional_frame_timestep >= 0:
-                mask_B_T = condition_mask[:, 0, :, 0, 0].to(t.dtype)  # (B, T)
-                transformer_t = t_expanded * (1 - mask_B_T) + conditional_frame_timestep * mask_B_T
-            else:
-                transformer_t = t_expanded
-
-            # Reshape for convert_model_output broadcasting against (B, C, T, H, W)
-            conversion_t = transformer_t.reshape(B, 1, T, 1, 1)
-
+        model_input_core = self.cast_to_model_precision(model_input)
+        assert_same(dtype=self.precision_model, device=model_input_core.device, text_embeds=text_embeds)
+        # NVIDIA Predict2.5 casts floating batch inputs, including fps, to the model's
+        # execution dtype before the DiT. Mirror that boundary here for every fps source dtype.
+        fps = fps.to(dtype=model_input_core.dtype)
+        # Keep normalized timesteps in FP32 through the sinusoidal projection.
+        transformer_t_core = transformer_t.to(dtype=torch.float32)
         model_outputs = self.transformer(
-            x_B_C_T_H_W=model_input,
-            timesteps_B_T=transformer_t,
+            x_B_C_T_H_W=model_input_core,
+            timesteps_B_T=transformer_t_core,
             crossattn_emb=text_embeds,
             fps=fps,
             padding_mask=padding_mask,
@@ -1462,22 +1550,13 @@ class CosmosPredict2(FastGenNetwork):
         else:
             out = model_outputs
 
-        if len(feature_indices) == 0:
+        output_args = (x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning)
+        if feature_indices is None:
             assert isinstance(out, torch.Tensor)
-            out = self.noise_scheduler.convert_model_output(
-                model_input, out, conversion_t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
-            # Video2world training: replace x0 prediction for conditioning frames
-            if conditioning_latents is not None and condition_mask is not None and fwd_pred_type == "x0":
-                out = conditioning_latents_full * condition_mask_C + out * (1 - condition_mask_C)
+            out = self.transform_output(out, *output_args, conditional_frame_timestep=conditional_frame_timestep)
         else:
             assert isinstance(out, list)
-            out[0] = self.noise_scheduler.convert_model_output(
-                model_input, out[0], conversion_t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
-            # Video2world training: replace x0 prediction for conditioning frames
-            if conditioning_latents is not None and condition_mask is not None and fwd_pred_type == "x0":
-                out[0] = conditioning_latents_full * condition_mask_C + out[0] * (1 - condition_mask_C)
+            out[0] = self.transform_output(out[0], *output_args, conditional_frame_timestep=conditional_frame_timestep)
             # Unpatchify features to match expected output format
             if unpatchify_features:
                 out[1] = [rearrange(f, "B T H W D -> B D T H W") for f in out[1]]
@@ -1485,5 +1564,5 @@ class CosmosPredict2(FastGenNetwork):
                 out[1] = [rearrange(f, "B T H W D -> B (T H W) D") for f in out[1]]
 
         if return_logvar:
-            return out, logvar
+            return out, logvar.to(dtype=x_t.dtype)
         return out

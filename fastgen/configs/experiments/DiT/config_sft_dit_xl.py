@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+
 from omegaconf import DictConfig
 
 import fastgen.configs.methods.config_sft as config_sft_default
 from fastgen.configs.data import ImageNet256_Loader_Config
-from fastgen.configs.net import DiT_IN256_XL_Config, CKPT_ROOT_DIR
+from fastgen.configs.net import DIT_XL_2_256_URL, DiT_XL_2_256_Config
 from fastgen.configs.callbacks import EMA_CONST_CALLBACKS
+from fastgen.networks.DiT.network import DiT
 
 """Configs for SFT (Supervised Fine-Tuning) on DiT-XL and ImageNet-256 dataset."""
 
@@ -18,6 +21,7 @@ def create_config():
     # DiT latent shape: [C, H, W] = [4, 32, 32] for 256x256 images (256/8 = 32)
     config.model.input_shape = [4, 32, 32]
     config.model.precision_amp = "bfloat16"
+    config.model.precision_amp_infer = "bfloat16"
     config.model.cond_dropout_prob = 0.1  # 10% dropout for CFG training
 
     # Timestep sampling config
@@ -29,14 +33,11 @@ def create_config():
 
     # Pretrained model path
     # DiT-XL/2 ImageNet-256 checkpoint from https://github.com/facebookresearch/DiT
-    config.model.pretrained_model_path = f"{CKPT_ROOT_DIR}/imagenet-256/DiT-XL-2-256x256.pt"
+    config.model.pretrained_model_path = DIT_XL_2_256_URL
 
-    # Network config
-    config.model.net = DiT_IN256_XL_Config
-    config.model.net.learn_sigma = True  # Facebook DiT checkpoint was trained with learn_sigma=True
-    # Facebook DiT was trained with DDPM (epsilon prediction), not flow matching
-    config.model.net.net_pred_type = "eps"
-    config.model.net.schedule_type = "sd"  # Uses same linear beta schedule as DiT (0.0001 to 0.02)
+    # Network config: the DiT-XL/2 release (eps prediction with learned variance on linear DDPM betas, 3-channel CFG)
+    config.model.net = copy.deepcopy(DiT_XL_2_256_Config)
+    config.model.guidance_cfg = DiT.default_guidance_cfg()
 
     # Optimizer config (lower LR for fine-tuning; 1e-4 is for training from scratch)
     config.model.net_optimizer.optim_type = "adamw"
@@ -49,13 +50,13 @@ def create_config():
     config.trainer.callbacks = DictConfig(
         {k: v for k, v in config.trainer.callbacks.items() if not k.startswith("ema")}
     )
-    config.trainer.callbacks.update(EMA_CONST_CALLBACKS)
+    config.trainer.callbacks.update({k: EMA_CONST_CALLBACKS[k] for k in config.model.use_ema})
 
     # Dataloader
-    config.dataloader_train = ImageNet256_Loader_Config
+    config.dataloader_train = copy.deepcopy(ImageNet256_Loader_Config)
 
     # Sampling config for visualization
-    config.model.student_sample_steps = 50  # DiT typically uses 50-250 steps
+    config.model.student_grid_cfg.steps = 50  # DiT typically uses 50-250 steps
 
     # Trainer
     config.trainer.batch_size_global = 256

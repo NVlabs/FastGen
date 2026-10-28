@@ -3,7 +3,7 @@
 
 from omegaconf import DictConfig
 from fastgen.configs.methods.config_mean_flow import create_config as mf_create_config
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
 from fastgen.datasets.augment import AugmentPipe
 from fastgen.configs.callbacks import EMA_CONST_CALLBACKS
 
@@ -14,8 +14,9 @@ def create_config():
     config = mf_create_config()
 
     # Recommended setting for 2-step:
-    # config.model.sample_t_cfg.t_list = [0.999, 0.5, 0.0]
-    # config.model.student_sample_steps = 2
+    # config.model.student_grid_cfg.grid_type = "explicit"
+    # config.model.student_grid_cfg.grid_kwargs = {"timesteps": [0.999, 0.5, 0.0]}
+    # config.model.student_grid_cfg.steps = 2
 
     config.model.sample_t_cfg.train_p_mean = -0.6
     config.model.sample_t_cfg.train_p_std = 1.6
@@ -23,12 +24,8 @@ def create_config():
     config.model.sample_t_cfg.min_t = 0.0
     config.model.sample_t_cfg.max_t = 0.999
 
-    config.model.sample_r_cfg.enabled = True
-    config.model.sample_r_cfg.time_dist_type = "logitnormal"
-    config.model.sample_r_cfg.train_p_mean = -4.0
-    config.model.sample_r_cfg.train_p_std = 1.6
-    config.model.sample_r_cfg.min_t = 0.0
-    config.model.sample_r_cfg.max_t = 0.999
+    # r follows the t distribution except for its mean.
+    config.model.sample_r_overrides = {"train_p_mean": -4.0}
 
     config.model.loss_config.norm_method = "poly_0.75"
 
@@ -39,7 +36,7 @@ def create_config():
     config.model.net_scheduler.warm_up_steps = [(200 * 50000) // 1024]  # 200 epochs for CIFAR-10 with batch size 1024
     config.model.net_scheduler.f_start = [1e-8 / config.model.net_optimizer.lr]
 
-    config.model.net.dropout = 0.2
+    config.model.net.backbone.dropout = 0.2
     config.model.net.schedule_type = "rf"
     config.model.net.net_pred_type = "flow"
     config.model.loss_config.norm_const = 1e-3
@@ -57,7 +54,7 @@ def create_config():
     config.trainer.augment_pipe = L(AugmentPipe)(
         p=0.12, xflip=1e8, yflip=0, scale=1, rotate_frac=0, aniso=1, translate_frac=1
     )
-    config.model.net.augment_dim = 6
+    config.model.net.backbone.augment_dim = 6
     config.dataloader_train.xflip = True
 
     # trainer

@@ -5,8 +5,7 @@ from omegaconf import DictConfig
 import torch
 from torch.optim import Optimizer, Adam, AdamW, RAdam, lr_scheduler
 
-from fastgen.utils import LazyCall as L, instantiate
-import fastgen.utils.logging_utils as logger
+from fastgen.configs.instantiate import LazyCall as L, instantiate
 from fastgen.utils.lr_scheduler import LambdaLinearScheduler
 
 
@@ -20,8 +19,7 @@ def get_optimizer(
     elif optim_type == "radam":
         opt_cls = RAdam
     else:
-        logger.error(f"Unknown optimizer type: {optim_type}, use the default adam instead!")
-        opt_cls = Adam
+        raise ValueError(f"Unknown optimizer type: {optim_type!r}; expected 'adam', 'adamw', or 'radam'.")
     optimizer = opt_cls(
         params=[p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay, **kwargs
     )
@@ -31,14 +29,10 @@ def get_optimizer(
 def get_scheduler(
     optimizer: torch.optim.Optimizer,
     scheduler_config: dict | DictConfig,
-) -> lr_scheduler:
+) -> lr_scheduler.LambdaLR:
     net_scheduler = instantiate(scheduler_config)
-    return lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=[
-            net_scheduler.schedule,
-        ],
-    )
+    # One callable applies to every parameter group.
+    return lr_scheduler.LambdaLR(optimizer, lr_lambda=net_scheduler.schedule)
 
 
 BaseOptimizerConfig: DictConfig = L(get_optimizer)(

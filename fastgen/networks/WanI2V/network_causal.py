@@ -14,30 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import types
 from typing import Optional, List, Set, Union, Tuple, Dict
 
 from tqdm.auto import tqdm
 import torch
-from fastgen.networks.network import CausalFastGenNetwork
-from fastgen.networks.Wan.network import (
-    classify_forward,
-)
-from fastgen.networks.Wan.network_causal import (
-    _rope_forward_with_time_offset,
-    _prepare_blockwise_causal_attn_mask,
-    _create_external_caches,
-    _wan_set_attn_processor,
-    _wan_block_forward_inline_cache,
-    classify_forward_prepare,
-    classify_forward_block_forward,
-    CausalWanAttnProcessor,
-)
+from fastgen.networks.network_causal import CausalContext, causal_chunk_ranges
+from fastgen.networks.Wan.network_causal import CausalWan
 from fastgen.networks.WanI2V.network import WanI2V
-from fastgen.networks.noise_schedule import NET_PRED_TYPES
+from fastgen.utils.tree_utils import OutputDtype, assert_same
+from fastgen.utils.guidance import (
+    GuidanceConfig,
+    predict_with_guidance,
+)
 
 
-class CausalWanI2V(CausalFastGenNetwork, WanI2V):
+class CausalWanI2V(CausalWan, WanI2V):
     def __init__(
         self,
         model_id_or_local_path: str = WanI2V.MODEL_ID_VER_2_2_TI2V_5B_720P,
@@ -56,8 +47,7 @@ class CausalWanI2V(CausalFastGenNetwork, WanI2V):
         mask_when_storing_cache: bool = False,
         chunk_size: int = 3,
         total_num_frames: int = 21,
-        delete_cache_on_clear: bool = False,
-        **model_kwargs,
+        **kwargs,
     ):
         """Causal Wan I2V model constructor.
 
@@ -80,8 +70,7 @@ class CausalWanI2V(CausalFastGenNetwork, WanI2V):
                 Otherwise only the first frame is masked. Defaults to False.
             chunk_size (int, optional): The chunk size for the transformer. Defaults to 3.
             total_num_frames (int, optional): The total number of frames. Defaults to 21.
-            delete_cache_on_clear (bool, optional): Whether to delete the cache on clear. Defaults to False.
-            **model_kwargs: Additional keyword arguments to pass to the FastGenNetwork constructor.
+            **kwargs: Additional keyword arguments passed to ``WanI2V``.
         """
         super().__init__(
             model_id_or_local_path=model_id_or_local_path,
@@ -99,180 +88,9 @@ class CausalWanI2V(CausalFastGenNetwork, WanI2V):
             use_fsdp_checkpoint=use_fsdp_checkpoint,
             chunk_size=chunk_size,
             total_num_frames=total_num_frames,
-            **model_kwargs,
+            **kwargs,
         )
         self._mask_when_storing_cache = mask_when_storing_cache
-        self._delete_cache_on_clear = delete_cache_on_clear
-
-    def override_transformer_forward(self, inner_dim: int) -> None:
-        # Patch rope offset and helper methods
-        if hasattr(self.transformer, "rope"):
-            self.transformer.rope.forward = types.MethodType(_rope_forward_with_time_offset, self.transformer.rope)
-        self.transformer._prepare_blockwise_causal_attn_mask = types.MethodType(
-            _prepare_blockwise_causal_attn_mask, self.transformer
-        )
-        self.transformer._create_external_caches = types.MethodType(_create_external_caches, self.transformer)
-        self.transformer.set_attn_processor = types.MethodType(_wan_set_attn_processor, self.transformer)
-        self.transformer.classify_forward_prepare = types.MethodType(classify_forward_prepare, self.transformer)
-        self.transformer.classify_forward_block_forward = types.MethodType(
-            classify_forward_block_forward, self.transformer
-        )
-        self.transformer.forward = types.MethodType(classify_forward, self.transformer)
-
-        # Patch block forward to inline-cache path
-        for block in self.transformer.blocks:
-            block.forward = types.MethodType(_wan_block_forward_inline_cache, block)
-
-        # Install attention processor with inline caches
-        self.transformer.set_attn_processor(CausalWanAttnProcessor())
-        self.transformer.block_mask = None
-
-    def clear_caches(self) -> None:
-        if self._delete_cache_on_clear:
-            if hasattr(self.transformer, "_external_self_kv_list"):
-                del self.transformer._external_self_kv_list
-            if hasattr(self.transformer, "_external_cross_kv_list"):
-                del self.transformer._external_cross_kv_list
-            torch.cuda.empty_cache()
-            return
-
-        # Reset external KV lengths if present (mapping by tag)
-        if hasattr(self.transformer, "_external_self_kv_list"):
-            for kvb in self.transformer._external_self_kv_list:
-                if isinstance(kvb, dict):
-                    for sub in kvb.values():
-                        if isinstance(sub, dict):
-                            sub["len"] = 0
-                            sub["k"] = torch.zeros_like(sub["k"])
-                            sub["v"] = torch.zeros_like(sub["v"])
-        # Reset external cross-attn cache init flags if present (mapping by tag)
-        if hasattr(self.transformer, "_external_cross_kv_list"):
-            for kvb in self.transformer._external_cross_kv_list:
-                if isinstance(kvb, dict):
-                    for sub in kvb.values():
-                        if isinstance(sub, dict):
-                            sub["is_init"] = False
-                            sub["k"] = torch.zeros_like(sub["k"])
-                            sub["v"] = torch.zeros_like(sub["v"])
-
-    def _compute_timestep_inputs(self, timestep: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Compute timestep input used for Causal Wan models.
-        Optionally Expand or mask the timestep input for Wan 2.2 TI2V models.
-            - I2V: Apply a mask that zeroes out the timestep for the first latent frame.
-            - T2V: Use a mask tensor filled with ones.
-        Different from WanI2V/network.py that expands timestep to [B, num_tokens] for Wan 2.2 TI2V models only,
-            we expand timestep to [B, num_frames] for all Wan models to perform causal training/inference.
-
-        Args:
-            timestep (torch.Tensor): shape: (B, T) or (B, )
-            mask (torch.Tensor): shape: (B, T, H, W)
-
-        Return:
-            timestep (torch.Tensor): shape: (B, T)
-        """
-        timestep = self.noise_scheduler.rescale_t(timestep)
-        if timestep.ndim == 1:
-            timestep = timestep.view(-1, 1)
-        if mask is not None:
-            p_t, _, _ = self.transformer.config.patch_size
-            timestep = mask[:, ::p_t, 0, 0] * timestep
-
-        return timestep
-
-    def _compute_i2v_inputs(
-        self,
-        x_t: torch.Tensor,
-        first_frame_cond: torch.Tensor,
-        timestep: torch.Tensor,
-        r_timestep: Optional[torch.Tensor] = None,
-        cur_start_frame: int = 0,
-        mask_all_frames: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Compute the input tensor for the I2V model. Supports two cases:
-
-            1. Wan 2.1 I2V:
-                The input is formed by concatenating three tensors along the channel dimension:
-                - x_t: noisy latent video frames
-                    shape: [bsz, num_channels, num_latent_frames, H, W]
-                - mask_lat_size: binary mask indicating which frames are clean (first) vs noisy (others)
-                    shape: [bsz, scale_factor_temporal, num_latent_frames, H, W]
-                - first_frame_cond: latent of the clean first frame, with zero-padded frames for the rest
-                    shape: [bsz, num_channels, num_latent_frames, H, W]
-
-            2. Wan 2.2 TI2V (5B model):
-                The first latent frame of x_t is replaced with the clean first frame.
-                In this case, no zero padding is applied.
-                - first_frame_cond: clean latent of the first frame only
-                    shape: [bsz, num_channels, 1, H, W]
-                We also expand timesteps as Wan TI2V uses expanded timesteps.
-
-        Args:
-            x_t (torch.Tensor): The noisy latents to start from.
-            first_frame_cond (torch.Tensor): The clean first frame padded with encoded zero pixels.
-            timestep (torch.Tensor): The timestep.
-            r_timestep (torch.Tensor): The optional timestep for meanflow-like models.
-            cur_start_frame (int): The current start frame index. Varies during autoregressive sampling.
-            mask_all_frames (bool): Whether to mask all frames. Used optionally for KV-caching during
-                autoregressive sampling.
-        """
-        bsz, _, num_latent_frames, H, W = x_t.shape
-        if self.concat_mask:
-            scale_factor_temporal = 4
-
-            # with clean images
-            if mask_all_frames:
-                # Need to mask all frames
-                num_frames = num_latent_frames * scale_factor_temporal
-                mask_lat_size = torch.ones(bsz, 1, num_frames, H, W).to(dtype=x_t.dtype, device=first_frame_cond.device)
-            elif cur_start_frame == 0:
-                # Not masking all, but the first frame needs to be masked
-                # mask tensor to indicate whether the frame is real (clean) frame or noisy one
-                num_frames = (num_latent_frames - 1) * scale_factor_temporal + 1
-                mask_lat_size = torch.zeros(bsz, 1, num_frames, H, W).to(
-                    dtype=x_t.dtype, device=first_frame_cond.device
-                )
-                # first frame is real one, so set it as one
-                mask_lat_size[:, :, 0] = 1
-                first_frame_mask = mask_lat_size[:, :, :1]
-                first_frame_mask = torch.repeat_interleave(first_frame_mask, dim=2, repeats=scale_factor_temporal)
-                # mask_lat_size: (bsz, 1, scale_factor_temporal * num_latent_frames, H, W)
-                mask_lat_size = torch.concat([first_frame_mask, mask_lat_size[:, :, 1:, :]], dim=2)
-            else:
-                # Not masking any frames, as we're past first frame too
-                num_frames = num_latent_frames * scale_factor_temporal
-                mask_lat_size = torch.zeros(bsz, 1, num_frames, H, W).to(
-                    dtype=x_t.dtype, device=first_frame_cond.device
-                )
-            # mask_lat_size: (bsz, num_latent_frames, scale_factor_temporal, H, W)
-            mask_lat_size = mask_lat_size.view(bsz, -1, scale_factor_temporal, H, W)
-            # mask_lat_size: (bsz, scale_factor_temporal, num_latent_frames, H, W)
-            mask_lat_size = mask_lat_size.transpose(1, 2)
-            latent_model_input = torch.concat([x_t, mask_lat_size, first_frame_cond], dim=1)
-
-            timestep = self._compute_timestep_inputs(timestep)
-            if r_timestep is not None:
-                r_timestep = self._compute_timestep_inputs(r_timestep)
-        else:
-            latent_model_input = x_t
-            timestep_mask = None
-            if mask_all_frames:
-                # Need to mask all frames
-                latent_model_input = x_t
-                timestep_mask = torch.ones(1, 1, num_latent_frames, H, W).to(dtype=x_t.dtype, device=x_t.device)
-            if cur_start_frame == 0:
-                # At the start, so force the first frame replacement
-                latent_model_input, first_frame_mask = self._replace_first_frame(
-                    first_frame_cond, x_t, return_mask=True
-                )
-                # If we're not masking all frames, we need to mask just the first frame
-                if not mask_all_frames:
-                    timestep_mask = first_frame_mask[:, 0]
-            timestep = self._compute_timestep_inputs(timestep, timestep_mask)
-
-            if r_timestep is not None:
-                r_timestep = self._compute_timestep_inputs(r_timestep, timestep_mask)
-        return latent_model_input, timestep, r_timestep
 
     def forward(
         self,
@@ -286,53 +104,74 @@ class CausalWanI2V(CausalFastGenNetwork, WanI2V):
         unpatchify_features: bool = True,
         fwd_pred_type: Optional[str] = None,
         skip_layers: Optional[List[int]] = None,
-        cache_tag: str = "pos",
-        cur_start_frame: int = 0,
-        store_kv: bool = False,
-        is_ar: bool = False,
+        causal_ctx: Optional[CausalContext] = None,
+        apply_output_conditioning: bool = True,
+        output_dtype: OutputDtype = "same",
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-        """Forward pass of the StableDiffusion latent diffusion score model.
+        """Forward pass of the WanI2V diffusion score model.
 
         Args:
             x_t (torch.Tensor): The diffused data sample.
             t (torch.Tensor): The current timestep.
-            condition (Dict[str, torch.Tensor]): The conditioning information.  Defaults to None.
+            condition (Optional[Dict[str, torch.Tensor]]): The conditioning information. Defaults to None.
             r (torch.Tensor): Another timestep mainly used by meanflow.
             return_features_early: If true, the forward pass returns the features once the set is complete.
                 This means the forward pass will not finish completely and no final output is returned.
             feature_indices: A set of feature indices (a set of integers) decides which blocks
-                to extract features from. If the set is non-empty, then features will be returned.
-                By default, feature_indices=None means extract no features.
-            return_logvar: If true, the foward pass returns the logvar.
+                to extract features from. Any provided set returns a feature list alongside the output,
+                including an empty list for an empty set. None returns only the model output.
+            return_logvar: If true, the forward pass also returns the logvar, shape [B, 1].
+            unpatchify_features: If true, the features are unpatchified to [B, C', T, H, W] (C' = hidden size / patch
+                volume); otherwise they stay packed as [B, N_tokens, D].
             fwd_pred_type: Update the network prediction type, must be in ['x0', 'eps', 'v', 'flow'].
                 None means using the original net_pred_type.
             skip_layers: Apply skip-layer guidance by skipping layers of the unconditional network during forward pass.
-            images: The images given as condition to the model.
-
+            causal_ctx: Causal rollout state for the KV-cache path. None attends to the whole sequence without a
+                mask; causal training and sampling always pass a context.
+            apply_output_conditioning: Pin frame zero in the first chunk after the conversion.
+            output_dtype: ``"same"`` rounds the prediction to the state dtype; ``None`` keeps it in high precision.
         Returns:
             torch.Tensor: The score model output.
         """
+        self._validate_forward_kwargs(
+            fwd_kwargs,
+            r=r,
+            return_features_early=return_features_early,
+            feature_indices=feature_indices,
+            skip_layers=skip_layers,
+            supports_r_timestep=getattr(self.transformer, "r_embedder", None) is not None,
+            supports_skip_layers=True,
+            num_features=len(self.transformer.blocks),
+        )
+        if return_features_early and feature_indices is not None and not feature_indices:
+            return []
+
         assert isinstance(condition, dict), "condition must be a dict"
         assert "text_embeds" in condition, "condition must contain 'text_embeds'"
         assert "first_frame_cond" in condition, "condition must contain 'first_frame_cond'"
 
-        if feature_indices is None:
-            feature_indices = {}
-        if return_features_early and len(feature_indices) == 0:
-            # Exit immediately if user requested this.
-            return []
+        cur_start_frame = 0 if causal_ctx is None else causal_ctx.cur_start_frame
+        store_kv = False if causal_ctx is None else causal_ctx.store_kv
 
-        if fwd_pred_type is None:
-            fwd_pred_type = self.net_pred_type
-        else:
-            assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
-
-        text_embeds, first_frame_cond = condition["text_embeds"], condition["first_frame_cond"]
+        first_frame_cond = condition["first_frame_cond"]
         # Slice the first frame cond to match the current frame start
         if self.concat_mask:
             first_frame_cond = first_frame_cond[:, :, cur_start_frame : cur_start_frame + x_t.shape[2]]
-        text_embeds = torch.stack(text_embeds, dim=0) if isinstance(text_embeds, list) else text_embeds
+
+        assert_same(
+            shape=self.concat_mask,
+            device=True,
+            x_t=x_t,
+            first_frame_cond=first_frame_cond,
+        )
+        assert_same(
+            shape=True,
+            dtype=self.noise_scheduler.t_precision,
+            device=True,
+            t=t,
+            r=r,
+        )
 
         i2v_inputs, timestep, r_timestep = self._compute_i2v_inputs(
             x_t,
@@ -342,146 +181,154 @@ class CausalWanI2V(CausalFastGenNetwork, WanI2V):
             cur_start_frame=cur_start_frame,
             mask_all_frames=store_kv and self._mask_when_storing_cache,
         )
-        kwargs = dict()
-        if "encoder_hidden_states_image" in condition:
-            kwargs["encoder_hidden_states_image"] = condition["encoder_hidden_states_image"]
+        i2v_inputs = self.cast_to_model_precision(i2v_inputs)
+        text_embeds = condition["text_embeds"]
+        encoder_hidden_states_image = condition.get("encoder_hidden_states_image")
+        assert_same(
+            dtype=self.precision_model,
+            device=i2v_inputs.device,
+            text_embeds=text_embeds,
+            encoder_hidden_states_image=encoder_hidden_states_image,
+        )
 
-        attention_kwargs = {
-            "cache_tag": cache_tag,
-            "chunk_size": self.chunk_size,
-            "store_kv": store_kv,
-            "cur_start_frame": cur_start_frame,
-            "total_num_frames": self.total_num_frames,
-            "is_ar": is_ar,
-        }
+        # Pass the primary tensor inputs positionally so FSDP2 input handling is
+        # preserved across activation-checkpoint recompute.
         model_outputs = self.transformer(
-            hidden_states=i2v_inputs,
-            timestep=timestep,
-            encoder_hidden_states=text_embeds,
+            i2v_inputs,
+            timestep,
+            text_embeds,
             r_timestep=r_timestep,
-            attention_kwargs=attention_kwargs,
+            causal_ctx=causal_ctx,
             return_features_early=return_features_early,
             feature_indices=feature_indices,
             return_logvar=return_logvar,
             skip_layers=skip_layers,
-            **kwargs,
+            encoder_hidden_states_image=encoder_hidden_states_image,
         )
 
         if return_features_early:
             assert len(model_outputs) == len(feature_indices)
-            return self._unpatchify_features(x_t, model_outputs) if unpatchify_features else model_outputs
+            return self._unpatchify_features(i2v_inputs, model_outputs) if unpatchify_features else model_outputs
 
         if return_logvar:
             out, logvar = model_outputs[0], model_outputs[1]
         else:
             out = model_outputs
 
-        if len(feature_indices) == 0:
+        if feature_indices is None:
             assert isinstance(out, torch.Tensor)
-            out = self.noise_scheduler.convert_model_output(
-                x_t, out, t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
+            out = self.transform_output(
+                out, x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning, causal_ctx=causal_ctx
             )
-            if cur_start_frame == 0 and not self.concat_mask:
-                out = self._replace_first_frame(first_frame_cond, out)
-
         else:
             assert isinstance(out, list)
-            out[0] = self.noise_scheduler.convert_model_output(
-                x_t, out[0], t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
+            out[0] = self.transform_output(
+                out[0], x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning, causal_ctx=causal_ctx
             )
-            if cur_start_frame == 0 and not self.concat_mask:
-                out[0] = self._replace_first_frame(first_frame_cond, out[0])
-            return self._unpatchify_features(x_t, model_outputs) if unpatchify_features else model_outputs
+            out[1] = self._unpatchify_features(i2v_inputs, out[1]) if unpatchify_features else out[1]
 
         if return_logvar:
-            return out, logvar
+            return out, logvar.to(dtype=x_t.dtype)
         return out
 
     def sample(
         self,
-        noise: torch.FloatTensor,
+        noise: torch.Tensor,
         condition: Optional[Dict[str, torch.Tensor]] = None,
         neg_condition: Optional[Dict[str, torch.Tensor]] = None,
-        guidance_scale: Optional[float] = 5.0,
-        sample_steps: Optional[int] = 50,
-        shift: float = 5.0,
-        context_noise: float = 0,
-        **kwargs,
+        sample_steps: Optional[int] = None,
+        sample_type: str = "ode",
+        shift: Optional[float] = None,
+        context_noise: Optional[float] = None,
+        guidance_cfg: Optional[GuidanceConfig] = None,
     ) -> torch.Tensor:
-        """Autoregressive sampling for teacher network with CFG and unipc_scheduler
+        """Autoregressive sampling for teacher network with CFG and UniPC.
 
         Args:
             noise (torch.Tensor): The pure noise to start from (usually a zero-mean, unit-variance Gaussian)
-            condition (Dict[str, torch.Tensor], optional): conditioning information.
-            neg_condition (Dict[str, torch.Tensor], optional): Optional negative conditioning information. Defaults to None.
-            guidance_scale (Optional[float]): Scale of guidance. Defaults to 5.0.
-            sample_steps (Optional[int]): Number of time steps to sample. Defaults to 4.
-            shift (Optional[float]): Shift value of timestep scheduler. Defaults to 5.0.
-            context_noise (Optional[float]): Scale of context noise in the range [0, 1]. Defaults to 0.
+            condition (Optional[Dict[str, torch.Tensor]]): Conditioning information. Defaults to None.
+            neg_condition (Optional[Dict[str, torch.Tensor]]): Optional negative conditioning information. Defaults to None.
+            sample_steps (Optional[int]): Number of time steps to sample. Defaults to None, the official setting from
+                ``resolve_sample_settings``.
+            sample_type: Integration policy; only ``"ode"`` is supported.
+            shift (Optional[float]): Shift value of timestep scheduler. Defaults to None, the official setting from
+                ``resolve_sample_settings``.
+            context_noise (Optional[float]): Time in [0, 1] to which each finished chunk is re-noised before
+                caching; None caches the clean chunk. Defaults to None.
+            guidance_cfg (Optional[GuidanceConfig]): Composite guidance config; ``None`` →
+                ``WanI2V.default_guidance_cfg()`` (CFG at 5.0).
 
         Returns:
             torch.Tensor: The sample output.
         """
-        assert self.schedule_type == "rf", f"{self.schedule_type} is not supported"
-        # Extract first_frame_cond for replacement during sampling
-        first_frame_cond = None
-        if isinstance(condition, dict) and "first_frame_cond" in condition:
-            first_frame_cond = condition["first_frame_cond"]
-        # Ensure caches are clean at the start of sampling
+        self._validate_sample_kwargs(
+            sample_type,
+            supported_schedule_types=("rf",),
+            supported_sample_types=("ode",),
+        )
+        if guidance_cfg is None:
+            guidance_cfg = self.default_guidance_cfg()
+        sample_steps, shift = self.resolve_sample_settings(noise.shape[1:], sample_steps, shift)
+
+        # Ensure caches are clean at the start of sampling.
         self.clear_caches()
 
-        batch_size = noise.shape[0]
-        num_frames = noise.shape[2]
+        kv_cache_engine = self.transformer.kv_cache_engines["main"]
 
-        num_chunks = num_frames // self.chunk_size
-        remaining_size = num_frames % self.chunk_size
-        time_rescale_factor = self.unipc_scheduler.config.num_train_timesteps
+        # One ``(cache_key, ctx, cond)`` triple per active guidance forward.
+        def new_ctx(cache_tag):
+            return CausalContext(
+                cache_tag=cache_tag,
+                cache_engines={"main": kv_cache_engine},
+                chunk_size=self.chunk_size,
+                total_num_frames=self.total_num_frames,
+                is_ar=True,
+            )
 
-        # Create initial latents
-        self.unipc_scheduler.config.flow_shift = shift
-        self.unipc_scheduler.set_timesteps(num_inference_steps=sample_steps, device=noise.device)
-        timesteps = self.unipc_scheduler.timesteps
-        t_init = timesteps[0] / time_rescale_factor
-        x = self.noise_scheduler.latents(noise=noise, t_init=t_init)
+        ctxs = [
+            (key, new_ctx(key), guidance_cfg.condition_for_pred_key(key, condition, neg_condition))
+            for key in guidance_cfg.active_pred_keys()
+        ]
 
-        for i in range(max(1, num_chunks)):
-            if num_chunks == 0:
-                start, end = 0, remaining_size
-            else:
-                start = 0 if i == 0 else self.chunk_size * i + remaining_size
-                end = self.chunk_size * (i + 1) + remaining_size
+        # Create initial latents.
+        scheduler, t_grid = self.sample_scheduler_and_grid(sample_steps, flow_shift=shift, device=noise.device)
+        x = self.noise_scheduler.latents(noise=noise, t_init=t_grid[0])
+        first_frame_cond = condition.get("first_frame_cond") if isinstance(condition, dict) else None
 
+        batch_size = x.shape[0]
+        num_frames = x.shape[2]
+
+        for start, end in causal_chunk_ranges(num_frames, self.chunk_size):
             x_next = x[:, :, start:end]
-            # Reset scheduler state (model_outputs, lower_order_nums, etc.)
-            self.unipc_scheduler.set_timesteps(num_inference_steps=sample_steps, device=noise.device)
-            for timestep in tqdm(timesteps):
-                t = (timestep / time_rescale_factor).expand(batch_size)
+            # Reset scheduler state (model_outputs, lower_order_nums, etc.).
+            # Reset the UniPC multistep state for this chunk; the grid (``timesteps`` / ``t_grid``) is unchanged.
+            self.sample_scheduler_and_grid(sample_steps, flow_shift=shift, device=noise.device)
+
+            # Configure all contexts for denoising (read-only cache access).
+            for _, ctx, _ in ctxs:
+                ctx.cur_start_frame = start
+                ctx.store_kv = False
+
+            for sched_step, t in tqdm(
+                zip(scheduler.timesteps, t_grid, strict=True), total=len(t_grid), desc="Sampling"
+            ):
+                t = t.expand(batch_size)
                 x_cur = x_next
-                flow_pred = self(
+                flow_pred = predict_with_guidance(
+                    self,
                     x_cur,
                     t,
-                    condition,
-                    cache_tag="pos",  # kv-cache positive
-                    cur_start_frame=start,
-                    store_kv=False,
-                    is_ar=True,
+                    guidance_cfg=guidance_cfg,
+                    condition=condition,
+                    neg_condition=neg_condition,
+                    fwd_pred_type="flow",
+                    contexts={key: {"causal_ctx": ctx} for key, ctx, _ in ctxs},
                 )
-                if guidance_scale is not None:
-                    flow_uncond = self(
-                        x_cur,
-                        t,
-                        neg_condition,
-                        cache_tag="neg",  # kv-cache negative
-                        cur_start_frame=start,
-                        store_kv=False,
-                        is_ar=True,
-                    )
-                    flow_pred = flow_uncond + guidance_scale * (flow_pred - flow_uncond)
                 # For Wan 2.2 TI2V: keep the first frame clean in the first chunk
                 if first_frame_cond is not None and not self.concat_mask and start == 0:
                     flow_pred = flow_pred.clone()
                     flow_pred[:, :, 0] = 0.0
-                x_next = self.unipc_scheduler.step(flow_pred, timestep, x_next, return_dict=False)[0]
+                x_next = scheduler.step(flow_pred, sched_step, x_next, return_dict=False)[0]
                 if first_frame_cond is not None and not self.concat_mask and start == 0:
                     x_next = x_next.clone()
                     x_next[:, :, 0] = first_frame_cond[:, :, 0]
@@ -490,33 +337,19 @@ class CausalWanI2V(CausalFastGenNetwork, WanI2V):
 
             # rerun with timestep zero or context_noise to finalize the cache slice
             x_cache = x_next
-            t_cache = torch.full((batch_size,), 0, device=x.device, dtype=x.dtype)
-            if context_noise > 0:
+            t_cache = torch.full((batch_size,), 0, device=x.device, dtype=self.noise_scheduler.t_precision)
+            if context_noise is not None:
                 # Add context noise to denoised frames before caching
-                t_cache = torch.full((batch_size,), context_noise, device=x.device, dtype=x.dtype)
+                t_cache = torch.full(
+                    (batch_size,), context_noise, device=x.device, dtype=self.noise_scheduler.t_precision
+                )
                 x_cache = self.noise_scheduler.forward_process(x_next, torch.randn_like(x_next), t_cache)
 
-            _ = self(
-                x_cache,
-                t_cache,
-                condition,
-                cache_tag="pos",
-                cur_start_frame=start,
-                store_kv=True,
-                is_ar=True,
-            )
-            if guidance_scale is not None:
-                _ = self(
-                    x_cache,
-                    t_cache,
-                    neg_condition,
-                    cache_tag="neg",
-                    cur_start_frame=start,
-                    store_kv=True,
-                    is_ar=True,
-                )
+            # Store KV cache for this chunk (one finalization pass per active ctx).
+            for _, ctx, cond in ctxs:
+                with ctx.set_store_kv(True):
+                    _ = self(x_cache, t_cache, condition=cond, causal_ctx=ctx, apply_output_conditioning=False)
 
         # cleanup caches after full sampling
         self.clear_caches()
-
         return x

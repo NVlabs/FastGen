@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+
 from omegaconf import DictConfig
 
 import fastgen.configs.methods.config_cm as config_cm_default
 from fastgen.configs.data import ImageNet64_EDMV2_Loader_Config
 from fastgen.configs.net import EDM2_IN64_S_Config, CKPT_ROOT_DIR
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
 from fastgen.utils.lr_scheduler import LambdaInverseSquareRootScheduler
 from fastgen.configs.callbacks import ForcedWeightNorm_CALLBACK, EMA_POWER_CALLBACKS
 
@@ -37,8 +39,10 @@ def create_config():
     config.model.loss_config.huber_const = 0.06
     config.model.loss_config.weighting_ct_loss = "c_out_sq"
 
-    # (optional) AMP training
-    # config.model.precision_amp = "float16"
+    # (optional) The reference's FP16 training: EDM2's FP16 mode casts the network input and weights to FP16
+    # without autocast, keeps FP32 master weights, and scales the loss dynamically.
+    # config.model.precision_model = "float16"
+    # config.model.precision_opt = "float32"
     # config.model.grad_scaler_enabled = True
     # config.model.grad_scaler_init_scale = 16
     # config.model.grad_scaler_growth_interval = 20000
@@ -47,10 +51,11 @@ def create_config():
     # config.trainer.callbacks.grad_clip.grad_norm = 10.0
 
     # Recommended setting for 2-step:
-    # config.model.sample_t_cfg.t_list = [80.0, 1.526, 0.0]
-    # config.model.student_sample_steps = 2
+    # config.model.student_grid_cfg.grid_type = "explicit"
+    # config.model.student_grid_cfg.grid_kwargs = {"timesteps": [80.0, 1.526, 0.0]}
+    # config.model.student_grid_cfg.steps = 2
 
-    config.model.net = EDM2_IN64_S_Config
+    config.model.net = copy.deepcopy(EDM2_IN64_S_Config)
     # Important!!! EDM2 needs the ForcedWeightNorm callback
     config.trainer.callbacks.update(ForcedWeightNorm_CALLBACK)
     config.model.net.dropout = 0.4
@@ -67,7 +72,7 @@ def create_config():
     # config.model.net.sigma_shift = 0.003
 
     # dataloader
-    config.dataloader_train = ImageNet64_EDMV2_Loader_Config
+    config.dataloader_train = copy.deepcopy(ImageNet64_EDMV2_Loader_Config)
 
     config.trainer.batch_size_global = 1024
     config.trainer.max_iter = 150000

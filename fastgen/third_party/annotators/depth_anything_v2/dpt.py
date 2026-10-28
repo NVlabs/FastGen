@@ -85,7 +85,7 @@ class DepthAnythingV2(nn.Module):
 
         # Add batch dimension and resize
         image = image_tensor.unsqueeze(0)  # [1, C, H, W]
-        image = F.interpolate(image, size=(new_h, new_w), mode="bicubic", align_corners=True)
+        image = F.interpolate(image, size=(new_h, new_w), mode="bicubic", align_corners=False)
 
         # Normalize with ImageNet stats
         mean = torch.tensor([0.485, 0.456, 0.406], device=image.device).view(1, 3, 1, 1)

@@ -3,5 +3,10 @@
 
 import warnings
 
-# Suppress all FutureWarning messages
-warnings.simplefilter(action='ignore', category=FutureWarning)
+# Suppress FutureWarnings attributed to bundled third-party code without hiding
+# warnings from FastGen or unrelated dependencies.
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    module=r"^fastgen\.third_party(?:\.|$)",
+)

@@ -10,9 +10,9 @@ student update — see ``AnyFlowModel``. The values below mirror the reference
 recipe ``train_wan1b_onpolicy_81f_480p_lr2e-6_1k_b32.yml``, which runs 1200
 generator updates.
 
-Two checkpoints must be supplied. The student is seeded from a Stage 1 trainer
+The student must be seeded from a Stage 1 trainer
 checkpoint, read directly with no conversion; ``pretrained_ckpt_key_map`` below
- takes it from the Stage 1 ``ema`` weights, matching the reference's
+takes it from the Stage 1 ``ema`` weights, matching the reference's
 ``pretrained_weight: ema``::
 
     trainer.checkpointer.pretrained_ckpt_path=<stage1>/checkpoints/0006000.pth
@@ -29,11 +29,11 @@ batch (see ``config_anyflow.py`` and ``FlowMapLossMixin._compute_mf_loss``).
 
 import copy
 
-
 import fastgen.configs.methods.config_anyflow as config_anyflow_default
 from fastgen.configs.data import VideoLoaderConfig
 from fastgen.configs.net import Wan_1_3B_Config
-from fastgen.methods import AnyFlowModel
+from fastgen.configs.config_utils import model_pixel_shape
+from fastgen.networks.Wan.network import Wan
 
 
 def create_config():
@@ -63,12 +63,12 @@ def create_config():
     # "ema" mirrors the reference's `pretrained_weight: ema`.
     config.trainer.checkpointer.pretrained_ckpt_key_map = {"net": "ema", "ema": "ema"}
 
-    config.model.precision = "bfloat16"
+    config.trainer.fsdp = True
+    config.model.precision_model = "bfloat16"
     # FSDP2 parameter storage and gradient reduction in fp32 while compute stays
-    # bfloat16 -- the same split as the reference. Takes
-    # effect only under FSDP (`trainer.ddp=False`); it is ignored under DDP, where
-    # params, grads and compute are all `precision`.
-    config.model.precision_fsdp = "float32"
+    # bfloat16 -- the same split as the reference. With eager execution or DDP,
+    # precision_opt still controls storage; use precision_amp for autocast.
+    config.model.precision_opt = "float32"
 
     # VAE compress ratio: (1 + T/4) * H/8 * W/8. 81-frame, 480p clips.
     config.model.input_shape = [16, 21, 60, 104]
@@ -77,17 +77,20 @@ def create_config():
     # The reference Stage 2 has no adversarial loss: its "discriminator" is
     # the fake score network, trained with denoising score matching only.
     config.model.gan_loss_weight_gen = 0.0
+    config.model.discriminator = None
+    config.trainer.callbacks.pop("grad_clip_discriminator", None)
     # The reference updates generator and fake score 1:1 (both every global
     # step); in DMD2's alternating scheme that is student_update_freq=2.
     config.model.student_update_freq = 2
     # Reference real_guidance_scale=3.0 applies cond + 3*(cond - uncond);
     # FastGen's CFG formula is cond + (g-1)*(cond - uncond), so g=4.
-    config.model.guidance_scale = 4.0
+    config.model.guidance_cfg = Wan.default_guidance_cfg()
+    config.model.guidance_cfg.cfg.scale = 4.0
 
     # DMD gradient noising time: reference `generator_loss` draws torch.rand
     # then applies the shift -> shifted-uniform. The bounds keep the score models off
-    # the degenerate endpoints (see the deviation note above); `fake_score_sample_t_cfg`
-    # inherits them through the deepcopy below.
+    # the degenerate endpoints (see the deviation note above); the fake-score
+    # noising below inherits them.
     config.model.sample_t_cfg.time_dist_type = "shifted"
     config.model.sample_t_cfg.shift = 5.0
     config.model.sample_t_cfg.min_t = 0.001
@@ -95,19 +98,20 @@ def create_config():
 
     # Fake-score noising time: reference `discriminator_loss` draws
     # logit_normal(0, 1) then applies the same shift. This is a DIFFERENT
-    # density from the DMD path above, so it needs its own config.
-    config.model.fake_score_sample_t_cfg = copy.deepcopy(config.model.sample_t_cfg)
-    config.model.fake_score_sample_t_cfg.time_dist_type = "shifted_logitnormal"
-    config.model.fake_score_sample_t_cfg.train_p_mean = 0.0
-    config.model.fake_score_sample_t_cfg.train_p_std = 1.0
+    # density from the DMD path above, so it overrides the density family.
+    config.model.fake_score_sample_t_overrides = {
+        "time_dist_type": "shifted_logitnormal",
+        "train_p_mean": 0.0,
+        "train_p_std": 1.0,
+    }
 
     # ------ student rollout (reference rollout_cfg) ------
-    # The rollout grid's shift comes from `cotrain_sample_t_cfg` below: the reference
-    # builds its rollout pipeline from the same `scheduler` it draws the co-trained
-    # (t, r) from, separately from the DMD noising time above.
+    # Scheduler-owned flow-map grid, independent of the co-trained t/r density below.
+    # This recipe happens to use shift 5 for both (and for DMD noising above).
     config.model.student_sample_type = "ode"
-    config.model.student_sample_steps_list = [2, 4, 8, 16, 50]
-    config.model.student_sample_steps = 4
+    config.model.student_steps_list = [2, 4, 8, 16, 50]
+    config.model.student_grid_cfg.steps = 4
+    config.model.student_grid_cfg.grid_kwargs["shift"] = 5.0
 
     # ------ co-trained Stage-1 flow-map loss (reference cotrain_forward_kl) ------
     # FastGen's VSD loss carries a 0.5 factor the reference's DMD loss does
@@ -125,8 +129,6 @@ def create_config():
     config.model.cond_dropout_prob = 0.1
     config.model.precision_amp_jvp = "float32"
     # (t, r) sampling for the co-trained loss, drawn from the reference's `scheduler`.
-    # Its shift also drives the student's rollout grid, so it is independent of the DMD
-    # noising-time shift above; the reference recipe sets both to 5.0.
     config.model.cotrain_sample_t_cfg.time_dist_type = "shifted"
     config.model.cotrain_sample_t_cfg.shift = 5.0
     config.model.cotrain_sample_t_cfg.min_t = 0.0
@@ -134,12 +136,6 @@ def create_config():
     config.model.cotrain_sample_t_cfg.flow_matching_ratio = 0.5
     config.model.cotrain_sample_t_cfg.consistency_ratio = 0.25
     config.model.cotrain_sample_t_cfg.deterministic_buckets = True
-
-    # Validation schedule at `student_sample_steps` -- the same grid the per-NFE rollout
-    # builds, so it follows the co-trained sampling shift.
-    config.model.sample_t_cfg.t_list = AnyFlowModel.rollout_t_list(
-        config.model.student_sample_steps, config.model.cotrain_sample_t_cfg.shift, config.model.net.max_t
-    ).tolist()
 
     # ------ optimization (reference: AdamW lr=2e-6, betas=(0.0, 0.999), wd=0,
     # grad clip 1.0, EMA 0.99) ------
@@ -160,8 +156,11 @@ def create_config():
 
     # ------ data / trainer ------
     config.dataloader_train = copy.deepcopy(VideoLoaderConfig)
-    config.dataloader_train.img_size = (config.model.input_shape[-1] * 8, config.model.input_shape[-2] * 8)
-    config.dataloader_train.sequence_length = (config.model.input_shape[1] - 1) * 4 + 1
+    # Resample onto the model's fps if the dataset is not already preprocessed at it.
+    # config.dataloader_train.target_fps = config.model.net.fps
+    num_frames, height, width = model_pixel_shape(config.model)
+    config.dataloader_train.img_size = (width, height)
+    config.dataloader_train.sequence_length = num_frames
     config.dataloader_train.batch_size = 1
 
     # The reference runs 1200 global steps, each performing BOTH a generator

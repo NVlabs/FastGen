@@ -1,20 +1,56 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import List, Optional, Set
+import math
+from typing import Collection, List, Optional, Sequence, Set, Union
 import torch
 from torch import nn
 
+from fastgen.networks.EDM.network import Conv2d as EDMConv2d, GroupNorm as EDMGroupNorm
+from fastgen.networks.network import FastGenModule
+from fastgen.configs.instantiate import instantiate
+from fastgen.utils.tree_utils import to
+import fastgen.utils.logging_utils as logger
 
-class Discriminator(torch.nn.Module):
+
+class Discriminator(FastGenModule):
     """
     Base class for Discriminators.
     Subclasses should override the forward method.
     """
 
-    def __init__(self, feature_indices: Optional[Set[int]] = None):
+    def __init__(self, feature_indices: Optional[Collection[int]] = None):
         super().__init__()
-        self.feature_indices = feature_indices
+        self.feature_indices: Optional[Set[int]] = None if feature_indices is None else set(feature_indices)
+
+    @staticmethod
+    def _resolve_feature_indices(
+        feature_indices: Optional[Collection[int]],
+        max_index: int,
+        default: Set[int],
+    ) -> Set[int]:
+        """Default ``None`` to ``default``, warn-and-filter invalid entries.
+
+        Entries must be integers in ``[0, max_index]`` (inclusive). Out-of-range
+        or non-integer entries are dropped with a warning. Booleans are rejected
+        even though ``bool`` is a subclass of ``int``. Raises ``ValueError``
+        only if the resolved set is empty (no heads could be built).
+        """
+        if feature_indices is None:
+            return set(default)
+        valid = {i for i in feature_indices if isinstance(i, int) and not isinstance(i, bool) and 0 <= i <= max_index}
+        dropped = set(feature_indices) - valid
+        if dropped:
+            logger.warning(
+                f"Discriminator dropped invalid feature_indices {sorted(dropped, key=str)}; "
+                f"each index must be an integer in [0, {max_index}]"
+            )
+        if not valid:
+            raise ValueError(
+                f"feature_indices resolved to an empty set after filtering against "
+                f"max_index={max_index}; original input was {feature_indices}"
+            )
+        return valid
 
     def forward(self, feats: List[torch.Tensor]) -> torch.Tensor:
         """Forward pass of the discriminator.
@@ -41,15 +77,17 @@ def _get_optimal_groups(num_channels: int) -> int:
     Returns:
         Optimal number of groups that divides num_channels evenly
     """
+    if num_channels <= 0:
+        raise ValueError(f"num_channels must be positive, got {num_channels}")
     if num_channels <= 32:
         # For small channel counts, use num_channels//4 but ensure at least 1 group
         groups = max(1, num_channels // 4)
     else:
-        # For larger channel counts, try to use 32 groups, but find the largest divisor <= 32
+        # For larger channel counts, try to use 32 groups.
         groups = 32
-        while groups > 1 and num_channels % groups != 0:
-            groups -= 1
-    assert num_channels % groups == 0, f"{num_channels} not divisible by {groups}"
+    # Both branches need a divisor: e.g. 14 channels cannot use the initial 3 groups.
+    while num_channels % groups != 0:
+        groups -= 1
 
     return groups
 
@@ -60,36 +98,47 @@ def _get_optimal_groups(num_channels: int) -> int:
 
 
 class Discriminator_EDM(Discriminator):
+    """Convolutional heads on EDM U-Net features, built from EDM's layers.
+
+    EDM's layers cast their weights to the input's dtype on every call, so FP32 master weights serve the FP16 compute
+    of EDM's FP16 mode without autocast or FSDP.
+    """
+
     def __init__(
         self,
-        feature_indices: Optional[Set[int]] = None,
-        all_res: List[int] = [32, 16, 8],
-        in_channels: int = 256,
+        feature_indices: Optional[Collection[int]] = None,
+        all_res: Sequence[int] = (32, 16, 8),
+        in_channels: Union[int, Sequence[int]] = 256,
     ):
         super(Discriminator_EDM, self).__init__(feature_indices=feature_indices)
-        if self.feature_indices is None:
-            self.feature_indices = {len(all_res) - 1}  # use the middle bottleneck feature
-        self.feature_indices = {
-            i for i in self.feature_indices if i < len(all_res)
-        }  # make sure feature indices are valid
+        self.feature_indices = self._resolve_feature_indices(
+            self.feature_indices,
+            max_index=len(all_res) - 1,
+            default={len(all_res) - 1},  # use the last (bottleneck) feature
+        )
+        # One channel width per feature in ``all_res`` (an int broadcasts); the heads keep the selected ones.
+        if isinstance(in_channels, int):
+            in_channels = [in_channels] * len(all_res)
+        if len(in_channels) != len(all_res):
+            raise ValueError(f"in_channels {list(in_channels)} must align with all_res {list(all_res)}")
         self.in_res = [all_res[i] for i in sorted(self.feature_indices)]
-        self.in_channels = in_channels
+        self.in_channels = [in_channels[i] for i in sorted(self.feature_indices)]
 
+        # torch.nn.Conv2d's default initialization, which EDM's DhariwalUNet uses as well: weights and biases uniform
+        # within +-1/sqrt(fan_in).
+        init = dict(init_mode="kaiming_uniform", init_weight=math.sqrt(1 / 3), init_bias=math.sqrt(1 / 3))
         self.discriminator_heads = nn.ModuleList()
-        for res in self.in_res:
+        for i, res in enumerate(self.in_res):
+            channels = self.in_channels[i]
+            # min_channels_per_group=1 keeps this exact group count rather than EDM's cap of channels // 4.
+            norm = dict(num_groups=_get_optimal_groups(channels), min_channels_per_group=1)
             layers = []
             while res > 8:
                 # reduce the resolution by half, until 8x8
                 layers.extend(
                     [
-                        nn.Conv2d(
-                            kernel_size=4,
-                            in_channels=self.in_channels,
-                            out_channels=self.in_channels,
-                            stride=2,
-                            padding=1,
-                        ),
-                        nn.GroupNorm(num_groups=_get_optimal_groups(self.in_channels), num_channels=self.in_channels),
+                        EDMConv2d(channels, channels, kernel=4, stride=2, padding=1, **init),
+                        EDMGroupNorm(channels, **norm),
                         nn.SiLU(),
                     ]
                 )
@@ -97,19 +146,15 @@ class Discriminator_EDM(Discriminator):
 
             layers.extend(
                 [
-                    nn.Conv2d(
-                        kernel_size=4, in_channels=self.in_channels, out_channels=self.in_channels, stride=2, padding=1
-                    ),
+                    EDMConv2d(channels, channels, kernel=4, stride=2, padding=1, **init),
                     # 8x8 -> 4x4
-                    nn.GroupNorm(num_groups=_get_optimal_groups(self.in_channels), num_channels=self.in_channels),
+                    EDMGroupNorm(channels, **norm),
                     nn.SiLU(),
-                    nn.Conv2d(
-                        kernel_size=4, in_channels=self.in_channels, out_channels=self.in_channels, stride=4, padding=0
-                    ),
+                    EDMConv2d(channels, channels, kernel=4, stride=4, padding=0, **init),
                     # 4x4 -> 1x1
-                    nn.GroupNorm(num_groups=_get_optimal_groups(self.in_channels), num_channels=self.in_channels),
+                    EDMGroupNorm(channels, **norm),
                     nn.SiLU(),
-                    nn.Conv2d(kernel_size=1, in_channels=self.in_channels, out_channels=1, stride=1, padding=0),
+                    EDMConv2d(channels, 1, kernel=1, **init),
                     # 1x1 -> 1x1
                 ]
             )
@@ -119,6 +164,7 @@ class Discriminator_EDM(Discriminator):
 
     def forward(self, feats: List[torch.Tensor]):
         assert isinstance(feats, list)
+        feats = to(feats, dtype=self.precision_model)
         all_logits = []
 
         if len(feats) != len(self.in_res):
@@ -128,7 +174,7 @@ class Discriminator_EDM(Discriminator):
 
         for i, res in enumerate(self.in_res):
             assert res == feats[i].shape[-1]
-            # perform average pooling over spatial dimension if necessary
+            # the strided head ends at 1x1; flatten to [B, 1]
             logits = self.discriminator_heads[i](feats[i]).reshape(-1, 1)
             all_logits.append(logits)
 
@@ -145,9 +191,10 @@ class Discriminator_EDM(Discriminator):
 class Discriminator_SD15(Discriminator_EDM):
     def __init__(
         self,
-        feature_indices: Optional[Set[int]] = None,
-        all_res: List[int] = [32, 16, 8, 8, 8],
-        in_channels: int = 1280,
+        feature_indices: Optional[Collection[int]] = None,
+        all_res: Sequence[int] = (32, 16, 8, 8, 8),
+        # per-tap widths: the four down blocks, then mid
+        in_channels: Union[int, Sequence[int]] = (320, 640, 1280, 1280, 1280),
     ):
         super().__init__(feature_indices=feature_indices, all_res=all_res, in_channels=in_channels)
 
@@ -155,9 +202,10 @@ class Discriminator_SD15(Discriminator_EDM):
 class Discriminator_SDXL(Discriminator_EDM):
     def __init__(
         self,
-        feature_indices: Optional[Set[int]] = None,
-        all_res: List[int] = [32, 16, 16, 16],
-        in_channels: int = 1280,
+        feature_indices: Optional[Collection[int]] = None,
+        all_res: Sequence[int] = (32, 16, 16, 16),
+        # per-tap widths: the three down blocks, then mid
+        in_channels: Union[int, Sequence[int]] = (320, 640, 1280, 1280),
     ):
         super().__init__(feature_indices=feature_indices, all_res=all_res, in_channels=in_channels)
 
@@ -171,7 +219,7 @@ class Discriminator_ImageDiT(Discriminator):
     """
     Simple discriminator for image features from image DiT models (e.g., Flux).
 
-    Uses a lightweight 2-layer Conv2D architecture (~0.5M params per head).
+    Uses a 2-layer Conv2D head with about ``8 * inner_dim**2`` parameters.
 
     Input: List of feature tensors with shape [B, inner_dim, H, W]
     Output: Concatenated logits [B, num_heads] for discrimination
@@ -179,7 +227,7 @@ class Discriminator_ImageDiT(Discriminator):
 
     def __init__(
         self,
-        feature_indices: Optional[Set[int]] = None,
+        feature_indices: Optional[Collection[int]] = None,
         num_blocks: int = 57,  # Flux: 19 joint + 38 single = 57
         inner_dim: int = 3072,  # Flux hidden dimension
     ):
@@ -196,10 +244,11 @@ class Discriminator_ImageDiT(Discriminator):
         """
         super().__init__(feature_indices=feature_indices)
 
-        # Validate and set feature indices
-        if self.feature_indices is None:
-            self.feature_indices = {int(num_blocks // 2)}
-        self.feature_indices = {i for i in self.feature_indices if i < num_blocks}
+        self.feature_indices = self._resolve_feature_indices(
+            self.feature_indices,
+            max_index=num_blocks - 1,
+            default={num_blocks // 2},
+        )
         self.num_features = len(self.feature_indices)
         self.inner_dim = inner_dim
 
@@ -240,12 +289,14 @@ class Discriminator_ImageDiT(Discriminator):
                 f"got {type(feats)} with length {len(feats) if isinstance(feats, list) else 'N/A'}"
             )
 
+        feats = to(feats, dtype=self.precision_model)
         all_logits = []
         for head, feat in zip(self.cls_pred_heads, feats):
             logits = head(feat)
             all_logits.append(logits)
 
-        return torch.cat(all_logits, dim=1)
+        logits = torch.cat(all_logits, dim=1)
+        return logits
 
 
 # =============================================================================
@@ -309,7 +360,7 @@ def _build_dit_conv3d_discriminator_head(
 
     Args:
         inner_dim: Input channel dimension (typically 384).
-        channel_mults: Channel multipliers for each conv layer [c2, c3, c4].
+        channel_mults: Output channels [c2, c3, c4] of the first three conv layers; the fourth keeps c4.
         mlp_hidden_dim: Hidden dimension of the final MLP classifier.
 
     Returns:
@@ -325,7 +376,7 @@ def _build_dit_conv3d_discriminator_head(
         nn.Conv3d(c2, c3, kernel_size=(3, 4, 4), stride=(2, 2, 2), padding=(1, 1, 1)),  # Output: (B, c3, 11, 7, 13)
         nn.GroupNorm(num_groups=_get_optimal_groups(c3), num_channels=c3),
         nn.LeakyReLU(0.2),
-        nn.Conv3d(c3, c4, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)),  # Output: (B, c3, 6, 4, 7)
+        nn.Conv3d(c3, c4, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)),  # Output: (B, c4, 6, 4, 7)
         nn.GroupNorm(num_groups=_get_optimal_groups(c4), num_channels=c4),
         nn.LeakyReLU(0.2),
         nn.Conv3d(c4, c4, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)),  # Output: (B, c4, 3, 2, 4)
@@ -459,7 +510,7 @@ def _build_dit_attention_discriminator_head(
         mlp_hidden_dim: The hidden dimension of the final MLP head.
 
     Returns:
-        An nn.Sequential module representing the discriminator head.
+        An nn.Module representing the discriminator head.
     """
 
     class SpatioTemporalAttention(nn.Module):
@@ -512,7 +563,7 @@ def _build_dit_attention_discriminator_head(
 
 def _build_dit_multiscale_discriminator_head(
     inner_dim: int,
-    scales: List[int] = [1, 2, 4],
+    scales: Sequence[int] = (1, 2, 4),
     channel_reduction: int = 4,
     mlp_hidden_dim: int = 256,
 ) -> nn.Module:
@@ -531,7 +582,7 @@ def _build_dit_multiscale_discriminator_head(
         mlp_hidden_dim: The hidden dimension of the final MLP head.
 
     Returns:
-        An nn.Sequential module representing the discriminator head.
+        An nn.Module representing the discriminator head.
     """
 
     class MultiScaleProcessor(nn.Module):
@@ -606,7 +657,7 @@ def _build_dit_factorized_discriminator_head(
         mlp_hidden_dim: The hidden dimension of the fusion MLP.
 
     Returns:
-        An nn.Sequential module representing the discriminator head.
+        An nn.Module representing the discriminator head.
     """
 
     class FactorizedProcessor(nn.Module):
@@ -696,21 +747,22 @@ class Discriminator_VideoDiT(Discriminator):
     5. Multi-scale: Parallel processing at multiple resolutions
     6. Factorized: Separate temporal and spatial branch processing
 
-    Available Architectures:
-    - dit_simple_conv3d: Simple DiT-style 2-layer conv3d (~1M params)
+    Available Architectures, with parameters per head at the default ``inner_dim=384`` (they grow with
+    ``inner_dim``, quadratically for the simple and multi-scale heads):
+    - dit_simple_conv3d: Simple DiT-style 2-layer conv3d (~2.4M params)
     - conv3d_down_mlp: Standard 3D conv (~65M params)
     - conv3d_down_mlp_efficient: Efficient 3D conv (~25M params)
     - conv1d_2d_down_mlp: Factorized conv (~17.6M params)
     - conv1d_2d_down_mlp_efficient: Efficient factorized conv (~6.9M params)
-    - attention_down_mlp: Large attention model (~15M params)
-    - attention_down_mlp_efficient: Compact attention (~5M params)
-    - multiscale_down_mlp: Large multi-scale model (~15M params)
-    - multiscale_down_mlp_efficient: Compact multi-scale (~4M params)
-    - multiscale_down_mlp_medium: Medium multi-scale model (~30M params)
-    - multiscale_down_mlp_large: Extra large multi-scale model (~50M params)
-    - factorized_down_mlp: Large factorized model (~15M params)
-    - factorized_down_mlp_efficient: Compact factorized (~3M params)
-    - factorized_down_mlp_large: Extra large factorized model (~50M params)
+    - attention_down_mlp: Large attention model (~9.7M params)
+    - attention_down_mlp_efficient: Compact attention (~1.7M params)
+    - multiscale_down_mlp: Large multi-scale model (~4.7M params)
+    - multiscale_down_mlp_efficient: Compact multi-scale (~0.9M params)
+    - multiscale_down_mlp_medium: Medium multi-scale model (~4.9M params)
+    - multiscale_down_mlp_large: Extra large multi-scale model (~23M params)
+    - factorized_down_mlp: Large factorized model (~7.9M params)
+    - factorized_down_mlp_efficient: Compact factorized (~3.4M params)
+    - factorized_down_mlp_large: Extra large factorized model (~20M params)
 
     Input: List of feature tensors with shape [B, inner_dim, T, H, W]
            where T, H, W are temporal and spatial dimensions (varies by model)
@@ -725,38 +777,28 @@ class Discriminator_VideoDiT(Discriminator):
             "kernel_size": (2, 4, 4),
             "stride": (2, 2, 2),
             "padding": (0, 1, 1),
-            "params_estimate": "~1M",
-            "description": "Simple DiT-style 2-layer conv3d for efficiency",
         },
         # 3D Convolution Architectures
         "conv3d_down_mlp": {
             "type": "conv3d",
             "channel_mults": [512, 512, 1024],
             "mlp_hidden_dim": 512,
-            "params_estimate": "~65M",
-            "description": "Standard 3D conv with high capacity",
         },
         "conv3d_down_mlp_efficient": {
             "type": "conv3d",
             "channel_mults": [256, 512, 512],
             "mlp_hidden_dim": 256,
-            "params_estimate": "~25M",
-            "description": "Efficient 3D conv with reduced channels",
         },
         # Conv1d + Conv2d Architectures
         "conv1d_2d_down_mlp": {
             "type": "conv1d_2d",
             "channel_progression": [512, 512, 1024],
             "mlp_hidden_dim": 512,
-            "params_estimate": "~17M",
-            "description": "Factorized conv with high capacity",
         },
         "conv1d_2d_down_mlp_efficient": {
             "type": "conv1d_2d",
             "channel_progression": [256, 512, 512],
             "mlp_hidden_dim": 256,
-            "params_estimate": "~7M",
-            "description": "Efficient factorized conv",
         },
         # Attention Architectures
         "attention_down_mlp": {
@@ -764,16 +806,12 @@ class Discriminator_VideoDiT(Discriminator):
             "num_heads": 16,
             "num_layers": 3,
             "mlp_hidden_dim": 512,
-            "params_estimate": "~15M",
-            "description": "Large attention model with deep layers",
         },
         "attention_down_mlp_efficient": {
             "type": "attention",
             "num_heads": 8,
             "num_layers": 2,
             "mlp_hidden_dim": 256,
-            "params_estimate": "~5M",
-            "description": "Self-attention for global context",
         },
         # Multiscale Architectures
         "multiscale_down_mlp": {
@@ -781,32 +819,24 @@ class Discriminator_VideoDiT(Discriminator):
             "scales": [1, 2, 4, 8],
             "channel_reduction": 2,
             "mlp_hidden_dim": 512,
-            "params_estimate": "~15M",
-            "description": "Large multi-scale with more scales",
         },
         "multiscale_down_mlp_efficient": {
             "type": "multiscale",
             "scales": [1, 2, 4],
             "channel_reduction": 4,
             "mlp_hidden_dim": 256,
-            "params_estimate": "~4M",
-            "description": "Multi-resolution feature processing",
         },
         "multiscale_down_mlp_medium": {
             "type": "multiscale",
             "scales": [1, 2, 4, 8],
             "channel_reduction": 2,
             "mlp_hidden_dim": 768,
-            "params_estimate": "~25M",
-            "description": "Medium multi-scale model balancing capacity and efficiency",
         },
         "multiscale_down_mlp_large": {
             "type": "multiscale",
             "scales": [1, 2, 4, 8, 16],
             "channel_reduction": 1,
             "mlp_hidden_dim": 1024,
-            "params_estimate": "~50M",
-            "description": "Large multi-scale with extensive scales and minimal channel reduction",
         },
         # Factorized Architectures
         "factorized_down_mlp": {
@@ -814,30 +844,24 @@ class Discriminator_VideoDiT(Discriminator):
             "temporal_dim": 256,
             "spatial_dim": 256,
             "mlp_hidden_dim": 512,
-            "params_estimate": "~15M",
-            "description": "Large factorized with wider branches",
         },
         "factorized_down_mlp_efficient": {
             "type": "factorized",
             "temporal_dim": 128,
             "spatial_dim": 128,
             "mlp_hidden_dim": 256,
-            "params_estimate": "~3M",
-            "description": "Separate temporal/spatial branches",
         },
         "factorized_down_mlp_large": {
             "type": "factorized",
             "temporal_dim": 512,
             "spatial_dim": 512,
             "mlp_hidden_dim": 1024,
-            "params_estimate": "~50M",
-            "description": "Large factorized with very wide branches for high capacity",
         },
     }
 
     def __init__(
         self,
-        feature_indices: Optional[Set[int]] = None,
+        feature_indices: Optional[Collection[int]] = None,
         num_blocks: int = 30,
         disc_type: str = "conv3d_down_mlp_efficient",
         inner_dim: int = 384,
@@ -849,18 +873,20 @@ class Discriminator_VideoDiT(Discriminator):
             feature_indices: Which block indices to apply discrimination to.
                            Defaults to middle block if None.
             num_blocks: Total number of blocks in the model.
-                       Common values: 30 (CogVideoX-2B, Wan2.1 2B)
+                       Common values: 30 (CogVideoX-2B, Wan2.1 1.3B)
             disc_type: Architecture type. See ARCHITECTURES for options.
-                      Defaults to lightweight DiT-style for efficiency.
+                      Defaults to the efficient 3D conv; the shipped configs use dit_simple_conv3d or a
+                      multi-scale head.
             inner_dim: Input channel dimension of the features.
-                      Common values: 480 (CogVideoX-2B), 384 (Wan2.1 2B)
+                      Common values: 480 (CogVideoX-2B), 384 (Wan2.1 1.3B)
         """
         super().__init__(feature_indices=feature_indices)
 
-        # Validate and set feature indices
-        if self.feature_indices is None:
-            self.feature_indices = {int(num_blocks // 2)}
-        self.feature_indices = {i for i in self.feature_indices if i < num_blocks}
+        self.feature_indices = self._resolve_feature_indices(
+            self.feature_indices,
+            max_index=num_blocks - 1,
+            default={num_blocks // 2},
+        )
         self.num_features = len(self.feature_indices)
         self.disc_type = disc_type
         self.inner_dim = inner_dim
@@ -942,45 +968,122 @@ class Discriminator_VideoDiT(Discriminator):
                 f"got {type(feats)} with length {len(feats) if isinstance(feats, list) else 'N/A'}"
             )
 
+        feats = to(feats, dtype=self.precision_model)
         all_logits = []
         for head, feat in zip(self.cls_pred_heads, feats):
             logits = head(feat)
             all_logits.append(logits)
 
-        return torch.cat(all_logits, dim=1)
-
-    @classmethod
-    def list_architectures(cls) -> List[str]:
-        """Return a list of all available architecture names."""
-        return list(cls.ARCHITECTURES.keys())
-
-    @classmethod
-    def get_architecture_info(cls, disc_type: str) -> dict:
-        """Get detailed information about a specific architecture."""
-        if disc_type not in cls.ARCHITECTURES:
-            available = ", ".join(cls.ARCHITECTURES.keys())
-            raise ValueError(f"Unknown disc_type '{disc_type}'. Available: {available}")
-
-        config = cls.ARCHITECTURES[disc_type].copy()
-        return {
-            "name": disc_type,
-            "type": config.pop("type"),
-            "params_estimate": config.pop("params_estimate"),
-            "description": config.pop("description", "No description available"),
-            "config": config,
-        }
-
-    def get_model_info(self) -> dict:
-        """Get information about the current discriminator instance."""
-        arch_info = self.get_architecture_info(self.disc_type)
-        return {
-            **arch_info,
-            "num_heads": self.num_features,
-            "feature_indices": sorted(self.feature_indices),
-            "inner_dim": self.inner_dim,
-        }
+        logits = torch.cat(all_logits, dim=1)
+        return logits
 
 
-# =============================================================================
-# End of Discriminators
-# =============================================================================
+class Discriminator_Audio2D(Discriminator):
+    """Per-feature 2D-conv discriminator for audio spectrogram features.
+
+    Audio features ``[B, C, L, M]`` (L=time, M=mel bins) are processed by
+    independent conv heads (one per feature index) and concatenated.
+    """
+
+    def __init__(
+        self,
+        feature_indices: Optional[Collection[int]] = None,
+        inner_dim: int = 128,
+        hidden_channels: int = 256,
+        num_blocks: int = 48,
+    ):
+        super().__init__(feature_indices=feature_indices)
+        self.feature_indices = self._resolve_feature_indices(
+            self.feature_indices,
+            max_index=num_blocks - 1,
+            default={num_blocks // 2},
+        )
+        num_features = len(self.feature_indices)
+        h = hidden_channels
+        self.heads = nn.ModuleList()
+        for _ in range(num_features):
+            head = nn.Sequential(
+                nn.Conv2d(inner_dim, h, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1)),
+                nn.GroupNorm(num_groups=_get_optimal_groups(h), num_channels=h),
+                nn.LeakyReLU(0.2),
+                nn.Conv2d(h, h * 2, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1)),
+                nn.GroupNorm(num_groups=_get_optimal_groups(h * 2), num_channels=h * 2),
+                nn.LeakyReLU(0.2),
+                nn.Conv2d(h * 2, h * 2, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)),
+                nn.GroupNorm(num_groups=_get_optimal_groups(h * 2), num_channels=h * 2),
+                nn.LeakyReLU(0.2),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(h * 2, 1),
+            )
+            self.heads.append(head)
+
+    def forward(self, feats: list) -> torch.Tensor:
+        if len(feats) == 0:
+            raise ValueError("Empty feature list")
+        feats = to(feats, dtype=self.precision_model)
+        logits = torch.cat([head(feat) for head, feat in zip(self.heads, feats, strict=True)], dim=1)
+        return logits
+
+
+class CompositeDiscriminator(Discriminator):
+    """Applies independent per-modality discriminators and concatenates logits.
+
+    Each entry in *modality_discs* maps a modality key (e.g. ``"video"``,
+    ``"audio"``) to a `Discriminator` subclass.  At forward time the
+    features are expected to be a ``List[Dict[str, Tensor]]`` (one dict per
+    feature index), and each modality discriminator receives its slice.
+
+    All modalities share the same ``feature_indices`` (the features are
+    extracted at the same transformer layers for all modalities).
+    """
+
+    def __init__(
+        self,
+        modality_discs: dict,
+        feature_indices: Optional[Collection[int]] = None,
+    ):
+        overrides = {}
+        if feature_indices is not None:
+            feature_indices = set(feature_indices)
+            overrides["feature_indices"] = feature_indices
+            for key, cfg in modality_discs.items():
+                configured = cfg.get("feature_indices")
+                if configured is None or set(configured) != feature_indices:
+                    logger.warning(
+                        f"Modality '{key}' config has feature_indices={configured}, "
+                        f"overriding with CompositeDiscriminator feature_indices={feature_indices}"
+                    )
+        discriminators = {key: instantiate(cfg, **overrides) for key, cfg in modality_discs.items()}
+        self._validate_discriminators(discriminators)
+        super().__init__(feature_indices=next(iter(discriminators.values())).feature_indices)
+        self.modality_discs = nn.ModuleDict(discriminators)
+
+    @staticmethod
+    def _validate_discriminators(discriminators: dict[str, Discriminator]) -> None:
+        """Check modality discriminator types and agreement on feature indices."""
+        assert all(
+            isinstance(disc, Discriminator) for disc in discriminators.values()
+        ), "All modality discriminators must be Discriminator instances"
+
+        resolved_indices = {key: disc.feature_indices for key, disc in discriminators.items()}
+        if not resolved_indices:
+            raise ValueError("CompositeDiscriminator requires at least one modality discriminator")
+
+        feature_indices = next(iter(resolved_indices.values()))
+        if any(indices != feature_indices for indices in resolved_indices.values()):
+            raise ValueError(
+                f"CompositeDiscriminator modality_discs have conflicting feature_indices: {resolved_indices}"
+            )
+
+    def forward(self, feats: list) -> torch.Tensor:
+        if len(feats) == 0:
+            raise ValueError("Empty feature list")
+
+        feats = to(feats, dtype=self.precision_model)
+        all_logits = []
+        for key, disc in self.modality_discs.items():
+            modality_feats = [f[key] for f in feats]
+            all_logits.append(disc(modality_feats))
+        logits = torch.cat(all_logits, dim=1)
+        return logits

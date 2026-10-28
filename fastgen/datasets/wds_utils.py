@@ -4,28 +4,176 @@
 """Common utilities for WebDataset loaders.
 
 This module provides shared functionality for all WDS loaders including:
-- Shard discovery (local and S3)
-- Ignore index management
-- Shard counting for deterministic iteration
-- Common preprocessing functions
-- Prompt embedding loading
+- Shard discovery (local and S3) and selection
+- Ignore indices and per-shard sample counts
+- ``BaseWDSLoader`` with its shuffled training dataset and its deterministic, resumable ``DeterministicWDS``
+- Batching and ``DataLoader`` wrapping
+
+Deterministic loading
+---------------------
+``sampler_start_idx`` counts samples before decoding, after removing the union of all ``ignore_index_paths``.
+The trainer's resume offset matches the batches it received only if each remaining sample produces exactly one
+output. A sample that fails to decode or preprocess, lacks a required field, or is dropped by the pipeline is
+skipped with a warning naming it. Each skip pulls that worker's next sample forward, so the stream runs ahead of the
+trainer's offset and a resume repeats one sample per skip: with one worker (the deterministic default) the last
+samples before the checkpoint, with more the samples just after it that the skipping worker had already delivered.
+``MAX_CONSECUTIVE_SKIPS`` skips in a row on one worker raise, since they point to a systematic problem.
+``strict=True`` raises on the first such sample instead. ``presets_filter`` is rejected either way, because it drops
+samples systematically; precompute its exclusions into ``ignore_index_paths``.
+
+``DeterministicWDS`` documents the sample order. It is independent of the worker count only for a fixed shard
+selection (setting ``shards_per_worker`` makes the selection depend on the worker count) and while no sample is
+skipped, since a skip shifts only its worker's later batches. It requires the DataLoader's default in-order delivery.
+Only ``train=True`` repeats the stream; otherwise a start index at or beyond the end yields no batches.
+
+A ``shard_count_file`` must hold accurate raw counts (before ignore indices), and every ignored key must exist in
+its shard, because the number of ignored keys is subtracted from these counts. Counts are checked for shards that
+are read but not for shards skipped on resume; rebuild stale counts before resuming, or omit the file to read
+through the offset.
+
+Finite and distributed iteration
+--------------------------------
+Finite workers or ranks without shards finish normally. Ranks split the data only under FastGen's CUDA process
+group (see ``fastgen.utils.distributed.world_size``). The trainer advances training and validation loaders through
+``synced_iter``: an iterator error or unequal exhaustion raises on every rank before the next model step. When all
+ranks run out together, iteration ends normally and the next training batch request raises ``StopIteration``, so
+training loaders should repeat (``train=True``) to supply ``max_iter`` iterations. ``synced_iter`` does not compare
+batch sizes. With ``drop_last`` (the default), a finite deterministic stream ends at its last complete group of
+``world_size`` samples, so every rank reads the same number and yields the same batches. Skipped samples (unless
+``strict=True``) and shuffled loading, which splits whole shards across ranks, can still leave ranks unequal: balance
+such finite validation data or cap it with ``MAX_VAL_STEPS``; ``shards_per_worker`` balances shard URLs, not the
+samples that remain after filtering.
 """
 
 import functools
+import itertools
 import json
 import os
+import shlex
+import signal
 import sys
-import itertools
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Set
 
 import torch
 import webdataset as wds
 from torch.utils.data import IterableDataset, default_collate
+from webdataset.gopen import Pipe, gopen_schemes
 
 import fastgen.utils.logging_utils as logger
+import fastgen.utils.s3 as s3
+from fastgen.datasets.samplers import normalize_sampler_start_idx
 from fastgen.utils.basic_utils import ensure_trailing_slash
-from fastgen.utils.distributed import get_rank, world_size
+from fastgen.utils.distributed import get_rank, local_world_size, world_size
+
+
+# =============================================================================
+# Validation
+# =============================================================================
+
+
+def validate_wds_config(sampler_start_idx=0, num_shards=None, deterministic=False, presets_filter=None):
+    """Reject settings that could silently change the selected sample stream."""
+    if sampler_start_idx < 0:
+        raise ValueError("sampler_start_idx must be nonnegative")
+    if num_shards is not None and num_shards <= 0:
+        raise ValueError("num_shards must be positive")
+    if deterministic and presets_filter:
+        raise ValueError(
+            "deterministic=True does not support presets_filter: precompute these exclusions in "
+            "ignore_index_paths so shard counts and sampler_start_idx describe the same sample stream."
+        )
+
+
+def validate_ignore_index(data, source):
+    """A string or non-string keys would silently exclude the wrong samples."""
+    for shard, files in data.items():
+        if not isinstance(files, list) or not all(isinstance(key, str) for key in files):
+            raise ValueError(f"Ignore index {source}: {shard} must contain a list of sample keys")
+
+
+def validate_shard_counts(counts):
+    """Negative effective counts corrupt shard skipping and epoch lengths."""
+    for shard, count in counts.items():
+        if count < 0:
+            raise ValueError(f"Negative sample count for {shard}; check shard counts and ignore_index_paths")
+
+
+def check_repeat_samples(has_samples, repeat):
+    """Finite streams may be empty; repeating an empty pass cannot make progress."""
+    if repeat and not has_samples:
+        raise ValueError("No samples remain in the selected shards after applying ignore_index_paths")
+
+
+# Skipping this many samples, or failing this many shard reads, in a row points to a systematic problem (e.g. a wrong
+# key_map or expired storage credentials) rather than bad data, and a repeating stream whose samples or shards all
+# fail would otherwise search forever without yielding a batch.
+MAX_CONSECUTIVE_SKIPS = 100
+
+
+def process_samples(samples, pipeline_fn, strict=False):
+    """Run ``pipeline_fn`` on each sample separately, which must yield exactly one output per sample.
+
+    Both loading modes process samples this way. A sample that fails or yields nothing is skipped with a warning
+    (in deterministic loading this shifts the resume offset by one), and ``MAX_CONSECUTIVE_SKIPS`` skips in a row
+    raise; ``strict=True`` raises on the first one instead. Only the selected rank/worker's samples are decoded.
+    """
+    skipped = 0
+    for sample in samples:
+        name = f"{sample.get('__url__', '')}:{sample.get('__key__', '')}"
+        reason = "the pipeline dropped it"
+        try:
+            outputs = [sample] if pipeline_fn is None else list(pipeline_fn(wds.FluidWrapper([sample])))
+        except Exception as error:
+            # Name the sample: WebDataset's DecodingError has an empty message (its cause holds the reason).
+            if strict:
+                raise ValueError(f"Cannot process sample {name}") from error
+            outputs, reason = [], repr(error.__cause__ or error)
+        if len(outputs) > 1:
+            raise ValueError(f"The pipeline produced {len(outputs)} outputs for sample {name}")
+        if outputs and outputs[0] is not None:
+            skipped = 0
+            yield outputs[0]
+            continue
+        if strict:
+            raise ValueError(
+                f"The pipeline dropped sample {name}. "
+                "Use ignore_index_paths to exclude samples without changing resume offsets."
+            )
+        skipped += 1
+        logger.warning(f"Skipping sample {name}: {reason}")
+        if skipped == MAX_CONSECUTIVE_SKIPS:
+            raise ValueError(
+                f"{skipped} samples in a row failed or were dropped, the last one {name} ({reason}); "
+                "check the data and key_map, or set strict=True to raise on the first failure"
+            )
+
+
+def check_shard_counts(samples, urls, counts):
+    """Check visited shards against counts keyed by URL, including adjacent repeated URLs.
+
+    Zero-count shards have no nonignored samples, so exclude them from the expected
+    sequence. Consecutive visits to the same URL form one group in both sequences.
+    """
+    nonempty_urls = (url for url in urls if counts[url] > 0)
+    actual_groups = iter(itertools.groupby(samples, key=lambda sample: sample["__url__"]))
+    for url, visits in itertools.groupby(nonempty_urls):
+        expected = counts[url] * sum(1 for _ in visits)
+        actual_url, shard_samples = next(actual_groups, (None, ()))
+        if actual_url != url:
+            raise ValueError(f"Shard count mismatch: expected samples from {url}, next sampled shard was {actual_url}")
+        count = 0
+        for sample in shard_samples:
+            count += 1
+            if count > expected:
+                raise ValueError(f"Shard count mismatch for {url}: more than {expected} nonignored samples")
+            yield sample
+        if count != expected:
+            raise ValueError(f"Shard count mismatch for {url}: expected {expected} nonignored samples, read {count}")
+    extra = next(actual_groups, None)
+    if extra is not None:
+        raise ValueError(f"Shard count mismatch: unexpected nonignored samples from {extra[0]}")
 
 
 # =============================================================================
@@ -34,10 +182,11 @@ from fastgen.utils.distributed import get_rank, world_size
 
 
 def shard_to_name(shard: str) -> str:
-    """Convert a shard path to a name by extracting the filename.
+    """Convert a shard path or URI to a name by extracting the filename.
 
     Example:
         '<path>/00012.tar' -> '00012.tar'
+        's3://<bucket>/<prefix>/00012.tar' -> '00012.tar'
     """
     filename = shard.split("/")[-1]
     return filename
@@ -77,6 +226,19 @@ def get_prefixes(wds_tags: List[str]) -> List[str]:
     return prefixes
 
 
+def _open_s3_shard(url: str, mode: str = "rb", bufsize: int = 8192) -> Pipe:
+    """Open an ``s3://`` shard for WebDataset by streaming it with retryable bounded ranged GETs."""
+    if mode != "rb":
+        raise ValueError(f"S3 shards are read-only: {url}")
+    # Popen reports a child killed by SIGPIPE (the reader stopped mid-shard) as -SIGPIPE, which is not a failure.
+    command = [sys.executable, "-m", "scripts.resumable_s3_download", url]
+    return Pipe(command, mode=mode, bufsize=bufsize, ignore_status=[-signal.SIGPIPE])
+
+
+# Registered at import: DataLoader workers import this module when they unpickle the dataset, before opening a shard.
+gopen_schemes["s3"] = _open_s3_shard
+
+
 def get_shards(
     wds_tags: List[str],
     shard_start: int = 0,
@@ -85,7 +247,8 @@ def get_shards(
 ) -> List[str]:
     """Get the shards from the WDS tags.
 
-    Supports both local file paths and S3 paths (using s5cmd).
+    Supports local file paths and S3 paths. S3 shard discovery uses ``s5cmd``, and S3 shards are returned as
+    ``s3://`` URIs, which WebDataset reads through ``_open_s3_shard`` with retryable bounded ranged GETs.
 
     Args:
         wds_tags: List of WDS tags in format 'WDS:<PATH>'
@@ -96,6 +259,8 @@ def get_shards(
     Returns:
         List of shard URLs
     """
+    validate_wds_config(num_shards=num_shards)
+
     # Validate the dataset tags
     for d in wds_tags:
         if not d.startswith("WDS"):
@@ -105,14 +270,25 @@ def get_shards(
     all_urls = []
 
     for prefix in prefixes:
-        if prefix.startswith("s3://"):
+        if s3.is_uri(prefix):
             prefix = ensure_trailing_slash(prefix)
-            with os.popen(f"s5cmd ls {prefix}", "r") as f:
-                urls = [
-                    f"pipe:s5cmd cat {prefix}{path.strip().split(' ')[-1]}"
-                    for path in f.readlines()
-                    if path.strip().endswith(".tar")
-                ]
+            urls = []
+            with os.popen(f"s5cmd ls {shlex.quote(prefix)}", "r") as proc:
+                for line in proc:
+                    # Date, time and size precede the object name, which may itself contain spaces.
+                    listed_path = line.strip().split(maxsplit=3)[-1] if line.strip() else ""
+                    if not listed_path.endswith(".tar"):
+                        continue
+                    # s5cmd versions may print either the full URI or a path
+                    # relative to the listed prefix. Accept both forms.
+                    s3_path = listed_path if s3.is_uri(listed_path) else prefix + listed_path.lstrip("/")
+                    urls.append(s3_path)
+                # Exiting the block discards close()'s exit status, so read it here; closing again is a no-op.
+                status = proc.close()
+            if status:
+                raise RuntimeError(
+                    f"s5cmd ls {prefix} failed with status {status}; install s5cmd and check the S3 credentials"
+                )
             all_urls.extend(urls)
         elif Path(prefix).is_dir():
             # Local directory with tar files
@@ -122,17 +298,21 @@ def get_shards(
         else:
             raise ValueError(f"Invalid prefix: {prefix}")
 
-    # Sort by shard name
+    # Sort by shard index, falling back to lexicographic shard names
     try:
         all_urls.sort(key=shard_to_idx)
     except ValueError as e:
-        logger.error(f"Error sorting urls: {e}")
+        logger.warning(f"Shard names are not all numeric ({e}); selecting shards in lexicographic order.")
         all_urls.sort(key=shard_to_name)
 
     # Truncate or repeat shards
-    all_urls = all_urls[max(shard_start, 0) :]
-    if shard_end is not None:
-        all_urls = all_urls[: int(shard_end + 1)]
+    stop = int(shard_end + 1) if shard_end is not None else None
+    all_urls = all_urls[max(shard_start, 0) : stop]
+    if not all_urls:
+        raise ValueError(
+            f"No shards remaining in {wds_tags} with shard_start={shard_start}, shard_end={shard_end}, and num_shards={num_shards}."
+        )
+
     if num_shards is not None:
         if len(all_urls) > num_shards:
             logger.warning(
@@ -145,11 +325,6 @@ def get_shards(
             )
             all_urls = all_urls * (num_shards // len(all_urls)) + all_urls[: num_shards % len(all_urls)]
         assert len(all_urls) == num_shards
-
-    if len(all_urls) == 0:
-        raise ValueError(
-            f"No shards remaining in {wds_tags} with shard_start={shard_start}, shard_end={shard_end}, and num_shards={num_shards}."
-        )
 
     logger.info(f"Using a total of {len(all_urls)} shards")
     return all_urls
@@ -171,6 +346,10 @@ def get_ignore_index(ignore_index_paths: List[str] | None, shard_list: List[str]
 
     Returns:
         Dictionary mapping shard names to sets of filenames to ignore
+
+    Raises:
+        OSError, ValueError: If an ignore index cannot be read or parsed; skipping it would train on the
+            files it excludes.
     """
     ignore_index: Dict[str, Set[str]] = {}
 
@@ -178,25 +357,17 @@ def get_ignore_index(ignore_index_paths: List[str] | None, shard_list: List[str]
         for p in ignore_index_paths:
             logger.info(f"Loading ignore index from {p}")
 
-            if p.startswith("s3://"):
-                try:
-                    with os.popen(f"s5cmd cat {p}", "r") as f:
-                        json_content = f.read()
-                        if not json_content.strip():
-                            logger.warning(f"Empty or failed to read S3 file: {p}")
-                            continue
-                        data = json.loads(json_content)
-                except (json.JSONDecodeError, OSError) as e:
-                    logger.error(f"Failed to load ignore index from S3 path {p}: {e}")
-                    continue
+            if s3.is_uri(p):
+                with os.popen(f"s5cmd cat {shlex.quote(p)}", "r") as f:
+                    json_content = f.read()
+                if not json_content.strip():
+                    raise ValueError(f"Empty or failed to read S3 ignore index: {p}")
+                data = json.loads(json_content)
             else:
-                try:
-                    with open(p, mode="r") as f:
-                        data = json.load(f)
-                except (FileNotFoundError, json.JSONDecodeError, OSError) as e:
-                    logger.error(f"Failed to load ignore index from local path {p}: {e}")
-                    continue
+                with open(p, mode="r") as f:
+                    data = json.load(f)
 
+            validate_ignore_index(data, p)
             for shard, files in data.items():
                 if shard not in ignore_index:
                     ignore_index[shard] = set()
@@ -222,21 +393,19 @@ def get_ignore_index(ignore_index_paths: List[str] | None, shard_list: List[str]
 def get_shard_count(
     shard_count_file: str,
     ignore_index: Dict[str, Set[str]] | None = None,
-    shard_list: List[str] | None = None,
 ) -> Dict[str, int]:
     """Load shard count from a JSON file.
 
     Args:
         shard_count_file: Path to JSON file with shard counts
         ignore_index: Optional ignore index to adjust counts
-        shard_list: Optional list of shards to check
 
     Returns:
         Dictionary mapping shard names to sample counts
     """
-    if shard_count_file.startswith("s3://"):
+    if s3.is_uri(shard_count_file):
         try:
-            with os.popen(f"s5cmd cat {shard_count_file}", "r") as f:
+            with os.popen(f"s5cmd cat {shlex.quote(shard_count_file)}", "r") as f:
                 json_content = f.read()
                 if not json_content.strip():
                     raise ValueError(f"Empty or failed to read S3 file: {shard_count_file}")
@@ -252,12 +421,7 @@ def get_shard_count(
         for shard_name in shard_count.keys():
             if shard_name in ignore_index:
                 shard_count[shard_name] -= len(ignore_index[shard_name])
-
-    if shard_list is not None:
-        for shard in shard_list:
-            shard_name = shard_to_name(shard)
-            if shard_name not in shard_count:
-                logger.warning(f"Shard {shard_name} cannot be found in shard count file.")
+    validate_shard_counts(shard_count)
 
     logger.info(
         f"Shard count file loaded from {shard_count_file}. Using {sum(shard_count.values())} samples from the dataset."
@@ -278,25 +442,29 @@ def filter_by_index(item: dict, ignore_index: Dict[str, Set[str]]) -> bool:
 # =============================================================================
 
 
-def _nodesplitter(src, group=None):
-    if torch.distributed.is_initialized():
-        if group is None:
-            group = torch.distributed.group.WORLD
-        rank = torch.distributed.get_rank(group=group)
-        size = torch.distributed.get_world_size(group=group)
-        for i, item in enumerate(src):
-            if i % size == rank:
-                yield item
-    else:
-        yield from src
+def _nodesplitter(src, rank: int, size: int):
+    yield from itertools.islice(src, rank, None, size)
 
 
-def _collate_fn(batch):
-    # Filter out None samples and collate
-    valid_batch = [item for item in batch if item is not None]
-    if not valid_batch:
-        return {}
-    return default_collate(valid_batch)
+def _collate_samples(samples):
+    """Reject unequal nested mapping keys before ``default_collate`` can silently discard them."""
+
+    def validate(values):
+        first = values[0]
+        if isinstance(first, Mapping):
+            if any(not isinstance(value, Mapping) or value.keys() != first.keys() for value in values):
+                raise ValueError(
+                    "Cannot collate samples with different mapping keys (e.g. clips with and without audio); "
+                    "use batch_size=1 or exclude them via ignore_index_paths"
+                )
+            for key in first:
+                validate([value[key] for value in values])
+        elif isinstance(first, (list, tuple)):
+            for items in zip(*values):
+                validate(items)
+
+    validate(samples)
+    return default_collate(samples)
 
 
 def batch_wds_dataset(dataset: wds.WebDataset, batch_size: int, partial: bool = False) -> wds.WebDataset:
@@ -310,7 +478,8 @@ def batch_wds_dataset(dataset: wds.WebDataset, batch_size: int, partial: bool = 
     Returns:
         wds.WebDataset: Batched webdataset.
     """
-    return dataset.batched(batch_size, partial=partial, collation_fn=_collate_fn)
+    # ``process_samples`` yields only non-``None`` samples, so nothing needs filtering before collation.
+    return dataset.batched(batch_size, partial=partial, collation_fn=_collate_samples)
 
 
 def wds_to_dataloader(
@@ -353,9 +522,10 @@ def init_output_dict(item: dict) -> Dict[str, Any]:
         item: WebDataset item
 
     Returns:
-        Dictionary with fname and shard fields
+        Dictionary with idx (the generic per-sample id shared by every loader), fname and shard fields
     """
     return {
+        "idx": item["__key__"],
         "fname": item["__key__"],
         "shard": item.get("__url__", ""),
     }
@@ -364,14 +534,11 @@ def init_output_dict(item: dict) -> Dict[str, Any]:
 class BaseWDSLoader:
     """Base class for WebDataset loaders.
 
-    This class handles common functionality:
-    - num_workers auto-calculation
-    - Deterministic behavior warnings
-    - Common attribute initialization
-    - The __iter__ method
-
-    Subclasses should call super().__init__() with the common parameters,
-    then create their dataset and call _create_loader().
+    It picks the number of workers, builds the dataset (shuffled and resampled, or read in order with
+    ``deterministic=True``, which supports resuming), and iterates batches. Subclasses set their own attributes
+    before calling ``super().__init__()``, which builds the loader, and override ``_pipeline`` to filter,
+    decode, and preprocess samples; ``process_samples`` runs it on each sample. Samples excluded on purpose
+    belong in ``_prefilter``, so they never count as failures.
     """
 
     def __init__(
@@ -380,16 +547,16 @@ class BaseWDSLoader:
         batch_size: int,
         num_workers: int | None = None,
         train: bool = True,
-        cache_path: str | None = None,
         deterministic: bool = False,
-        sampler_start_idx: int = 0,
+        strict: bool = False,
+        sampler_start_idx: int | None = None,
         shard_count_file: str | None = None,
         ignore_index_paths: List[str] | None = None,
         shard_start: int = 0,
         shard_end: int | None = None,
         shards_per_worker: int | None = None,
         partial: bool = False,
-        empty_check: bool = True,
+        drop_last: bool = True,
         shuffle_size: int = 1000,
     ):
         """Initialize common loader attributes.
@@ -399,31 +566,39 @@ class BaseWDSLoader:
             batch_size: Batch size for the dataloader
             num_workers: Number of workers (None for auto)
             train: Whether this is a training dataset
-            cache_path: Path to cache directory
             deterministic: Whether to use deterministic iteration
-            sampler_start_idx: Start index for resumable iteration
-            shard_count_file: Path to shard count file
+            strict: Raise on a sample that fails to decode or preprocess, or on an unreadable shard, instead of
+                skipping it with a warning (deterministic loading always raises on unreadable shards). With
+                ``deterministic`` this keeps resume offsets exact: each skip makes a resume repeat one sample (see
+                the module docstring). ``MAX_CONSECUTIVE_SKIPS`` skips in a row raise either way.
+            sampler_start_idx: Global start sample of deterministic iteration. A ``None`` set in a config lets the
+                trainer choose it: the resume offset for training, 0 for validation. An unresolved ``None`` defaults
+                to 0 with a warning.
+            shard_count_file: Path to shard count file, which lets a deterministic resume skip whole shards
             ignore_index_paths: List of JSON files specifying files to skip
             shard_start: Start index for shard selection
-            shard_end: End index for shard selection
-            shards_per_worker: If None, forces a specific number of total shards per worker by truncating/repeating shards.
+            shard_end: End index for shard selection (inclusive)
+            shards_per_worker: If not None, force this many shards per worker
+                (``world_size * num_workers * shards_per_worker`` shards in total) by truncating/repeating shards.
             partial: Whether to allow partial batches
-            empty_check: Whether to check for empty URL list
+            drop_last: With ``deterministic`` and ``train=False``, end the stream at its last complete group of
+                ``world_size`` samples so every rank reads the same number of samples and, unless some are skipped,
+                yields the same batches; ``False`` reads every sample, which gives the first ranks one extra each.
             shuffle_size: Size of shuffle buffer (0 for no shuffle, only used when train=True)
         """
         self.datatags = datatags
         self.batch_size = batch_size
         self.train = train
-        self.cache_path = cache_path
         self.deterministic = deterministic
-        self.sampler_start_idx = sampler_start_idx or 0
+        self.strict = strict
+        self.sampler_start_idx = normalize_sampler_start_idx(sampler_start_idx)
         self.shard_count_file = shard_count_file
         self.ignore_index_paths = ignore_index_paths
         self.shard_start = shard_start
         self.shard_end = shard_end
         self.shards_per_worker = shards_per_worker
         self.partial = partial
-        self.empty_check = empty_check
+        self.drop_last = drop_last
         self.shuffle_size = shuffle_size
 
         # Compute num_workers
@@ -432,22 +607,17 @@ class BaseWDSLoader:
             if deterministic:
                 self.num_workers = 1
             else:
-                self.num_workers = min(os.cpu_count() // world_size(), 8)
+                # The workers share the node's CPUs with the ranks on that node, not with the whole world.
+                self.num_workers = max(1, min((os.cpu_count() or 1) // local_world_size(), 8))
             logger.info(f"Automatically setting num_workers to {self.num_workers}")
 
         # Log deterministic warnings
         if self.deterministic:
-            if self.num_workers > 1:
-                logger.warning(
-                    "Due to concurrency of workers, deterministic behavior cannot be guaranteed with more than one worker."
-                )
             if self.train:
                 logger.warning("Deterministic webdataset does not shuffle the shards or files within shards.")
         elif self.sampler_start_idx > 0:
-            logger.warning(
-                f"Sampler start index is set to {self.sampler_start_idx} but deterministic is False. "
-                "This will result in a non-deterministic dataset."
-            )
+            # Shuffled, resampled iteration has no position to resume.
+            logger.info(f"Ignoring sampler_start_idx={self.sampler_start_idx} since deterministic is False.")
 
         self.loader = self._create_loader()
 
@@ -465,6 +635,14 @@ class BaseWDSLoader:
         """
         return dataset
 
+    def _prefilter(self, dataset: "wds.WebDataset") -> "wds.WebDataset":
+        """Drop raw samples on purpose before ``_pipeline`` runs; these never count as failures.
+
+        Shuffled loading only: deterministic loading counts its resume offset in raw samples, so it must not drop
+        any outside ``ignore_index_paths``.
+        """
+        return dataset
+
     def _create_loader(self) -> "wds.WebLoader":
         """Create the dataset and dataloader using this loader's pipeline.
 
@@ -474,8 +652,10 @@ class BaseWDSLoader:
         Returns:
             WebLoader wrapping the dataset
         """
-        # force single shard per worker for validation
-        num_shards = None if self.shards_per_worker is None else world_size() * (self.num_workers or 1)
+        # Force a fixed number of shards per worker (e.g. one for validation) by truncating/repeating shards.
+        num_shards = (
+            None if self.shards_per_worker is None else world_size() * (self.num_workers or 1) * self.shards_per_worker
+        )
 
         if self.deterministic:
             dataset = DeterministicWDS(
@@ -489,23 +669,23 @@ class BaseWDSLoader:
                 shard_start=self.shard_start,
                 shard_end=self.shard_end,
                 num_shards=num_shards,
-                empty_check=self.empty_check,
                 partial=self.partial,
-                cache_path=self.cache_path,
+                drop_last=self.drop_last,
+                strict=self.strict,
             )
         else:
             dataset = create_base_webdataset(
                 wds_tags=self.datatags,
                 train=self.train,
-                cache_path=self.cache_path,
                 ignore_index_paths=self.ignore_index_paths,
                 shard_start=self.shard_start,
                 shard_end=self.shard_end,
                 num_shards=num_shards,
-                empty_check=self.empty_check,
                 shuffle_size=self.shuffle_size if self.train else 0,
+                strict=self.strict,
             )
-            dataset = self._pipeline(dataset)
+            dataset = self._prefilter(dataset)
+            dataset = wds.FluidWrapper(functools.partial(process_samples, dataset, self._pipeline, self.strict))
 
         loader = wds_to_dataloader(
             dataset,
@@ -527,11 +707,57 @@ class BaseWDSLoader:
 # =============================================================================
 
 
+def _resume_shards(urls: List[str], counts: Dict[str, int] | None, start: int, repeat: bool):
+    """Return the remaining shard order and the offset within its first shard."""
+    if counts is None:
+        return urls, start
+    total = sum(counts[shard_to_name(url)] for url in urls)
+    if total == 0 or (not repeat and start >= total):
+        return [], 0
+    if repeat:
+        start %= total
+    for index, url in enumerate(urls):
+        count = counts[shard_to_name(url)]
+        if start < count:
+            remaining = urls[index:] + urls[:index] if repeat else urls[index:]
+            return remaining, start
+        start -= count
+    raise AssertionError("Validated shard counts did not contain the resume offset")
+
+
+def _complete_group_samples(samples, rank: int, num_ranks: int):
+    """Yield sample ``rank`` of each complete group of ``num_ranks`` consecutive samples.
+
+    Dropping the final incomplete group gives every rank the same number of samples. Raw samples can be large, so
+    only the selected sample of a group is held.
+    """
+    samples = iter(samples)
+    while True:
+        selected, count = None, 0
+        for count, sample in enumerate(itertools.islice(samples, num_ranks), start=1):
+            if count == rank + 1:
+                selected = sample
+        if count < num_ranks:
+            return
+        yield selected
+
+
 class DeterministicWDS(IterableDataset):
     """Base class for deterministic WebDataset loaders that support resumable iteration.
 
     The full dataset is read in order (i.e., every shard and every file in that shard
-    that is not ignored) and all workers across ranks read their corresponding slice.
+    that is not ignored). Rank r reads every world_size-th sample starting at
+    sampler_start_idx + r; with ``drop_last``, a finite stream stops at its last complete
+    group of world_size samples, so every rank reads the same number. Workers take whole
+    batches round-robin, so the combined order is independent of their number, including
+    when resuming mid-epoch, as long as no sample is skipped.
+
+    Repeated epochs form one continuous stream; batches can cross epoch boundaries.
+    An empty pass raises when repeating; finite streams may finish empty.
+    Count metadata can skip whole shards and must match the data and ignore indices.
+    Processing should yield one output per input: samples that fail or are dropped are
+    skipped with a warning (``strict=True`` raises); use explicit ignore indices for
+    exclusions. Determinism covers sample order, not random augmentations.
     """
 
     def __init__(
@@ -545,10 +771,10 @@ class DeterministicWDS(IterableDataset):
         shard_start: int = 0,
         shard_end: int | None = None,
         num_shards: int | None = None,
-        empty_check: bool = True,
         partial: bool = False,
-        cache_path: str | None = None,
+        drop_last: bool = True,
         pipeline_fn: Callable[[wds.WebDataset], wds.WebDataset] | None = None,
+        strict: bool = False,
     ):
         """Initialize the deterministic WebDataset.
 
@@ -562,146 +788,154 @@ class DeterministicWDS(IterableDataset):
             shard_start: Start index for shard selection
             shard_end: End index for shard selection (inclusive)
             num_shards: Target number of shards
-            empty_check: Whether to check for empty URL list
             partial: Whether to allow partial batches
-            cache_path: Path to cache directory
+            drop_last: Without ``repeat``, end at the last complete group of world-size samples so every rank reads
+                the same number; ``False`` reads every sample, which gives the first ranks one extra sample each
             pipeline_fn: Function that processes the WebDataset
+            strict: Raise when ``pipeline_fn`` fails on or drops a sample instead of skipping it with a warning
         """
         super().__init__()
-        self.cache_path = cache_path
-        self.empty_check = empty_check
-        self.sampler_start_idx = sampler_start_idx
+        self.sampler_start_idx = normalize_sampler_start_idx(sampler_start_idx)
         self.partial = partial
+        self.drop_last = drop_last
         self.batch_size = batch_size
         self.repeat = repeat
         self.pipeline_fn = pipeline_fn
+        self.strict = strict
+        # Spawned workers have no process group; capture the rank in the parent.
+        self.rank, self.num_ranks = get_rank(), world_size()
+        validate_wds_config(sampler_start_idx=self.sampler_start_idx)
 
         # Get URLs and ignore index
         self.all_urls = get_shards(wds_tags, shard_start, shard_end=shard_end, num_shards=num_shards)
         self.ignore_index = get_ignore_index(ignore_index_paths, shard_list=self.all_urls)
 
         if shard_count_file is None:
-            logger.warning("Shard count file is not provided, will not be able to fast-forward the urls.")
+            if self.sampler_start_idx > 0:
+                logger.warning(
+                    f"Without a shard count file, every worker reads the {self.sampler_start_idx} skipped samples to "
+                    "reach sampler_start_idx; set shard_count_file to skip whole shards."
+                )
             self.shard_count = None
         else:
-            self.shard_count = get_shard_count(
-                shard_count_file, ignore_index=self.ignore_index, shard_list=self.all_urls
-            )
+            self.shard_count = get_shard_count(shard_count_file, ignore_index=self.ignore_index)
+            check_repeat_samples(any(self.shard_count[shard_to_name(url)] for url in self.all_urls), self.repeat)
 
-        # Create cache directory
-        if self.cache_path is not None:
-            logger.info("Creating WebDataset cache directory")
-            os.makedirs(self.cache_path, exist_ok=True)
-
-    def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-
-        if worker_info is None:
-            worker_id = 0
-            num_workers = 1
-        else:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-
-        start_idx = self.sampler_start_idx
-        if self.shard_count is not None:
-            # Fast-forward URLs until offset is reached
-            shard_idx = 0
-            for idx, url in enumerate(itertools.cycle(self.all_urls)):
-                new_start_idx = start_idx - self.shard_count[shard_to_name(url)]
-                if new_start_idx >= 0:
-                    start_idx = new_start_idx
-                else:
-                    shard_idx = idx % len(self.all_urls)
-                    break
-
-            assert (
-                sum(self.shard_count[shard_to_name(url)] for url in self.all_urls[:shard_idx]) <= self.sampler_start_idx
-            )
-            logger.debug(
-                f"Fast-forwarding to shard {shard_idx} (with start index {start_idx}) "
-                f"for worker {worker_id} of {num_workers} worker(s)"
-            )
-            self.all_urls = self.all_urls[shard_idx:] + self.all_urls[:shard_idx]
-
-        # Calculate offset and splitsize for this specific worker
-        offset = start_idx + worker_id + num_workers * get_rank()
-        splitsize = num_workers * world_size()
-
-        # Build the webdataset
+    def _sample_stream(self, urls):
         dataset = wds.WebDataset(
-            self.all_urls,
-            cache_dir=self.cache_path,
+            urls,
             nodesplitter=None,
             workersplitter=None,
             shardshuffle=False,
-            handler=wds.handlers.warn_and_continue,
-            empty_check=self.empty_check,
+            handler=wds.handlers.reraise_exception,
+            empty_check=False,
         )
+        dataset = dataset.select(functools.partial(filter_by_index, ignore_index=self.ignore_index))
+        counts = None if self.shard_count is None else {url: self.shard_count[shard_to_name(url)] for url in urls}
+        while True:
+            seen = False
+            samples = dataset if counts is None else check_shard_counts(dataset, urls, counts)
+            for sample in samples:
+                seen = True
+                yield sample
+            check_repeat_samples(seen, self.repeat)
+            if not self.repeat:
+                return
 
-        if self.repeat:
-            dataset = dataset.repeat()
+    def __iter__(self):
+        worker = torch.utils.data.get_worker_info()
+        worker_id, num_workers = (worker.id, worker.num_workers) if worker else (0, 1)
+        urls, start = _resume_shards(self.all_urls, self.shard_count, self.sampler_start_idx, self.repeat)
+        if not urls:
+            return
 
-        # Filter ignored files
-        if len(self.ignore_index) > 0:
-            filter_fn = functools.partial(filter_by_index, ignore_index=self.ignore_index)
-            dataset = dataset.select(filter_fn)
+        stream = self._sample_stream(urls)
+        if self.drop_last and not self.repeat:
+            rank_samples = _complete_group_samples(itertools.islice(stream, start, None), self.rank, self.num_ranks)
+        else:
+            rank_samples = itertools.islice(stream, start + self.rank, None, self.num_ranks)
+        # DataLoader fetches worker batches round-robin. Partition *batches*, not
+        # individual samples, so restarting worker 0 continues the global stream.
+        samples = (sample for i, sample in enumerate(rank_samples) if (i // self.batch_size) % num_workers == worker_id)
+        processed = functools.partial(process_samples, samples, self.pipeline_fn, self.strict)
+        dataset = wds.FluidWrapper(processed)
+        yield from batch_wds_dataset(dataset, self.batch_size, partial=self.partial)
 
-        # Jump to offset and skip splitsize samples for this worker
-        dataset = dataset.slice(offset, sys.maxsize, splitsize)
 
-        # Process and batch the dataset
-        if self.pipeline_fn is not None:
-            dataset = self.pipeline_fn(dataset)
-        dataset = batch_wds_dataset(dataset, self.batch_size, partial=self.partial)
+class _ShardReadHandler:
+    """WebDataset handler that skips unreadable shard data with a warning, or re-raises the error with ``strict``.
 
-        yield from dataset
+    ``MAX_CONSECUTIVE_SKIPS`` failures in a row raise; ``reset`` marks each sample read successfully.
+    """
+
+    def __init__(self, strict: bool):
+        self.strict = strict
+        self.failures = 0
+
+    def __call__(self, error: Exception) -> bool:
+        if self.strict:
+            raise error
+        self.failures += 1
+        # WebDataset appends the shard URL to the error's arguments.
+        logger.warning(f"Skipping unreadable shard data: {error!r}")
+        if self.failures == MAX_CONSECUTIVE_SKIPS:
+            raise ValueError(
+                f"{self.failures} shard reads in a row failed, the last with {error!r}; "
+                "check the shard paths and storage credentials"
+            ) from error
+        return True
+
+    def reset(self, sample: dict) -> dict:
+        self.failures = 0
+        return sample
 
 
 def create_base_webdataset(
     wds_tags: List[str],
     train: bool = True,
-    cache_path: str | None = None,
     ignore_index_paths: List[str] | None = None,
     shard_start: int = 0,
     shard_end: int | None = None,
     num_shards: int | None = None,
-    empty_check: bool = True,
     shuffle_size: int = 1000,
+    strict: bool = False,
 ) -> wds.WebDataset:
     """Create a base WebDataset with common configuration.
+
+    Unreadable shards are skipped with a warning, and ``MAX_CONSECUTIVE_SKIPS`` failed shard reads in a row raise;
+    ``strict=True`` raises on the first one.
 
     Args:
         wds_tags: List of WDS tags
         train: Whether this is a training dataset
-        cache_path: Path to cache directory
         ignore_index_paths: List of JSON files specifying files to skip
         shard_start: Start index for shard selection
-        shard_end: End index for shard selection
+        shard_end: End index for shard selection (inclusive)
         num_shards: Target number of shards
-        empty_check: Whether to check for empty URL list
         shuffle_size: Size of shuffle buffer (0 for no shuffle)
+        strict: Raise on the first unreadable shard instead of skipping it
 
     Returns:
         Configured WebDataset ready for processing
     """
     all_urls = get_shards(wds_tags, shard_start, shard_end=shard_end, num_shards=num_shards)
     ignore_index = get_ignore_index(ignore_index_paths, shard_list=all_urls)
+    # Bind rank information before DataLoader creates isolated worker processes.
+    rank, size = get_rank(), world_size()
 
-    # Create cache directory
-    if cache_path is not None:
-        logger.info("Creating WebDataset cache directory")
-        os.makedirs(cache_path, exist_ok=True)
-
+    shard_errors = _ShardReadHandler(strict)
     dataset = wds.WebDataset(
         all_urls,
         resampled=train,
-        nodesplitter=None if train else _nodesplitter,
-        cache_dir=cache_path,
+        nodesplitter=None if train else functools.partial(_nodesplitter, rank=rank, size=size),
         shardshuffle=False,
-        handler=wds.handlers.warn_and_continue,
-        empty_check=empty_check,
-    ).shuffle(shuffle_size if train else 0)
+        handler=shard_errors,
+        # Finite workers may have no assigned shards or only empty shards.
+        empty_check=train,
+    )
+    # A resampled stream whose shards all fail would otherwise retry them forever without yielding a sample.
+    dataset = dataset.map(shard_errors.reset)
+    dataset = dataset.shuffle(shuffle_size if train else 0)
 
     # Apply ignore filter
     if len(ignore_index) > 0:

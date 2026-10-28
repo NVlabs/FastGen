@@ -22,10 +22,11 @@ from typing import Any, Optional, TYPE_CHECKING
 
 import torch
 
-from fastgen.methods.consistency_model.mean_flow import FlowMapLossMixin
-from fastgen.methods.distribution_matching.dmd2 import DMD2Model
-from fastgen.networks.noise_schedule import time_shift
-from fastgen.utils.distributed import world_size
+from fastgen.methods.trajectory_matching.mean_flow import FlowMapLossMixin
+from fastgen.methods.distribution_matching.dmd2 import DMD2Model, Generation, TrainingInputs
+from fastgen.utils.distributed.collectives import broadcast_choice
+from fastgen.utils.basic_utils import safe_update
+from fastgen.utils.tree_utils import noise_from_shape
 import fastgen.utils.logging_utils as logger
 
 
@@ -39,111 +40,128 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
     """AnyFlow on-policy stage: DMD2 with a flow-map rollout student.
 
     ``FlowMapLossMixin`` supplies the co-trained Stage-1 objective and the
-    flow-map validation sample loop, which integrates with ``r = t_next``.
+    flow-map student-step hook, which integrates with ``r = t_next`` through
+    the shared sample loop.
+
+    AnyFlow requires ``backward_simulation="default"`` because its student always
+    starts from fresh noise. Unlike base DMD2, it completes the rollout in the
+    current iteration and does not emit cross-iteration carry state. Real data
+    is required only when the optional co-trained flow-map objective is active.
     """
 
+    # The flow-map rollout's clean endpoint is the generation.
+    student_generations = ("x0",)
+
     def __init__(self, config: ModelConfig):
+        if config.backward_simulation != "default":
+            raise ValueError(
+                "AnyFlowModel requires backward_simulation='default': it always starts from fresh noise "
+                "and performs its complete flow-map rollout within the current iteration, carrying nothing."
+            )
+        if config.max_steps_rollout <= 0:
+            raise ValueError(f"max_steps_rollout must be positive, got {config.max_steps_rollout}.")
         super().__init__(config)
-        self.config = config
         # The co-trained flow-map loss draws its (t, r) from its own config, not from
         # `sample_t_cfg` -- DMD2 keeps that one for the noising time.
-        self._init_flow_map_loss(config.cotrain_sample_t_cfg, config.cotrain_sample_r_cfg)
+        self._init_flow_map_loss(config.cotrain_sample_t_cfg, config.cotrain_sample_r_overrides)
 
         logger.info(
-            f"AnyFlow on-policy: student_sample_steps_list={self.config.student_sample_steps_list}, "
+            f"AnyFlow on-policy: student_steps_list={self.config.student_steps_list}, "
+            f"max_steps_rollout={self.config.max_steps_rollout}, "
             f"student_update_freq={self.config.student_update_freq}, "
             f"cotrain_pretrain_weight={self.config.cotrain_pretrain_weight}, "
             f"gan_loss_weight_gen={self.config.gan_loss_weight_gen}"
         )
 
+    def init_optimizers(self):
+        super().init_optimizers()
+        # Runs after the trainer loads trainer.checkpointer.pretrained_ckpt_path, which sets resume_iter.
+        if not hasattr(self, "resume_iter"):
+            logger.warning(
+                "AnyFlow's on-policy stage starts without its Stage-1 flow-map checkpoint; set "
+                "trainer.checkpointer.pretrained_ckpt_path to it, whose iteration also offsets the EMA start."
+            )
+
     # ------------------------------------------------------------------
     # Rollout
     # ------------------------------------------------------------------
 
-    def _generate_noise_and_time(
-        self, real_data: torch.Tensor, iteration: Optional[int] = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The student rollout always starts from pure noise at ``max_t``."""
-        batch_size = real_data.shape[0]
+    def _rollout_paths(self, num_steps: int) -> list[list[int]]:
+        """Enumerate the bounded windows of one inference grid."""
+        max_steps_rollout = self.config.max_steps_rollout
+        if max_steps_rollout == 1 or num_steps == 1:
+            return [[0, num_steps]]
+        if max_steps_rollout == 2:
+            return [[0, split, num_steps] for split in range(1, num_steps)]
 
-        eps_student = torch.randn(batch_size, *self.input_shape, device=self.device, dtype=real_data.dtype)
-        t_student = torch.full(
-            (batch_size,),
-            self.net.noise_scheduler.max_t,
-            device=self.device,
-            dtype=self.net.noise_scheduler.t_precision,
+        # Expose consecutive fine steps and collapse the optional prefix and
+        # suffix into one forward each. A cap of 3 reproduces the reference
+        # prefix / selected fine step / suffix construction.
+        num_exposed_steps = min(max_steps_rollout - 2, num_steps)
+        # Neighbouring starts share one window once it spans every interior node; keep each window once, in order.
+        exposed_windows = dict.fromkeys(
+            tuple(step_idx for step_idx in range(start, start + num_exposed_steps + 1) if 0 < step_idx < num_steps)
+            for start in range(num_steps - num_exposed_steps + 1)
         )
-        input_student = self.net.noise_scheduler.latents(noise=eps_student)
+        return [[0, *window, num_steps] for window in exposed_windows]
 
-        t = self._sample_noising_time(batch_size, iteration)
-        eps = torch.randn_like(real_data, device=self.device, dtype=real_data.dtype)
-        return input_student, t_student, t, eps
+    def _training_inputs(self, data: "Dict[str, Any]", iteration: int = 1) -> TrainingInputs:
+        """Construct data-free inputs for AnyFlow's in-iteration rollout.
 
-    def _broadcast_choice(self, high: int) -> int:
-        """Pick an index in [0, high) on rank 0 and broadcast it."""
-        idx = torch.randint(0, high, (1,), device=self.device, dtype=torch.long)
-        if world_size() > 1:
-            torch.distributed.broadcast(idx, src=0)
-        return int(idx.item())
-
-    @staticmethod
-    def rollout_t_list(num_steps: int, shift: float = 1.0, max_t: float = 1.0) -> torch.Tensor:
-        """Shifted timestep schedule ``[max_t, ..., 0]`` with ``num_steps + 1`` entries.
-
-        Equivalent to the reference scheduler's ``set_timesteps``, with ``shift`` the
-        model's ``flow_map_shift``. Static so the configs can derive the matching
-        validation ``t_list`` from it; float64 on the CPU for the caller to cast.
+        Shape and dtype come from the model configuration. Real data, when
+        present, is retained only for the optional GAN and flow-map co-training
+        losses. Returning no student step or trajectory step expresses
+        that the rollout constructs its complete schedule in-iteration and
+        carries no state across iterations.
         """
-        grid = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)
-        return time_shift(grid, shift).clamp(max=max_t)
+        del iteration
+        batch_size = self._batch_size(data)
+        noise = noise_from_shape(self.input_shape, batch_size, self.device, self.precision)
+        student_grid = self.net.noise_scheduler.student_grid(device=self.device)
+        input_student = self.net.noise_scheduler.latents(noise=noise, t_init=student_grid[0])
+        t, eps = self._sample_t_and_eps(batch_size)
+        return TrainingInputs(input_student=input_student, student_step=None, t=t, eps=eps)
 
     def gen_data_from_net(
         self,
         input_student: torch.Tensor,
-        t_student: torch.Tensor,
+        student_step: Optional[torch.Tensor],
         condition: Optional[Any] = None,
-    ) -> torch.Tensor:
-        """Flow-map rollout compressed into at most three network forwards.
+        neg_condition: Optional[Any] = None,
+    ) -> Generation:
+        """Flow-map rollout bounded by ``max_steps_rollout`` network calls.
 
-        Mirrors the reference ``WanAnyFlowPipeline.training_rollout``: on a
-        ``num_steps``-step schedule ``t_0 > ... > t_N = 0`` with a sampled fine-step
-        position ``g``, jump ``t_0 -> t_g``, take the fine step ``t_g -> t_{g+1}``,
-        then jump ``t_{g+1} -> 0``, each one forward of mean-velocity sampling
-        ``u_theta(x_t, t, r=t_next)``. Gradient flows through all segments; the
-        fake-score update wraps this call in ``no_grad`` at the caller.
+        On a ``num_steps``-step schedule ``t_0 > ... > t_N = 0``, a contiguous
+        window of fine steps is exposed while its optional prefix and suffix
+        are collapsed into jumps. The default cap of 3 mirrors the reference
+        ``WanAnyFlowPipeline.training_rollout``. Gradient flows through every
+        segment; the fake-score update wraps this call in ``no_grad``.
         """
-        del t_student  # the rollout schedule is built below
+        del student_step, neg_condition  # the complete rollout schedule is built below
 
-        # This iteration's rollout NFE, as the reference draws it
-        # (``random.choice(num_inference_steps_list)``, rank-0 broadcast in both the
-        # generator and the fake-score update); no list means the fixed
-        # ``student_sample_steps``.
-        steps_list = self.config.student_sample_steps_list
+        # Draw the training rollout NFE (rank-0 broadcast in both the
+        # generator and fake-score updates).
+        steps_list = self.config.student_steps_list
         if steps_list:
-            num_steps = int(steps_list[self._broadcast_choice(len(steps_list))])
+            num_steps = steps_list[broadcast_choice(len(steps_list), device=self.device)]
         else:
-            num_steps = int(self.config.student_sample_steps)
-        assert num_steps >= 1, f"rollout steps must be >= 1, got {num_steps}"
-        grad_step = self._broadcast_choice(num_steps)
-        ns = self.net.noise_scheduler
-        t_list = self.rollout_t_list(num_steps, self.flow_map_shift, float(ns.max_t)).to(
-            device=self.device, dtype=ns.t_precision
-        )
+            num_steps = self.net.noise_scheduler.student_grid_cfg.steps
+        student_grid = self.net.noise_scheduler.student_grid(num_steps, device=self.device)
+        paths = self._rollout_paths(num_steps)
+        step_indices = paths[0] if len(paths) == 1 else paths[broadcast_choice(len(paths), device=self.device)]
+        sample_grid = student_grid[step_indices]
 
-        # The leading jump exists only for grad_step > 0 and the trailing one
-        # only for grad_step + 1 < num_steps.
-        seg_t = [t_list[0]] if grad_step > 0 else []
-        seg_t += [t_list[grad_step], t_list[grad_step + 1]]
-        if grad_step + 1 < num_steps:
-            seg_t.append(t_list[-1])
-
-        return self._student_sample_loop(
+        gen_data = self._student_sample_loop(
             self.net,
             input_student,
-            t_list=torch.stack(seg_t),
+            student_grid=sample_grid,
             condition=condition,
-            student_sample_type="ode",
         )
+        generation_metrics = {
+            "student_steps": torch.tensor(float(num_steps), device=self.device),
+            "num_rollout_forwards": torch.tensor(float(len(step_indices) - 1), device=self.device),
+        }
+        return Generation(data=gen_data, x0=gen_data, metrics=generation_metrics)
 
     # ------------------------------------------------------------------
     # Training step — DMD2 plus the co-trained Stage-1 flow-map loss
@@ -152,32 +170,24 @@ class AnyFlowModel(FlowMapLossMixin, DMD2Model):
     def single_train_step(
         self, data: "Dict[str, Any]", iteration: int
     ) -> tuple[dict[str, torch.Tensor], dict[str, "torch.Tensor | Callable"]]:
-        real_data, condition, neg_condition = self._prepare_training_data(data)
-        self._setup_grad_requirements(iteration)
-        input_student, t_student, t, eps = self._generate_noise_and_time(real_data, iteration=iteration)
-
-        if iteration % self.config.student_update_freq == 0:
-            loss_map, outputs = self._student_update_step(
-                input_student, t_student, t, eps, data, condition=condition, neg_condition=neg_condition
+        real_data = data.get("real")
+        is_student_update = iteration % self.config.student_update_freq == 0
+        if self.config.cotrain_pretrain_weight > 0 and real_data is None:
+            raise ValueError(
+                "AnyFlow cotrain_pretrain_weight > 0 requires data['real']; set "
+                "cotrain_pretrain_weight=0 for data-free training."
             )
-            if self.config.cotrain_pretrain_weight > 0:
-                # Reference cotrain_forward_kl: every generator update also
-                # runs the full Stage-1 bidirection (flow-map) loss on the
-                # real batch.
-                t_mf, r_mf, r_eq_t_mask = self._sample_t_r_buckets(real_data.shape[0])
-                mf_outputs = self._compute_mf_loss(
-                    real_data=real_data,
-                    t=t_mf,
-                    r=r_mf,
-                    iteration=iteration,
-                    condition=condition,
-                    neg_condition=neg_condition,
-                )
-                bidirection_loss = self._reduce_mf_loss(mf_outputs[0], r_eq_t_mask)
-                loss_map["bidirection_loss"] = bidirection_loss
-                loss_map["total_loss"] = loss_map["total_loss"] + self.config.cotrain_pretrain_weight * bidirection_loss
-            return loss_map, outputs
 
-        return self._fake_score_discriminator_update_step(
-            input_student, t_student, t, eps, real_data, condition=condition
-        )
+        loss_map, outputs = super().single_train_step(data, iteration)
+        if is_student_update and self.config.cotrain_pretrain_weight > 0:
+            assert real_data is not None
+            # Reference cotrain_forward_kl: every generator update also runs
+            # the full Stage-1 flow-map loss on the real batch.
+            cotrain_loss_map = self._flow_map_loss_step(data, iteration).loss_map
+            cotrain_metrics = {"cotrain_loss": cotrain_loss_map.pop("total_loss")}
+            safe_update(cotrain_metrics, {f"cotrain_{key}": value for key, value in cotrain_loss_map.items()})
+            safe_update(loss_map, cotrain_metrics)
+            loss_map["total_loss"] = (
+                loss_map["total_loss"] + self.config.cotrain_pretrain_weight * loss_map["cotrain_loss"]
+            )
+        return loss_map, outputs

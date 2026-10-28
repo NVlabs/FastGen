@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import os
 from fastgen.utils import logging_utils as logger
+from fastgen.utils.env import output_root
 from fastgen.callbacks.callback import Callback
 import atexit
 import pickle
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
 def create_dump(dump_path):
     logger.critical(f"Creating {dump_path}")
     if not dump_path.endswith("html"):
-        print(f"[{__file__}] create_dump produces an HTML file but was called with {dump_path=}")
+        logger.warning(f"create_dump produces an HTML file but was called with {dump_path=}")
     torch.cuda.memory._dump_snapshot(dump_path + ".pickle")
     with open(dump_path + ".pickle", "rb") as f:
         data = pickle.load(f)
@@ -39,11 +40,10 @@ def create_dump(dump_path):
     """
 
     # find which GPU was active
-    idx_device = -1
-    for i in range(8):
-        if data["device_traces"][i]:
-            idx_device = i
-            break
+    idx_device = next((i for i, trace in enumerate(data["device_traces"]) if trace), None)
+    if idx_device is None:
+        logger.warning(f"No GPU recorded allocation events; skipping {dump_path}")
+        return
 
     traces = data["device_traces"][idx_device]  # create an aliasing variable for convenience
     traces = [
@@ -100,19 +100,22 @@ def create_dump(dump_path):
     )
     with open(dump_path, "w") as f:
         f.write(html_src)
+    os.remove(dump_path + ".pickle")
 
 
 class MemTrackerCallback(Callback):
     def __init__(self, save_every_n_iters: Optional[int] = None, deactivate_after_n_iters: int = 100):
         def close_and_save():
-            create_dump(
-                f"{os.environ.get('FASTGEN_OUTPUT_ROOT', 'FASTGEN_OUTPUT')}/crash_rank{os.environ.get('RANK', '0')}.html"
-            )
+            create_dump(f"{self._dump_dir()}/crash_rank{os.environ.get('RANK', '0')}.html")
 
         self.deactivate_after_n_iters = deactivate_after_n_iters  # Deactivate eventually to prevent leaking host memory
         self.save_every_n_iters = save_every_n_iters
         self.atexit_fn = close_and_save
         atexit.register(self.atexit_fn)
+
+    def _dump_dir(self) -> str:
+        """Run directory of the attached config, else the shared output root."""
+        return self.config.log_config.save_path if hasattr(self, "config") else output_root()
 
     def on_app_begin(self):
         logger.info("[MemTrackerCallback] Tracking peak memory usage")
@@ -129,6 +132,4 @@ class MemTrackerCallback(Callback):
         if iteration > self.deactivate_after_n_iters:
             torch.cuda.memory._record_memory_history(enabled=None)  # frees pytorch tracking datastructures
         if self.save_every_n_iters is not None and (iteration % self.save_every_n_iters) == 0:
-            create_dump(
-                f"{os.environ.get('FASTGEN_OUTPUT_ROOT', 'FASTGEN_OUTPUT')}/step{iteration}_rank{os.environ.get('RANK', '0')}.html"
-            )
+            create_dump(f"{self._dump_dir()}/step{iteration}_rank{os.environ.get('RANK', '0')}.html")

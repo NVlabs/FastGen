@@ -16,9 +16,7 @@
 
 from typing import Any, Dict, List, Optional, Tuple, Union, Set
 import types
-import os
 import torch
-from torch import dtype
 from torch.distributed.fsdp import fully_shard
 
 from diffusers import UNet2DConditionModel, AutoencoderKL
@@ -29,12 +27,12 @@ from diffusers.models.unets.unet_2d_blocks import (
     UpBlock2D,
     UNetMidBlock2DCrossAttn,
 )
-from diffusers.utils import deprecate, USE_PEFT_BACKEND, unscale_lora_layers
 from transformers import CLIPTextModel, CLIPTokenizer
-from fastgen.networks.network import FastGenNetwork
-from fastgen.networks.noise_schedule import NET_PRED_TYPES
-from fastgen.utils.basic_utils import str2bool
+from fastgen.networks.network import FastGenNetwork, FastGenModule
 from fastgen.utils.distributed.fsdp import apply_fsdp_checkpointing
+from fastgen.utils.guidance import GuidanceConfig, predict_with_guidance
+from fastgen.utils.tree_utils import OutputDtype, assert_same
+from fastgen.utils.env import hf_load
 import fastgen.utils.logging_utils as logger
 
 
@@ -48,9 +46,6 @@ def classify_forward(
     attention_mask: Optional[torch.Tensor] = None,
     cross_attention_kwargs: Optional[Dict[str, Any]] = None,
     added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
-    down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
-    mid_block_additional_residual: Optional[torch.Tensor] = None,
-    down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
     encoder_attention_mask: Optional[torch.Tensor] = None,
     return_features_early: Optional[bool] = False,
     feature_indices: Optional[Set[int]] = None,
@@ -81,27 +76,21 @@ def classify_forward(
         added_cond_kwargs: (`dict`, *optional*):
             A kwargs dictionary containing additional embeddings that if specified are added to the embeddings that
             are passed along to the UNet blocks.
-        down_block_additional_residuals: (`tuple` of `torch.Tensor`, *optional*):
-            A tuple of tensors that if specified are added to the residuals of down unet blocks.
-        mid_block_additional_residual: (`torch.Tensor`, *optional*):
-            A tensor that if specified is added to the residual of the middle unet block.
-        down_intrablock_additional_residuals (`tuple` of `torch.Tensor`, *optional*):
-            additional residuals to be added within UNet down blocks, for example from T2I-Adapter side model(s)
         encoder_attention_mask (`torch.Tensor`):
             A cross-attention mask of shape `(batch, sequence_length)` is applied to `encoder_hidden_states`. If
             `True` the mask is kept, otherwise if `False` it is discarded. Mask will be converted into a bias,
             which adds large negative values to the attention scores corresponding to "discard" tokens.
         feature_indices: A set of feature indices (a set of integers) decides which blocks
-                to extract features from. If the set is non-empty, then features will be returned.
-                By default, feature_indices=None means extract no features.
+                to extract features from. Any provided set returns a feature list alongside the output,
+                including an empty list for an empty set. None returns only the model output.
         return_features_early: If true, the forward pass returns the features once the set is complete.
             This means the forward pass will not finish completely and no final output is returned.
-        return_logvar: If true, the foward pass returns the logvar.
+        return_logvar: If true, the forward pass returns the logvar.
 
     Returns:
-        [A `list` is returned where the first element is the sample tensor.
+        The sample tensor, or ``[sample, features]`` when ``feature_indices`` is given, or only the features
+        with ``return_features_early``; ``return_logvar`` returns ``(output, logvar)``.
     """
-
     # By default, samples have to be AT least a multiple of the overall upsampling factor.
     # The overall upsampling factor is equal to 2 ** (# num of upsampling layers).
     # However, the upsampling interpolation output size can be forced to fit any upsampling size
@@ -182,41 +171,10 @@ def classify_forward(
         cross_attention_kwargs["gligen"] = {"objs": self.position_net(**gligen_args)}
 
     # 3. down
-    # we're popping the `scale` instead of getting it because otherwise `scale` will be propagated
-    # to the internal blocks and will raise deprecation warnings. this will be confusing for our users.
-    if cross_attention_kwargs is not None:
-        cross_attention_kwargs = cross_attention_kwargs.copy()
-        lora_scale = cross_attention_kwargs.pop("scale", 1.0)
-    else:
-        lora_scale = 1.0
-
-    is_controlnet = mid_block_additional_residual is not None and down_block_additional_residuals is not None
-    # using new arg down_intrablock_additional_residuals for T2I-Adapters, to distinguish from controlnets
-    is_adapter = down_intrablock_additional_residuals is not None
-    # maintain backward compatibility for legacy usage, where
-    #       T2I-Adapter and ControlNet both use down_block_additional_residuals arg
-    #       but can only use one or the other
-    if not is_adapter and mid_block_additional_residual is None and down_block_additional_residuals is not None:
-        deprecate(
-            "T2I should not use down_block_additional_residuals",
-            "1.3.0",
-            "Passing intrablock residual connections with `down_block_additional_residuals` is deprecated \
-                    and will be removed in diffusers 1.3.0.  `down_block_additional_residuals` should only be used \
-                    for ControlNet. Please make sure use `down_intrablock_additional_residuals` instead. ",
-            standard_warn=False,
-        )
-        down_intrablock_additional_residuals = down_block_additional_residuals
-        is_adapter = True
-
     down_block_res_samples = (sample,)
     idx, features = 0, []
     for downsample_block in self.down_blocks:
         if hasattr(downsample_block, "has_cross_attention") and downsample_block.has_cross_attention:
-            # For t2i-adapter CrossAttnDownBlock2D
-            additional_residuals = {}
-            if is_adapter and len(down_intrablock_additional_residuals) > 0:
-                additional_residuals["additional_residuals"] = down_intrablock_additional_residuals.pop(0)
-
             sample, res_samples = downsample_block(
                 hidden_states=sample,
                 temb=emb,
@@ -224,29 +182,17 @@ def classify_forward(
                 attention_mask=attention_mask,
                 cross_attention_kwargs=cross_attention_kwargs,
                 encoder_attention_mask=encoder_attention_mask,
-                **additional_residuals,
             )
         else:
             sample, res_samples = downsample_block(hidden_states=sample, temb=emb)
-            if is_adapter and len(down_intrablock_additional_residuals) > 0:
-                sample += down_intrablock_additional_residuals.pop(0)
 
-        if idx in feature_indices:
+        if feature_indices is not None and idx in feature_indices:
             features.append(sample)
         idx += 1
+        if return_features_early and feature_indices is not None and len(features) == len(feature_indices):
+            return features
 
         down_block_res_samples += res_samples
-
-    if is_controlnet:
-        new_down_block_res_samples = ()
-
-        for down_block_res_sample, down_block_additional_residual in zip(
-            down_block_res_samples, down_block_additional_residuals
-        ):
-            down_block_res_sample = down_block_res_sample + down_block_additional_residual
-            new_down_block_res_samples = new_down_block_res_samples + (down_block_res_sample,)
-
-        down_block_res_samples = new_down_block_res_samples
 
     # 4. mid
     if self.mid_block is not None:
@@ -262,22 +208,12 @@ def classify_forward(
         else:
             sample = self.mid_block(sample, emb)
 
-        # To support T2I-Adapter-XL
-        if (
-            is_adapter
-            and len(down_intrablock_additional_residuals) > 0
-            and sample.shape == down_intrablock_additional_residuals[0].shape
-        ):
-            sample += down_intrablock_additional_residuals.pop(0)
-
-    if is_controlnet:
-        sample = sample + mid_block_additional_residual
-
-    if idx in feature_indices:
+    if feature_indices is not None and idx in feature_indices:
         features.append(sample)
 
     # If we have all the features, we can exit early
     if return_features_early:
+        assert feature_indices is not None
         assert len(features) == len(feature_indices), f"{len(features)} != {len(feature_indices)}"
         return features
 
@@ -318,160 +254,144 @@ def classify_forward(
         sample = self.conv_act(sample)
     sample = self.conv_out(sample)
 
-    if USE_PEFT_BACKEND:
-        # remove `lora_scale` from each PEFT layer
-        unscale_lora_layers(self, lora_scale)
-
-    if len(feature_indices) == 0:
-        # no features requested, return only the model output
-        out = sample
-    else:
-        # score and features； score, features
-        out = [sample, features]
+    out = [sample, features] if feature_indices is not None else sample
 
     if return_logvar:
-        logvar = self.unet.logvar_linear(emb_timestep)
+        logvar = self.logvar_linear(emb_timestep)
         return out, logvar
 
     return out
 
 
-class StableDiffusionTextEncoder:
+class StableDiffusionTextEncoder(FastGenModule):
     def __init__(
         self,
-        model_id: str,
+        model_id_or_local_path: str,
     ):
         super().__init__()
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            model_id,
+        self.text_encoder = hf_load(
+            CLIPTextModel.from_pretrained,
+            model_id_or_local_path,
             subfolder="text_encoder",
-            cache_dir=os.environ["HF_HOME"],
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
+            # Reference is fp16 (StableDiffusionPipeline); `dtype="auto"` would give fp32
+            # (fp32 checkpoint). Keeping fp32 for parity with prior FastGen versions.
+            dtype=torch.float32,
         )
-        # We never update the encoder, so freeze it
-        self.text_encoder.eval().requires_grad_(False)
-
-        self.tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(
-            model_id,
+        self.tokenizer: CLIPTokenizer = hf_load(
+            CLIPTokenizer.from_pretrained,
+            model_id_or_local_path,
             subfolder="tokenizer",
-            cache_dir=os.environ["HF_HOME"],
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
         )
 
-        # pre-compute the unconditioned prompt embeddings
-        uncond_tokenized = self.tokenizer(
-            [""], max_length=self.tokenizer.model_max_length, return_tensors="pt", padding="max_length", truncation=True
+    def encode(self, conditioning: Optional[Any] = None) -> Tuple[Any, Any]:
+        tokenized = self.tokenizer(
+            conditioning,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
         )
-        self.uncond_prompt_mask = uncond_tokenized.attention_mask
-        self.uncond_prompt_embeddings = self.text_encoder(uncond_tokenized.input_ids)[0]
+        return self(tokenized.input_ids.to(self.device), tokenized.attention_mask.to(self.device))
 
-    def encode(self, conditioning: Optional[Any] = None, precision: dtype = torch.float32) -> Tuple[Any, Any]:
-        # Get prompt embeddings
-        if "" in conditioning:
-            prompt_embeddings = torch.repeat_interleave(self.uncond_prompt_embeddings, len(conditioning), dim=0).to(
-                self.text_encoder.device, dtype=precision
-            )
-            prompt_mask = torch.repeat_interleave(self.uncond_prompt_mask, len(conditioning), dim=0).to(
-                self.text_encoder.device, dtype=precision
-            )
-        else:
-            tokenized = self.tokenizer(
-                conditioning,
-                padding="max_length",
-                max_length=self.tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            tokens = tokenized.input_ids
-            prompt_mask = tokenized.attention_mask.to(self.text_encoder.device, dtype=precision)
-            prompt_embeddings = self.text_encoder(tokens.to(self.text_encoder.device))[0]
-
-        return prompt_embeddings, prompt_mask
-
-    def to(self, *args, **kwargs):
-        """
-        Moves the model to the specified device.
-        """
-        self.text_encoder.to(*args, **kwargs)
-        return self
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Tuple[Any, Any]:
+        return self.text_encoder(input_ids)[0], attention_mask
 
 
-class StableDiffusionImageEncoder:
+class StableDiffusionImageEncoder(FastGenModule):
+    """Stable Diffusion VAE with pipeline-owned scalar latent normalization.
+
+    The original CompVis ``AutoencoderKL`` has FP32 parameters and returns unscaled
+    latents; ``LatentDiffusion`` owns the ``scale_factor`` transform outside it. That
+    transform and image encode are FP32, while the default native pipeline decodes the
+    neural VAE under FP16 autocast. FastGen mirrors that ordering for released
+    ``force_upcast`` VAEs and returns each result in the dtype the VAE computed it in.
+    """
+
     def __init__(
         self,
-        model_id: str,
+        model_id_or_local_path: str,
     ):
         super().__init__()
-        self.vae: AutoencoderKL = AutoencoderKL.from_pretrained(
-            model_id,
-            subfolder="vae",
-            cache_dir=os.environ["HF_HOME"],
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        # We never update the encoder, so freeze it
-        self.vae.eval().requires_grad_(False)
+        self.vae: AutoencoderKL = hf_load(AutoencoderKL.from_pretrained, model_id_or_local_path, subfolder="vae")
+
+    @property
+    def precision_model(self) -> Optional[torch.dtype]:
+        """Keep the released FP32 VAE fixed while allowing custom replacements to opt out."""
+        if getattr(self.vae.config, "force_upcast", False):
+            return torch.float32
+        return super().precision_model
+
+    @property
+    def latent_compression_factors(self) -> tuple[int, int]:
+        """Pixel-to-latent ``(H, W)`` downsampling of the VAE; every down block but the last halves resolution."""
+        factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        return (factor, factor)
 
     def encode(self, real_images: torch.Tensor) -> torch.Tensor:
-        latent_images = self.vae.encode(real_images, return_dict=False)[0].sample()
-
-        return latent_images * self.vae.config.scaling_factor
+        return self(real_images, operation="encode")
 
     def decode(self, latent_images: torch.Tensor) -> torch.Tensor:
-        latents = 1 / self.vae.config.scaling_factor * latent_images
-        # print(f'vae.config.scaling_factor: {vae.config.scaling_factor}')
-        images = self.vae.decode(latents, return_dict=False)[0].clip_(-1.0, 1.0)
-        return images
+        return self(latent_images, operation="decode")
 
-    def to(self, *args, **kwargs):
-        """
-        Moves the model to the specified device.
-        """
-        self.vae.to(*args, **kwargs)
-        return self
+    def forward(self, data: torch.Tensor, operation: str) -> torch.Tensor:
+        if operation == "encode":
+            latent_images = self.vae.encode(data.to(dtype=self.precision_model), return_dict=False)[0].sample()
+            return latent_images * self.vae.config.scaling_factor
+        if operation == "decode":
+            latents = 1 / self.vae.config.scaling_factor * data.to(dtype=self.precision_model)
+            if getattr(self.vae.config, "force_upcast", False):
+                with torch.autocast(device_type=latents.device.type, dtype=torch.float16):
+                    images = self.vae.decode(latents, return_dict=False)[0]
+            else:
+                images = self.vae.decode(latents, return_dict=False)[0]
+            return images.clip_(-1.0, 1.0)
+        raise ValueError(f"Unsupported preprocessor operation: {operation!r}")
 
 
 class StableDiffusion15(FastGenNetwork):
     """A StableDiffusion teacher model for text-to-image diffusion distillation."""
 
-    MODEL_ID_15 = "runwayml/stable-diffusion-v1-5"
-    MODEL_ID_21 = "stabilityai/stable-diffusion-2-1"
+    MODEL_ID_15 = "stable-diffusion-v1-5/stable-diffusion-v1-5"
+    latent_compression_factors = (8, 8)
 
     def __init__(
         self,
-        model_id: str = MODEL_ID_15,
+        model_id_or_local_path: str = MODEL_ID_15,
         net_pred_type="eps",
         schedule_type="sd",
         load_pretrained: bool = True,
-        **model_kwargs,
+        **schedule_kwargs,
     ):
         """StableDiffusion score model constructor.
 
         Args:
-            model_id (str, optional): The huggingface model ID to load.
-                Defaults to "runwayml/stable-diffusion-v1-5".
+            model_id_or_local_path (str, optional): The huggingface model ID or local path to load.
+                Defaults to "stable-diffusion-v1-5/stable-diffusion-v1-5".
             net_pred_type (str, optional): Prediction type. Defaults to "eps".
             schedule_type (str, optional): Schedule type. Defaults to "sd".
             load_pretrained (bool, optional): Whether to load pretrained weights.
                 Defaults to True.
         """
         # Initialize FastGenNetwork with SD15-specific defaults
-        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **model_kwargs)
+        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **schedule_kwargs)
 
-        self.model_id = model_id
+        self.model_id_or_local_path = model_id_or_local_path
 
         # Initialize the network (handles meta device and pretrained loading)
-        self._initialize_network(model_id, load_pretrained)
+        self._initialize_network(model_id_or_local_path, load_pretrained)
 
         # Rewrite the unet forward to get bottleneck feature
         self.unet.forward = types.MethodType(classify_forward, self.unet)
+        # Block-level diffusers checkpointing for eager training.
+        self.unet.enable_gradient_checkpointing()
 
         torch.cuda.empty_cache()
 
-    def _initialize_network(self, model_id: str, load_pretrained: bool) -> None:
+    def _initialize_network(self, model_id_or_local_path: str, load_pretrained: bool) -> None:
         """Initialize the UNet network.
 
         Args:
-            model_id: The HuggingFace model ID or local path.
+            model_id_or_local_path: The HuggingFace model ID or local path.
             load_pretrained: Whether to load pretrained weights.
         """
         # Check if we're in a meta context (for FSDP memory-efficient loading)
@@ -480,20 +400,18 @@ class StableDiffusion15(FastGenNetwork):
 
         if should_load_weights:
             logger.info("Loading SD15 UNet from pretrained")
-            self.unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
-                model_id,
+            self.unet: UNet2DConditionModel = hf_load(
+                UNet2DConditionModel.from_pretrained,
+                model_id_or_local_path,
                 subfolder="unet",
-                cache_dir=os.environ["HF_HOME"],
-                local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
             )
         else:
             # Load config and create model structure
             # If we're in a meta context, tensors will automatically be on meta device
-            config = UNet2DConditionModel.load_config(
-                model_id,
-                cache_dir=os.environ["HF_HOME"],
+            config = hf_load(
+                UNet2DConditionModel.load_config,
+                model_id_or_local_path,
                 subfolder="unet",
-                local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
             )
             if in_meta_context:
                 logger.info("Initializing SD15 UNet on meta device (zero memory, will receive weights via FSDP sync)")
@@ -502,38 +420,11 @@ class StableDiffusion15(FastGenNetwork):
                 logger.warning("SD15 UNet being initialized from config. No weights are loaded!")
             self.unet: UNet2DConditionModel = UNet2DConditionModel.from_config(config)
 
-        self.unet.logvar_linear = torch.nn.Linear(1280, 1)
-
-    def reset_parameters(self):
-        """Reinitialize parameters for FSDP meta device initialization.
-
-        This is required when using meta device initialization for FSDP2.
-        Reinitializes all linear and convolutional layers.
-        """
-        import torch.nn as nn
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.02)
-
-        super().reset_parameters()
-
-        logger.debug("Reinitialized SD15 parameters")
+        # Logvar head on the time embedding (``time_embed_dim`` wide; 1280 for the released UNets).
+        self.unet.logvar_linear = torch.nn.Linear(self.unet.time_embedding.linear_2.out_features, 1)
 
     def fully_shard(self, **kwargs):
-        """Fully shard the SD15 network for FSDP.
-
-        Note: We shard `self.unet` instead of `self` because the network wrapper
-        class may have complex multiple inheritance with ABC, which causes Python's
-        __class__ assignment to fail due to incompatible memory layouts.
+        """Shard ``self.unet``; see ``FastGenNetwork.fully_shard``.
 
         SD15 uses a U-Net architecture with:
         - down_blocks: Encoder blocks (CrossAttnDownBlock2D, DownBlock2D)
@@ -548,18 +439,18 @@ class StableDiffusion15(FastGenNetwork):
             UNetMidBlock2DCrossAttn,
         )
 
-        # Note: Checkpointing has to happen first, for proper casting during backward pass recomputation.
-        if hasattr(self.unet, "gradient_checkpointing") and self.unet.gradient_checkpointing:
+        # Checkpointing has to happen first, for proper casting during backward pass recomputation.
+        # Diffusers keeps the checkpointing flag on the blocks, so query the U-Net root's property.
+        if self.unet.is_gradient_checkpointing:
             self.unet.disable_gradient_checkpointing()
-            apply_fsdp_checkpointing(self.unet, check_fn=lambda block: isinstance(block, unet_block_types))
-            logger.info("Applied FSDP activation checkpointing to SD15 U-Net blocks")
+            apply_fsdp_checkpointing(self.unet, unet_block_types)
 
         # Shard down blocks
         for block in self.unet.down_blocks:
             fully_shard(block, **kwargs)
 
         # Shard mid block
-        if hasattr(self.unet, "mid_block") and self.unet.mid_block is not None:
+        if self.unet.mid_block is not None:
             fully_shard(self.unet.mid_block, **kwargs)
 
         # Shard up blocks
@@ -570,40 +461,32 @@ class StableDiffusion15(FastGenNetwork):
 
     def init_preprocessors(self):
         """Initialize the text and image encoders for the Stable Diffusion model."""
-        if not hasattr(self, "text_encoder"):
+        if "text_encoder" not in self.preprocessors:
             self.init_text_encoder()
-        if not hasattr(self, "vae"):
+        if "vae" not in self.preprocessors:
             self.init_vae()
 
     def init_text_encoder(self):
         """Initialize the text encoder for Stable Diffusion model."""
-        self.text_encoder = StableDiffusionTextEncoder(model_id=self.model_id)
+        self.preprocessors["text_encoder"] = StableDiffusionTextEncoder(
+            model_id_or_local_path=self.model_id_or_local_path
+        )
 
     def init_vae(self):
         """Initialize the image encoder for Stable Diffusion model."""
-        self.vae = StableDiffusionImageEncoder(model_id=self.model_id)
-
-    def to(self, *args, **kwargs):
-        """
-        Moves the model to the specified device.
-        """
-        super().to(*args, **kwargs)
-        if hasattr(self, "text_encoder"):
-            self.text_encoder.to(*args, **kwargs)
-        if hasattr(self, "vae"):
-            self.vae.to(*args, **kwargs)
-        return self
+        self.preprocessors["vae"] = StableDiffusionImageEncoder(model_id_or_local_path=self.model_id_or_local_path)
 
     def forward(
         self,
         x_t: torch.FloatTensor,
         t: torch.Tensor,
         condition: Optional[List[torch.Tensor]] = None,
-        r: Optional[torch.Tensor] = None,
         return_features_early: bool = False,
         feature_indices: Optional[Set[int]] = None,
         return_logvar: bool = False,
         fwd_pred_type: Optional[str] = None,
+        apply_output_conditioning: bool = True,
+        output_dtype: OutputDtype = "same",
         **fwd_kwargs,
     ):
         """Forward pass of the StableDiffusion latent diffusion score model.
@@ -612,38 +495,43 @@ class StableDiffusion15(FastGenNetwork):
             x_t (torch.Tensor): The diffused data sample.
             t (torch.Tensor): The current timestep.
             condition (list[torch.Tensor]): Optional conditioning information.  Defaults to None.
-            r (torch.Tensor): Another timestep mainly used by meanflow.
             return_features_early: If true, the forward pass returns the features once the set is complete.
                 This means the forward pass will not finish completely and no final output is returned.
             feature_indices: A set of feature indices (a set of integers) decides which blocks
-                to extract features from. If the set is non-empty, then features will be returned.
-                By default, feature_indices=None means extract no features.
-            return_logvar: If true, the foward pass returns the logvar.
+                to extract features from. Any provided set returns a feature list alongside the output,
+                including an empty list for an empty set. None returns only the model output.
+            return_logvar: If true, the forward pass returns the logvar.
             fwd_pred_type: Update the network prediction type, must be in ['x0', 'eps', 'v', 'flow'].
                 None means using the original net_pred_type.
-
+            apply_output_conditioning: Apply the output constraint after the conversion.
+            output_dtype: ``"same"`` rounds the prediction to the state dtype; ``None`` keeps it in high precision.
         Returns:
             torch.Tensor: The score model output.
         """
-        if r is not None:
-            # TODO: add support for SD15
-            raise NotImplementedError("r is not yet supported for SD15")
-        if feature_indices is None:
-            feature_indices = {}
-        if fwd_pred_type is None:
-            fwd_pred_type = self.net_pred_type
-        else:
-            assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
+        self._validate_forward_kwargs(
+            fwd_kwargs,
+            return_features_early=return_features_early,
+            feature_indices=feature_indices,
+            num_features=len(self.unet.down_blocks) + 1,
+        )
+        if return_features_early and feature_indices is not None and not feature_indices:
+            return []
 
-        self.unet.enable_gradient_checkpointing()
-
-        # Note: Don't cast timestep to x_t.dtype here - the UNet's time_embedding expects
-        # float32 input, and autocast will handle dtype conversions inside the UNet
+        x_t_model = self.cast_to_model_precision(x_t)
+        prompt_embeddings, prompt_mask = condition
+        assert_same(dtype=self.precision_model, device=x_t_model.device, prompt_embeddings=prompt_embeddings)
+        assert prompt_mask.dtype in (
+            torch.bool,
+            torch.int32,
+            torch.int64,
+        ), f"prompt_mask must have bool, int32, or int64 dtype, got {prompt_mask.dtype}"
+        # CompVis and Diffusers both project the raw timestep in FP32, then cast
+        # the sinusoidal features to the UNet activation dtype.
         model_outputs = self.unet(
-            x_t,
+            x_t_model,
             self.noise_scheduler.rescale_t(t),
-            encoder_hidden_states=condition[0],
-            encoder_attention_mask=condition[1],
+            encoder_hidden_states=prompt_embeddings,
+            encoder_attention_mask=prompt_mask,
             return_features_early=return_features_early,
             feature_indices=feature_indices,
             return_logvar=return_logvar,
@@ -657,75 +545,88 @@ class StableDiffusion15(FastGenNetwork):
         else:
             out = model_outputs
 
-        if len(feature_indices) == 0:
+        if feature_indices is None:
             assert isinstance(out, torch.Tensor)
-            out = self.noise_scheduler.convert_model_output(
-                x_t, out, t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
+            out = self.transform_output(out, x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning)
         else:
             assert isinstance(out, list)
-            out[0] = self.noise_scheduler.convert_model_output(
-                x_t, out[0], t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
+            out[0] = self.transform_output(
+                out[0], x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning
             )
 
         if return_logvar:
-            return out, logvar
+            return out, logvar.to(dtype=x_t.dtype)
         return out
+
+    @staticmethod
+    def default_guidance_cfg() -> GuidanceConfig:
+        """Default guidance recipe: CFG only at scale 7.5."""
+        g = GuidanceConfig()
+        g.cfg.scale = 7.5
+        return g
 
     def sample(
         self,
         noise: torch.Tensor,
         condition: Optional[List[torch.Tensor]] = None,
         neg_condition: Optional[List[torch.Tensor]] = None,
-        guidance_scale: Optional[float] = 7.5,
-        num_steps: int = 50,
-        **kwargs,
+        sample_steps: int = 50,
+        sample_type: str = "ode",
+        guidance_cfg: Optional[GuidanceConfig] = None,
+        set_alpha_to_one: bool = False,
     ) -> torch.Tensor:
         """Generate samples using DDIM-style sampling.
 
+        Uses ``predict_with_guidance`` to fuse the cond +
+        cfg-uncond pair into one batched forward.
+
         Args:
-            noise: Initial noise tensor [B, C, H, W] (should be scaled by max sigma).
+            noise: Initial standard-normal noise tensor [B, C, H, W]; the sampler scales it to the first sigma.
             condition: List of [encoder_hidden_states, encoder_attention_mask].
             neg_condition: List of negative [encoder_hidden_states, encoder_attention_mask] for CFG.
-            guidance_scale: CFG guidance scale. None disables guidance.
-            num_steps: Number of sampling steps.
-            **kwargs: Additional keyword arguments.
+            sample_steps: Number of sampling steps.
+            sample_type: Integration policy; only ``"ode"`` is supported.
+            guidance_cfg: Composite guidance config; ``None`` →
+                ``default_guidance_cfg()`` (CFG at 7.5).
+            set_alpha_to_one: The final step's target, named as in diffusers' DDIM/PNDM schedulers.
+                ``False`` (default), as the reference pipeline's scheduler config, renoises the last x0
+                prediction to the table's first entry, ``alpha(0) x0 + sigma(0) eps``, so the output keeps the
+                reference's small residual noise (``sigma(0) = sqrt(beta_0) ≈ 0.03``); ``True`` returns x0.
 
         Returns:
             Generated samples in latent space.
         """
+        self._validate_sample_kwargs(
+            sample_type,
+            supported_schedule_types=("sd",),
+            supported_sample_types=("ode",),
+        )
+        if guidance_cfg is None:
+            guidance_cfg = self.default_guidance_cfg()
+
         # Get timestep schedule (SD uses t in [0, 1], mapped to [0, 1000])
-        t_list = self.noise_scheduler.get_t_list(num_steps, device=noise.device)
+        grid = self.noise_scheduler.grid(sample_steps, device=noise.device)
 
-        x = self.noise_scheduler.latents(noise=noise, t_init=t_list[0])
+        x = self.noise_scheduler.latents(noise=noise, t_init=grid[0])
 
-        for t, t_next in zip(t_list[:-1], t_list[1:]):
+        for t, t_next in zip(grid[:-1], grid[1:]):
             # Expand t for batch
             t_batch = t.expand(x.shape[0])
 
-            # Get noise prediction with optional CFG
-            if guidance_scale is not None and guidance_scale > 1.0 and neg_condition is not None:
-                # CFG: predict with both conditions
-                x_input = torch.cat([x, x], dim=0)
-                t_input = torch.cat([t_batch, t_batch], dim=0)
-                cond_input = [
-                    torch.cat([neg_condition[0], condition[0]], dim=0),
-                    torch.cat([neg_condition[1], condition[1]], dim=0),
-                ]
+            eps_pred = predict_with_guidance(
+                self,
+                x,
+                t_batch,
+                batched=True,
+                guidance_cfg=guidance_cfg,
+                condition=condition,
+                neg_condition=neg_condition,
+                output_dtype=None,
+                fwd_pred_type="eps",
+            )
 
-                eps_pred = self(x_input, t_input, condition=cond_input, fwd_pred_type="eps")
-                eps_uncond, eps_cond = eps_pred.chunk(2)
-                eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-            else:
-                eps_pred = self(x, t_batch, condition=condition, fwd_pred_type="eps")
-
-            # Convert to x0 prediction
-            x0_pred = self.noise_scheduler.eps_to_x0(x, eps_pred, t_batch)
-
-            # DDIM step: x_next = alpha_next * x0 + sigma_next * eps
-            t_next_batch = t_next.expand(x.shape[0])
-            alpha_next = self.noise_scheduler.alpha(t_next_batch).view(-1, 1, 1, 1).to(x.dtype)
-            sigma_next = self.noise_scheduler.sigma(t_next_batch).view(-1, 1, 1, 1).to(x.dtype)
-            x = alpha_next * x0_pred + sigma_next * eps_pred
+            # DDIM step: x_next = alpha_next * x0 + sigma_next * eps; the grid's end 0 is x0 with
+            # ``set_alpha_to_one`` and the table's noisy first entry otherwise.
+            x = self.noise_scheduler.step(x, eps_pred, t_batch, t_next, pred_type="eps", clean_end=set_alpha_to_one)
 
         return x

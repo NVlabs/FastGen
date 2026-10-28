@@ -9,11 +9,7 @@ from fastgen.utils.distributed import world_size
 import fastgen.utils.logging_utils as logger
 import torch
 import wandb
-
-try:
-    from torch.distributed.tensor import DTensor
-except ImportError:
-    DTensor = None
+from torch.distributed.tensor import DTensor
 
 if TYPE_CHECKING:
     from fastgen.methods import FastGenModel
@@ -25,7 +21,7 @@ def _get_local_numel(param: torch.Tensor) -> int:
     For DTensor (FSDP2), returns the local shard size.
     For regular tensors, returns the full size.
     """
-    if DTensor is not None and isinstance(param, DTensor):
+    if isinstance(param, DTensor):
         return param._local_tensor.numel()
     return param.numel()
 

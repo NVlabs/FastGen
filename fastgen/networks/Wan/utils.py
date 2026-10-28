@@ -12,11 +12,12 @@ converters here normalise them. They are applied in ``Wan.load_state_dict``:
 * ``remap_anyflow_keys`` — the AnyFlow HF releases, which store the flow-map
   r-pathway inside ``condition_embedder`` as ``delta_embedder``.
 
-Each converter is a no-op when its marker keys are absent, so they are safe to call
-unconditionally and in sequence.
+The loader detects original-Wan marker keys before calling its converter, since
+the norm-name swap is specific to that layout. The AnyFlow remapper is a no-op
+when its marker keys are absent.
 """
 
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
@@ -62,7 +63,16 @@ WAN_OFFICIAL_RENAME_MAPPING: List[Tuple[str, str]] = [
     ("attn2.to_k_img", "attn2.add_k_proj"),
     ("attn2.to_v_img", "attn2.add_v_proj"),
     ("attn2.norm_k_img", "attn2.norm_added_k"),
+    # VACE control-block projections
+    ("before_proj", "proj_in"),
+    ("after_proj", "proj_out"),
 ]
+
+# Rename sources only the original Wan layout uses (the norm2/norm3 swap is left out: both layouts use those names), so
+# a partial checkpoint such as VACE's control projections is still recognized.
+WAN_OFFICIAL_KEY_MARKERS: Tuple[str, ...] = tuple(
+    old for old, _ in WAN_OFFICIAL_RENAME_MAPPING if not old.startswith("norm")
+)
 
 # Keys a checkpoint may nest the model state under.
 _NESTED_STATE_KEYS = ["generator", "state_dict", "model", "module", "net"]
@@ -71,7 +81,7 @@ _NESTED_STATE_KEYS = ["generator", "state_dict", "model", "module", "net"]
 _STRIPPED_PREFIXES = ["model.", "module.", "transformer."]
 
 
-def _unwrap_state_dict(state_dict: Mapping[str, Any]) -> Tuple[Dict[str, Any], str | None]:
+def _unwrap_state_dict(state_dict: Mapping[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
     """Return the tensor state dict, unwrapping one level of nesting if present."""
     for key in _NESTED_STATE_KEYS:
         if isinstance(state_dict, dict) and key in state_dict and isinstance(state_dict[key], dict):

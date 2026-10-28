@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import copy
+
 from fastgen.configs.discriminator import Discriminator_Flux_Config
 import fastgen.configs.methods.config_dmd2 as config_dmd2_default
 from fastgen.configs.data import ImageLoaderConfig
 from fastgen.configs.net import FluxConfig
+from fastgen.configs.config_utils import model_pixel_shape
 
 """Configs for DMD2 distillation on Flux model."""
 
@@ -22,7 +25,7 @@ def create_config():
     config.model.input_shape = [16, 64, 64]
 
     # Discriminator config - ImageDiT with simple conv2d architecture
-    config.model.discriminator = Discriminator_Flux_Config
+    config.model.discriminator = copy.deepcopy(Discriminator_Flux_Config)
 
     # GAN settings
     config.model.gan_loss_weight_gen = 0.03
@@ -33,16 +36,20 @@ def create_config():
     # intermediate features to use for discrimination. By default, we use the middle block
     # config.model.discriminator.feature_indices=[30, 45] #use the 30th and 45th blocks from the DiT
 
-    # Network config
-    config.model.net = FluxConfig
-    # Flux uses embedded guidance via config.model.net.guidance_scale instead
-    config.model.net.guidance_scale = 3.5
+    # Network config. Flux.1-dev uses embedded distillation guidance, pinned
+    # to 3.5 in `FluxConfig` itself. `model.guidance_cfg` is left at its empty
+    # `GuidanceConfig()` default so DMD2's teacher rollout (via
+    # `predict_with_guidance`) skips the CFG term.
+    config.model.net = copy.deepcopy(FluxConfig)
+    config.trainer.fsdp = True
+    config.model.meta_init = True
 
     # Precision
     config.model.precision = "bfloat16"
+    config.model.precision_opt = "float32"
 
     # Student sampling steps
-    config.model.student_sample_steps = 4
+    config.model.student_grid_cfg.steps = 4
 
     # Time sampling config
     config.model.sample_t_cfg.time_dist_type = "uniform"
@@ -50,12 +57,14 @@ def create_config():
     config.model.sample_t_cfg.max_t = 0.999
     # we can further set the time list to control the sampled timesteps for the student, to focus more on
     # specific noise levels
-    # config.model.sample_t_cfg.t_list = [0.999,t1,t2,0]
+    # config.model.student_grid_cfg.grid_type = "explicit"
+    # config.model.student_grid_cfg.grid_kwargs = {"timesteps": [1.0,t1,t2,0]}
 
     # Dataloader
-    config.dataloader_train = ImageLoaderConfig
+    config.dataloader_train = copy.deepcopy(ImageLoaderConfig)
     config.dataloader_train.batch_size = 2
-    config.dataloader_train.input_res = 512
+    height, width = model_pixel_shape(config.model)
+    config.dataloader_train.input_res = (width, height)
 
     # Training iterations
     config.trainer.max_iter = 5000

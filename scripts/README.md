@@ -1,107 +1,181 @@
-# FastGen Inference
+# Scripts
+
+Inference and evaluation scripts for FastGen.
+
+## Inference
 
 Generate images and videos using pretrained or distilled models.
 
 | Script | Modality | Modes |
 |--------|----------|-------|
-| [`image_model_inference.py`](inference/image_model_inference.py) | Image | Unconditional, class-conditional, T2I |
-| [`video_model_inference.py`](inference/video_model_inference.py) | Video | T2V, I2V, V2V, Video2World |
+| [`image_model_inference.py`](inference/image_model_inference.py) | Image | Unconditional, class-conditional, T2I, image-editing (I2I) |
+| [`video_model_inference.py`](inference/video_model_inference.py) | Video, Video+Audio | T2V, I2V, V2V, Video2World |
+| [`flashdreams_inference.py`](inference/flashdreams_inference.py) | Video | FlashDreams Self-Forcing Wan 2.1 T2V example |
+| [`vlm_infer.py`](inference/vlm_infer.py) | Image, Video | VLM-as-judge scores for existing media listed in a JSONL file, using the endpoint and token of [`VLMLogger`](../fastgen/callbacks/README.md#log-modules) |
 
-## Key Arguments
+### Key Arguments
 
 | Argument | Description |
 |----------|-------------|
-| `--do_student_sampling` | Run distilled student (few-step) |
-| `--do_teacher_sampling` | Run teacher (multi-step) |
-| `--ckpt_path` | Path to distilled checkpoint (drop suffix `.pth` for FSDP checkpoints) |
-| `--num_steps` | Sampling steps for teacher |
+| `--do_student_sampling` | Run configured student (default: `True`) |
+| `--do_teacher_sampling` | Run the teacher (default: `False`). For methods without one, such as SFT, the script builds it from `model.teacher` (or `model.net`) and `model.pretrained_model_path` |
+| `--ckpt_path` | Path ending in `.pth` for either a monolithic checkpoint or a DCP completion marker |
+| `--prompt_file` | File with one prompt per line, or one integer class label per line with `--classes`, resolved from the working directory |
 | `--classes N` | Class-conditional with N classes |
 | `--unconditional` | Unconditional generation |
-| `--input_image_file` | Input images for I2V |
+| `--neg_prompt_file` | Negative prompts for CFG, one per `--prompt_file` prompt (a short file repeats its last, extras are dropped). Omit it for no negative conditioning; `scripts/inference/prompts/empty_prompt.txt` requests the empty negative prompt. Class-conditional image runs ignore it. See [Guidance](#guidance) |
+| `--input_image_file` | Input images for I2V, or source/reference images for image-editing (I2I) |
 | `--source_video_file` | Source videos for V2V |
-| `--fps` | Output video frame rate |
-| `model.guidance_scale` | CFG scale (config override) |
+| `model.guidance_cfg.cfg.scale` | CFG scale (config override). See [`fastgen/utils/guidance.py`](../fastgen/utils/guidance.py) for the full `GuidanceConfig` schema (mix, rescale) |
 | `trainer.seed` | Random seed for reproducibility (config override) |
 
+#### Guidance
 
-## Example commands
+`model.guidance_cfg` decides which guidance terms run, and `--neg_prompt_file`
+supplies their negative prompts. Classifier-free guidance (`cfg.scale`) and mix
+guidance (`mix.scale`) evaluate a negative branch, so with either of them active,
+pass a negative prompt file, or `scripts/inference/prompts/empty_prompt.txt` for
+the empty negative prompt; omitting the file does not disable them. Configs whose
+guidance runs neither term, such as those of guidance-distilled networks, need no
+negative prompt. Class-conditional image runs (`--classes`) ignore the file and
+use the all-zero class vector as the negative condition.
 
-### Unconditional
+### Example commands
+
+#### Unconditional
 ```bash
 python scripts/inference/image_model_inference.py \
     --config fastgen/configs/experiments/EDM/config_sft_edm_cifar10.py \
-    --do_student_sampling False --unconditional --num_samples 16 --num_steps 18
+    --unconditional --num_samples 16
 ```
 
-### Class-Conditional
+#### Class-Conditional
 ```bash
 python scripts/inference/image_model_inference.py \
     --config fastgen/configs/experiments/DiT/config_sft_sit_xl.py \
-    --do_student_sampling False --classes 1000 --num_steps 50 \
-    --prompt_file scripts/inference/prompts/classes.txt \
-    - model.guidance_scale=4.0
+    --classes 1000 \
+    --prompt_file scripts/inference/prompts/classes.txt
 ```
 
-### Text-to-Image (T2I)
+#### Text-to-Image (T2I)
 ```bash
 python scripts/inference/image_model_inference.py \
-    --config fastgen/configs/experiments/Flux/config_sft.py \
-    --do_student_sampling False --num_steps 50 \
-    - model.guidance_scale=3.5
+    --config fastgen/configs/experiments/Flux/config_sft.py
 ```
 
-### Text-to-Video (T2V)
+#### Image Editing (I2I)
 ```bash
-python scripts/inference/video_model_inference.py \
-    --config fastgen/configs/experiments/WanT2V/config_dmd2.py \
-    --do_student_sampling False --num_steps 50 --fps 16 \
-    --neg_prompt_file scripts/inference/prompts/negative_prompt.txt \
-    - model.guidance_scale=5.0
+python scripts/inference/image_model_inference.py \
+    --config fastgen/configs/experiments/Flux2/config_sft_image_edit.py \
+    --prompt_file scripts/inference/prompts/edit_prompts.txt \
+    --input_image_file scripts/inference/prompts/source_image_paths.txt
 ```
 
-### Image-to-Video (I2V)
+#### Text-to-Video (T2V)
 ```bash
 python scripts/inference/video_model_inference.py \
-    --config fastgen/configs/experiments/WanI2V/config_dmd2_wan22_5b.py \
-    --do_student_sampling False --num_steps 50 --fps 16 \
+    --config fastgen/configs/experiments/WanT2V/config_sft.py \
+    --neg_prompt_file scripts/inference/prompts/negative_prompt.txt
+```
+
+#### Image-to-Video (I2V)
+```bash
+python scripts/inference/video_model_inference.py \
+    --config fastgen/configs/experiments/WanI2V/config_sft_wan22_5b.py \
     --neg_prompt_file scripts/inference/prompts/negative_prompt.txt \
+    --input_image_file scripts/inference/prompts/source_image_paths.txt
+```
+
+#### Camera-Conditioned I2V
+```bash
+python scripts/inference/video_model_inference.py \
+    --config fastgen/configs/experiments/WanI2V/config_sft_lingbot_world.py \
+    --neg_prompt_file scripts/inference/prompts/negative_prompt_lingbot_world.txt \
     --input_image_file scripts/inference/prompts/source_image_paths.txt \
-    - model.guidance_scale=5.0
+    --camera_poses_file scripts/inference/prompts/camera_poses_paths.txt
 ```
 
-### Video-to-Video (V2V)
+
+#### Video-to-Video (V2V)
 ```bash
 python scripts/inference/video_model_inference.py \
     --config fastgen/configs/experiments/WanV2V/config_sft.py \
-    --do_student_sampling False --num_steps 50 --fps 16 \
     --neg_prompt_file scripts/inference/prompts/negative_prompt.txt \
-    --source_video_file scripts/inference/prompts/source_video_paths.txt \
-    - model.guidance_scale=5.0
+    --source_video_file scripts/inference/prompts/source_video_paths.txt
 ```
 
-### Video2World (Cosmos)
+#### Text-to-Video+Audio (LTX-2)
+```bash
+python scripts/inference/video_model_inference.py \
+    --config fastgen/configs/experiments/LTX2/config_sft.py \
+    --neg_prompt_file scripts/inference/prompts/negative_prompt_ltx.txt
+```
+
+#### Video2World (Cosmos)
 ```bash
 python scripts/inference/video_model_inference.py \
     --config fastgen/configs/experiments/CosmosPredict2/config_sft_v2w.py \
-    --do_student_sampling False --num_steps 35 \
-    --neg_prompt_file scripts/inference/prompts/negative_prompt_cosmos.txt
+    --neg_prompt_file scripts/inference/prompts/negative_prompt_cosmos.txt \
+    --input_image_file scripts/inference/prompts/source_image_paths.txt
 ```
 
-### Causal / Autoregressive
-Use causal configs (e.g., `config_sft_causal_wan22_5b.py`) for autoregressive generation.
+#### Causal / Autoregressive
+Causal configs (e.g., `config_sft_causal_wan22_5b.py`) generate autoregressively, chunk by chunk with a KV cache.
 
 ```bash
 python scripts/inference/video_model_inference.py \
     --config fastgen/configs/experiments/WanI2V/config_sft_causal_wan22_5b.py \
-    --do_student_sampling False --num_steps 50 --fps 16 \
     --neg_prompt_file scripts/inference/prompts/negative_prompt.txt \
-    --input_image_file scripts/inference/prompts/source_image_paths.txt \
-    - model.guidance_scale=5.0
+    --input_image_file scripts/inference/prompts/source_image_paths.txt
 ```
 
-For generating longer videos via extrapolation:
+Generating longer videos via extrapolation needs a CausVid or Self-Forcing config, such as
+[`WanT2V/config_sf.py`](../fastgen/configs/experiments/WanT2V/config_sf.py); other methods, including CausalSFT
+configs like the one above, raise an error:
 - `--num_segments N`: Generate N consecutive video segments autoregressively (default: 1)
-- `--overlap_frames K`: Overlap K latent frames between segments for temporal consistency (default: 0)
+- `--overlap_frames K`: Overlap K latent frames between segments for temporal consistency (default: 0); K must end on
+  a chunk boundary
+
+```bash
+python scripts/inference/video_model_inference.py \
+    --config fastgen/configs/experiments/WanT2V/config_sf.py \
+    --num_segments 3 --overlap_frames 3
+```
+
+### FlashDreams Example: Self-Forcing Wan 2.1 T2V
+
+[FlashDreams](https://github.com/NVIDIA/flashdreams) provides an optimized
+streaming runtime with `torch.compile`, CUDA Graph replay, and multi-GPU context
+parallelism. This example uses it to run FastGen-distilled Self-Forcing Wan 2.1
+T2V checkpoints. Other model families require a compatible FlashDreams
+integration and checkpoint mapping.
+
+Install the `self_forcing` integration from a local FlashDreams clone. The script targets FlashDreams v0.1.0; later versions moved this integration and changed its API:
+
+```bash
+git clone --branch v0.1.0 https://github.com/NVIDIA/flashdreams.git
+cd flashdreams
+uv sync --project integrations/self_forcing
+```
+
+Then run inference from the FastGen repo using that environment:
+
+```bash
+cd /path/to/FastGen
+uv run --project /path/to/flashdreams/integrations/self_forcing \
+    --with-editable . --with pandas \
+    python scripts/inference/flashdreams_inference.py \
+    --checkpoint /path/to/checkpoint.pth \
+    --config fastgen/configs/experiments/WanT2V/config_sf.py
+```
+
+For DCP checkpoints, consolidate first with [`scripts/fsdp_convert.py`](fsdp_convert.py), converting the network that inference uses: the first EMA when the config enables one (e.g. `--model-type ema_model` for `use_ema=True`), otherwise the default `net_model`. Monolithic checkpoints select the EMA automatically.
+
+The inference settings are loaded from the FastGen config, and overrides use the same trailing `-` syntax as other FastGen scripts.
+The rollout uses the first prompt of `--prompt-file`, which defaults to the same validation prompts as the other inference scripts.
+For an approximately 30-second rollout at 16 FPS with a 1.3B chunk-3 config, use `--sink --total-blocks 40`. 
+For 14B, pass `--config fastgen/configs/experiments/WanT2V/config_sf_14b.py`.
+Videos are written to `$FASTGEN_OUTPUT_ROOT/<project>/<group>/<name>/flashdreams` by default.
 
 ---
 
@@ -113,15 +187,15 @@ Compute Fréchet Inception Distance (FID) for image models using [`fid/compute_f
 
 ```bash
 torchrun --nproc_per_node=8 scripts/fid/compute_fid_from_ckpts.py \
-    --config fastgen/configs/experiments/EDM/config_dmd2_cifar10.py \
-    - trainer.ddp=True
+    --config fastgen/configs/experiments/EDM/config_dmd2_cifar10.py
 ```
 
-This script:
-1. Loads checkpoints from `trainer.checkpointer.save_dir`
-2. Generates `eval.num_samples` images using student sampling
-3. Computes FID against reference statistics
-4. Saves results to `{save_path}/{eval.samples_dir}/fid.json`
+For each checkpoint in `trainer.checkpointer.save_dir`, the script samples
+`eval.num_samples` images from the student and records its FID against the
+[reference statistics](#reference-statistics) in
+`{log_config.save_path}/{eval.samples_dir}/fid.json`. See the
+[script docstring](fid/compute_fid_from_ckpts.py) for checkpoint selection,
+reruns, and storage requirements.
 
 
 ### Config Options

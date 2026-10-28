@@ -3,7 +3,8 @@
 
 import functools
 import json
-from typing import Any, Dict, List, Callable, Tuple, Optional, Iterable
+import math
+from typing import Any, Dict, List, Callable, Tuple, Optional, Iterable, Union
 import os
 import subprocess
 from io import BytesIO
@@ -11,22 +12,32 @@ from io import BytesIO
 import torch
 import webdataset as wds
 import numpy as np
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize, InterpolationMode, Lambda
-
+import fastgen.utils.s3 as s3
 from fastgen.datasets.wds_utils import (
     BaseWDSLoader,
     init_output_dict,
     get_prefixes,
+    validate_wds_config,
 )
 from fastgen.datasets.decoders import (
     decode_video_full,
     decode_video_segment,
+    decode_video_audio_segment,
+    decode_video_audio_full,
     decode_image,
     decode_txt,
     decode_npy_torch,
     decode_npz_torch,
 )
-from fastgen.datasets.crop_resize import center_crop, resize_small_side_aspect_preserving
+from fastgen.datasets.crop_resize import (
+    center_crop,
+    normalize_pixels,
+    resize_small_side_aspect_preserving,
+    transform_image,
+)
+from fastgen.utils.audio import resample_audio
+from fastgen.utils.cache_utils import file_extension
+from fastgen.utils.camera_utils import transform_intrinsics
 import fastgen.utils.logging_utils as logger
 
 
@@ -35,20 +46,18 @@ def transform_video(
     sequence_length: int,
     img_size: Tuple[int, int],
 ) -> Dict[str, Any]:
-    """Transform a video tensor for inference, matching the training preprocessing.
-
-    This is a standalone function for use in inference scripts. For training,
-    use the VideoWDSLoader class which applies this automatically.
+    """Per-sample video preprocessing: truncate -> aspect-preserving resize -> center-crop -> normalize.
 
     Args:
         video: Input video tensor of shape (T, H, W, C) with uint8 RGB values.
-        sequence_length: Number of frames to extract.
+        sequence_length: Number of frames to extract (from the start).
         img_size: Target size as (width, height).
 
     Returns:
         Dict with:
-            - "real": Transformed video tensor of shape (C, T, H, W) normalized to [-1, 1]
-            - "cropping_params": Dict of cropping parameters
+            - "real_raw": Transformed video tensor of shape (C, T, H, W) normalized to [-1, 1]
+            - "cropping_params": resize/crop geometry (resize_w/h, orig_w/h, crop_x0/y0) consumed by
+              ``transform_intrinsics`` to rescale camera intrinsics into the cropped frame
 
     Raises:
         ValueError: If video has fewer frames than sequence_length.
@@ -61,13 +70,15 @@ def transform_video(
     video_sub = video[0:sequence_length]
 
     # resize & crop
+    orig_h, orig_w = video_sub.shape[2], video_sub.shape[3]
     video_sub = resize_small_side_aspect_preserving(video_sub, img_size)
     video_sub, cropping_params = center_crop(video_sub, img_size, return_cropping_params=True)
-    # normalize the video
-    video_sub = video_sub.float() / 127.5 - 1
+    cropping_params["orig_w"], cropping_params["orig_h"] = orig_w, orig_h
+    # normalize the video to [-1, 1]
+    video_sub = normalize_pixels(video_sub)
     video_sub = video_sub.permute(1, 0, 2, 3)  # t, c, h, w -> c, t, h, w
 
-    return {"real": video_sub, "cropping_params": cropping_params}
+    return {"real_raw": video_sub, "cropping_params": cropping_params}
 
 
 # =============================================================================
@@ -78,32 +89,42 @@ def transform_video(
 # Use presets_map in loader configs to map output keys to preset names.
 #
 # Example usage in config:
-#   presets_map={"neg_condition": "neg_prompt_wan"}
-#   # This adds output["neg_condition"] = PRESET_CONSTANTS["neg_prompt_wan"]
+#   presets_map={"neg_condition_raw": "neg_prompt_wan"}
+#   # This adds output["neg_condition_raw"] = PRESET_CONSTANTS["neg_prompt_wan"]
+#
+# The per-model negative prompts are shared with the inference scripts: the single
+# canonical copy of each lives in scripts/inference/prompts/ (usable directly via
+# ``--neg_prompt_file``) and is loaded here for the dataloader presets.
 #
 # Available presets:
 #   - "neg_prompt_wan": Standard negative prompt for WAN video generation model.
 #       Used to guide the model away from common video artifacts.
+#   - "neg_prompt_lingbot_world": Negative prompt for the LingBot-World model.
 #   - "neg_prompt_cosmos": Negative prompt for Cosmos video generation model.
 #       Used to guide the model away from common video artifacts.
+#   - "neg_prompt_cosmos3": Official Cosmos3 structured-caption negative prompt
+#       (the nvidia/Cosmos3-Nano release's negative_prompt.json, serialized with
+#       ``json.dumps`` exactly like the model-card examples).
+#   - "neg_prompt_ltx2": Full negative prompt from the LTX-2 pipeline defaults.
+#   - "neg_prompt_ltx2_short": Short negative prompt from LTX-2 training configs.
 #   - "empty_string": Empty string, useful for unconditional generation or
 #       as a default fallback for missing text conditions.
+
+_NEG_PROMPTS_DIR = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, "scripts", "inference", "prompts")
+
+
+def _load_negative_prompt(filename: str) -> str:
+    with open(os.path.join(_NEG_PROMPTS_DIR, filename), encoding="utf-8") as f:
+        return f.read().strip()
+
+
 PRESET_CONSTANTS: Dict[str, str] = {
-    "neg_prompt_wan": (
-        "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, "
-        "static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, "
-        "extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, "
-        "fused fingers, still picture, messy background, three legs, many people in the background, "
-        "walking backwards"
-    ),
-    "neg_prompt_cosmos": (
-        "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
-        "over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, "
-        "underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, "
-        "jerky movements, low frame rate, artifacting, color banding, unnatural transitions, "
-        "outdated special effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, "
-        "visual noise, and flickering. Overall, the video is of poor quality."
-    ),
+    "neg_prompt_wan": _load_negative_prompt("negative_prompt.txt"),
+    "neg_prompt_lingbot_world": _load_negative_prompt("negative_prompt_lingbot_world.txt"),
+    "neg_prompt_cosmos": _load_negative_prompt("negative_prompt_cosmos.txt"),
+    "neg_prompt_cosmos3": _load_negative_prompt("negative_prompt_cosmos3.txt"),
+    "neg_prompt_ltx2": _load_negative_prompt("negative_prompt_ltx.txt"),
+    "neg_prompt_ltx2_short": _load_negative_prompt("negative_prompt_ltx_short.txt"),
     "empty_string": "",
 }
 
@@ -132,7 +153,11 @@ def _filter_score(
 ) -> bool:
     """Filter items based on a numeric score from JSON metadata.
 
-    Keeps items where the score is >= threshold, or if no JSON/score exists.
+    Keeps items where the score is >= threshold, or if no JSON/score exists. Items whose
+    metadata cannot be parsed or whose score is not a finite number (e.g. ``null``, ``true``,
+    ``NaN``, or ``Infinity``) are dropped with a warning, like samples that fail to decode,
+    since raising here would stop the loader. A non-numeric ``threshold`` is a configuration
+    error and raises.
 
     Args:
         item: WebDataset item containing raw bytes
@@ -145,17 +170,26 @@ def _filter_score(
     if "json" not in item:
         return True
 
-    json_file = item["json"]
-    if isinstance(json_file, bytes):
-        json_string = json_file.decode("utf-8")
-    else:
-        json_string = json_file
-    data = json.loads(json_string)
-
-    if score_key in data and data[score_key] < threshold:
+    try:
+        data = json.loads(item["json"])
+    except (ValueError, RecursionError) as error:
+        logger.warning(f"Dropping sample {item.get('__key__')}: cannot parse its JSON metadata: {error}")
         return False
+    if not isinstance(data, dict) or score_key not in data:
+        return True
 
-    return True
+    score = data[score_key]
+    # Ints are exact and always finite; math.isfinite raises OverflowError on ones beyond the float range.
+    if (
+        isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or (isinstance(score, float) and not math.isfinite(score))
+    ):
+        logger.warning(
+            f"Dropping sample {item.get('__key__')}: its {score_key!r} score {score!r} is not a finite number"
+        )
+        return False
+    return score >= threshold
 
 
 def _filter_empty_keys(
@@ -208,13 +242,17 @@ class WDSLoader(BaseWDSLoader):
 
         files_map: Optional dict mapping output keys to file paths. These files are
             loaded once at initialization and added as constants to every output.
-            Supports both local paths and S3 paths. Relative paths are resolved
-            relative to the first shard directory.
+            Supports both local paths and S3 paths. Relative paths are resolved against
+            the parent directory of the first datatag path (the directory itself when the
+            path ends with ``/``). ``.npy`` loads a single tensor;
+            ``.pth``/``.pt`` loads a tensor or a list of tensors (e.g. SDXL's dual
+            ``[text_embedding, pooled_text_embedding]`` negative).
             Example: {"neg_condition": "neg_prompt_emb.npy"}
 
         presets_map: Optional dict mapping output keys to preset constant names.
             Available presets are defined in PRESET_CONSTANTS.
-            Example: {"neg_condition": "neg_prompt_wan"}
+            Text presets are raw prompts and therefore use raw condition keys.
+            Example: {"neg_condition_raw": "neg_prompt_wan"}
 
         presets_filter: Optional dict of filter configurations. Keys are filter names
             (from PRESET_FILTERS), values are kwargs for that filter.
@@ -225,8 +263,9 @@ class WDSLoader(BaseWDSLoader):
         **kwargs: Additional arguments passed to BaseWDSLoader, including:
             - num_workers: Number of dataloader workers (auto-detected if None)
             - train: Whether this is a training dataset (default: True)
-            - cache_path: Path to cache directory for downloaded shards
             - deterministic: Use deterministic iteration for resumability
+            - strict: Raise on samples or shards that fail instead of skipping them (default: False)
+            - drop_last: With deterministic and train=False, give every rank the same number of samples (default: True)
             - sampler_start_idx: Start index for resumable iteration
             - shard_count_file: Path to JSON with shard sample counts
             - ignore_index_paths: List of JSON files specifying samples to skip
@@ -251,6 +290,7 @@ class WDSLoader(BaseWDSLoader):
         # Common options passed to BaseWDSLoader
         **kwargs,
     ):
+        validate_wds_config(deterministic=kwargs.get("deterministic", False), presets_filter=presets_filter)
         # key_map: output keys -> item keys (file extensions in the shard)
         if key_map is None:
             key_map = {"real": "latent.pth", "condition": "txt_emb.pth"}
@@ -295,9 +335,6 @@ class WDSLoader(BaseWDSLoader):
 
         Returns:
             Dict with 'fname', 'shard', and all mapped output keys.
-
-        Raises:
-            AssertionError: If a required key is missing from both item and constants.
         """
         output = {
             **init_output_dict(item),
@@ -309,10 +346,11 @@ class WDSLoader(BaseWDSLoader):
             if item_key in item:
                 output[output_key] = item[item_key]
             else:
+                # ``filter_items`` already dropped items that lack both the key and a constant fallback.
                 assert (
                     output_key in self._constants
                 ), f"Missing required key '{item_key}' for output '{output_key}', without a default preset value."
-                logger.warning(f"Missing key '{item_key}' for output '{output_key}', using default preset value.")
+                logger.debug(f"Missing key '{item_key}' for output '{output_key}', using default preset value.")
         return output
 
     def filter_items(
@@ -328,7 +366,7 @@ class WDSLoader(BaseWDSLoader):
             item: Raw WebDataset item dict (pre-decoding, values are bytes).
 
         Returns:
-            True if item passes all filters and should be processed.
+            True if the item has the data to be processed.
         """
         for output_key, item_key in self._key_map.items():
             if item_key not in item:
@@ -338,45 +376,70 @@ class WDSLoader(BaseWDSLoader):
             elif not isinstance(item[item_key], (bytes, bytearray)):
                 # Present keys must be raw bytes (not yet decoded)
                 return False
-        if not all(f(item) for f in self._filter_fn):
-            return False
         return True
 
-    @staticmethod
-    def _load_file(path: str, wds_tags: List[str]) -> torch.Tensor:
-        """Load a numpy file as a torch tensor.
+    def _prefilter(self, dataset: wds.WebDataset) -> wds.WebDataset:
+        # presets_filter excludes samples on purpose, so it must not count toward failures; deterministic loading
+        # rejects it (see validate_wds_config).
+        for filter_fn in self._filter_fn:
+            dataset = dataset.select(filter_fn)
+        return dataset
 
-        Supports both local paths and S3 paths (via s5cmd). Relative paths
-        are resolved relative to the directory of the first shard.
+    @staticmethod
+    def _load_file(path: str, wds_tags: List[str]) -> Union[torch.Tensor, List[torch.Tensor]]:
+        """Load a constant embedding file as a torch tensor (or list of tensors).
+
+        Supports both local paths and S3 paths (via s5cmd). Relative paths are
+        resolved against ``os.path.dirname`` of the first datatag path: its parent
+        directory, or the directory itself when the path ends with ``/``.
+
+        Dispatch is by extension so a ``files_map`` constant can mirror whatever
+        structure its per-sample counterpart produces:
+
+        - ``.npy``: a single array -> ``torch.Tensor`` (unchanged default).
+        - ``.pth`` / ``.pt``: whatever was ``torch.save``-d, mirroring the
+          per-sample ``.pth`` autodecode path. A ``list`` / ``tuple`` of tensors
+          loads as ``list[torch.Tensor]`` (e.g. SDXL's dual
+          ``[text_embedding, pooled_text_embedding]`` negative); a bare tensor
+          stays a ``torch.Tensor``.
 
         Args:
-            path: Path to the .npy file (local, S3, or relative)
+            path: Path to the file (local, S3, or relative)
             wds_tags: List of WDS tags used to resolve relative paths
 
         Returns:
-            Loaded tensor, or None if file not found (for local paths)
+            Loaded tensor, or list of tensors for a list/tuple ``.pth`` payload.
 
         Raises:
-            RuntimeError: If S3 download fails
+            RuntimeError: If an S3 download fails.
+            FileNotFoundError: If a local file does not exist.
         """
-        if not path.startswith("s3://") and not os.path.isabs(path):
+        if not s3.is_uri(path) and not os.path.isabs(path):
             prefixes = get_prefixes(wds_tags)
             path = os.path.join(os.path.dirname(prefixes[0]), path)
 
-        if path.startswith("s3://"):
+        if s3.is_uri(path):
             proc = subprocess.run(["s5cmd", "cat", path], capture_output=True)
-            if proc.returncode == 0:
-                neg_condition = np.load(BytesIO(proc.stdout))
-                return torch.from_numpy(neg_condition)
-            else:
+            if proc.returncode != 0:
                 raise RuntimeError(f"Failed to load file from {path}: {proc.stderr.decode()}")
-
+            source: Union[str, BytesIO] = BytesIO(proc.stdout)
         elif os.path.isfile(path):
-            neg_condition = np.load(path)
-            return torch.from_numpy(neg_condition)
+            source = path
+        else:
+            raise FileNotFoundError(
+                f"files_map file not found: '{path}'. Every files_map entry must reference an "
+                f"existing file (e.g. a precomputed embedding); provide the file or remove the entry."
+            )
 
-        logger.info(f"No file found at {path}, using zero embedding.")
-        return None
+        # ``.pth``/``.pt`` mirror the per-sample autodecode path (torch.load), so a
+        # list payload (e.g. SDXL's dual [text, pooled] negative) survives intact.
+        if file_extension(path) in {".pth", ".pt"}:
+            obj = torch.load(source, map_location="cpu")
+            if isinstance(obj, (list, tuple)):
+                return [t if torch.is_tensor(t) else torch.as_tensor(t) for t in obj]
+            return obj if torch.is_tensor(obj) else torch.as_tensor(obj)
+
+        return torch.from_numpy(np.load(source))
 
     def _pipeline(self, dataset: wds.WebDataset) -> wds.WebDataset:
         """Process the WebDataset through filtering, decoding, and preprocessing.
@@ -396,8 +459,9 @@ class WDSLoader(BaseWDSLoader):
         # Decode only the keys we need from the key_map
         decode_keys = list(self._key_map.values())
         decoder = wds.autodecode.Decoder(self.decoders, only=decode_keys)
-        dataset = dataset.map(decoder, handler=wds.warn_and_continue)
-        dataset = dataset.map(self._preprocess, handler=wds.handlers.warn_and_continue)
+        # Errors propagate: process_samples runs this per sample and skips or, with strict=True, raises.
+        dataset = dataset.map(decoder)
+        dataset = dataset.map(self._preprocess)
 
         return dataset
 
@@ -426,18 +490,19 @@ class ImageWDSLoader(WDSLoader):
     Args:
         datatags: List of WDS tags in format 'WDS:<PATH>'
         batch_size: Batch size for the dataloader
-        input_res: Target image resolution (square). Images are resized and
-            center-cropped to this size. Default: 512
+        input_res: Target image resolution as an int (square) or a (W, H) tuple
+            for non-square crops. Images are resized and center-cropped to this
+            size. Default: 512
 
-        key_map: Dict mapping output keys to item keys. Image keys should
+        key_map: Required dict mapping output keys to item keys. Image keys should
             reference image file extensions (e.g., "jpg", "png").
-            Example: {"real": "jpg", "condition": "txt"}
+            Example: {"real_raw": "jpg", "condition_raw": "txt"}
 
         **kwargs: Additional arguments passed to WDSLoader and BaseWDSLoader.
 
     The default image transform pipeline:
-        1. Resize to input_res (bicubic interpolation)
-        2. Center crop to input_res x input_res
+        1. Resize preserving aspect ratio (small side to target size, bicubic interpolation)
+        2. Center crop to input_res (W x H)
         3. Convert to RGB
         4. Convert to tensor
         5. Normalize with norm_mean and norm_std
@@ -445,43 +510,34 @@ class ImageWDSLoader(WDSLoader):
 
     def __init__(
         self,
-        *args,
-        input_res: int = 512,
+        datatags: List[str],
+        batch_size: int,
+        key_map: Dict[str, str],
+        input_res: Union[int, Tuple[int, int]] = 512,  # int for square, or (W, H) for non-square
         norm_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         norm_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         **kwargs,
     ):
         # Store pipeline configuration
-        self._input_res = input_res
+        if isinstance(input_res, int):
+            self._input_res = (input_res, input_res)
+        else:
+            self._input_res = input_res
+        assert len(self._input_res) == 2, f"input_res must be a tuple of two integers, but got {input_res}"
         self._norm_mean = norm_mean
         self._norm_std = norm_std
-        super().__init__(*args, **kwargs)
+        super().__init__(datatags=datatags, batch_size=batch_size, key_map=key_map, **kwargs)
 
     @property
     def decoders(self) -> list[Callable[[str, bytes], Any]]:
         return super().decoders + [functools.partial(decode_image, image_transform=self._image_transform)]
 
-    @property
-    def _image_transform(self) -> Compose:
-        """Default image transform pipeline for resizing, cropping, and normalizing.
-
-        Returns:
-            Composed transform pipeline that:
-            - Resizes to input_res using bicubic interpolation
-            - Center crops to input_res
-            - Converts to RGB
-            - Converts to tensor
-            - Normalizes the tensor with norm_mean and norm_std
+    def _image_transform(self, img):
+        """Aspect-preserving resize (bicubic) + center-crop to ``input_res``, then
+        normalize to [-1, 1] via the shared ``normalize_pixels`` (== ``ToTensor()`` +
+        ``Normalize(norm_mean, norm_std)``). Shared with the inference path.
         """
-        return Compose(
-            [
-                Resize(self._input_res, interpolation=InterpolationMode.BICUBIC),
-                CenterCrop(self._input_res),
-                Lambda(lambda img: img.convert("RGB")),
-                ToTensor(),
-                Normalize(self._norm_mean, self._norm_std),
-            ]
-        )
+        return transform_image(img, self._input_res, self._norm_mean, self._norm_std)
 
 
 class VideoWDSLoader(WDSLoader):
@@ -496,14 +552,20 @@ class VideoWDSLoader(WDSLoader):
         sequence_length: Number of frames to extract from each video. Default: 81
         img_size: Target (width, height) for video frames. Default: (832, 480)
         video_keys: Iterable of output keys that contain video data and should be
-            transformed. Default: ("real",)
+            transformed. Default: ("real_raw",)
         decoder_type: Type of video decoder to use. Default: "segment"
             - "segment": Random segment sampling (if video is longer than sequence_length)
-            - "full": Full video decoding (no random segment sampling)
+            - "full": Full video decoding (no random segment sampling); the whole stream is read, without
+              the decoder's default wall-clock budget.
+        target_fps: Optional target FPS for timestamp-based resampling. When set
+            with decoder_type="segment", the random segment spans
+            sequence_length / target_fps seconds and is resampled by timestamp.
+            When set with decoder_type="full", the full decoded video is
+            resampled by timestamp before transforms.
 
-        key_map: Dict mapping output keys to item keys. Video keys should
+        key_map: Required dict mapping output keys to item keys. Video keys should
             reference video file extensions (e.g., "mp4").
-            Example: {"real": "mp4", "condition": "txt"}
+            Example: {"real_raw": "mp4", "condition_raw": "txt"}
 
         **kwargs: Additional arguments passed to WDSLoader and BaseWDSLoader.
 
@@ -517,18 +579,28 @@ class VideoWDSLoader(WDSLoader):
 
     def __init__(
         self,
-        *args,
+        datatags: List[str],
+        batch_size: int,
+        key_map: Dict[str, str],
         sequence_length: int = 81,
         img_size: Tuple[int, int] = (832, 480),
-        video_keys: Optional[Iterable[str]] = ("real",),
+        video_keys: Optional[Iterable[str]] = ("real_raw",),
         decoder_type: str = "segment",
+        target_fps: Optional[float] = None,
         **kwargs,
     ):
+        if key_map is None:
+            raise TypeError("`key_map` must not be None")
+        if target_fps is not None and (not math.isfinite(target_fps) or target_fps <= 0):
+            raise ValueError("target_fps must be a finite positive number")
+        if decoder_type not in ("segment", "full"):
+            raise ValueError(f"decoder_type must be 'segment' or 'full', got {decoder_type!r}")
         self.sequence_length = sequence_length
         self.img_size = img_size
         self.video_keys = [] if video_keys is None else list(video_keys)
         self.decoder_type = decoder_type
-        super().__init__(*args, **kwargs)
+        self.target_fps = target_fps
+        super().__init__(datatags=datatags, batch_size=batch_size, key_map=key_map, **kwargs)
         if not all(key in self._key_map for key in self.video_keys):
             raise ValueError(f"`{self.video_keys}` keys are required but got {list(self._key_map.keys())}")
 
@@ -539,14 +611,18 @@ class VideoWDSLoader(WDSLoader):
                 decode_video_segment,
                 num_frames=self.sequence_length,
                 output_format="torch",
+                target_fps=self.target_fps,
+                return_segment_start_frame=True,
             )
-        elif self.decoder_type == "full":
+        else:  # "full", validated in __init__
+            # Training reads the whole stream; the decoder's default wall-clock budget serves the VLM judge.
             video_decoder = functools.partial(
                 decode_video_full,
                 output_format="torch",
+                target_fps=self.target_fps,
+                timeout_s=None,
+                return_source_frame_indices=True,
             )
-        else:
-            raise ValueError(f"Invalid decoder type: {self.decoder_type}")
         return super().decoders + [video_decoder]
 
     def _transform_video(self, video: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, int]]:
@@ -564,15 +640,230 @@ class VideoWDSLoader(WDSLoader):
             ValueError: If video has fewer frames than sequence_length.
         """
         result = transform_video(video, self.sequence_length, self.img_size)
-        return result["real"], result["cropping_params"]
+        return result["real_raw"], result["cropping_params"]
 
     def _preprocess(self, item: dict) -> Dict[str, Any]:
         output = super()._preprocess(item)
         for video_key in self.video_keys:
-            video, cropping_params = self._transform_video(output[video_key])
+            decoded = output[video_key]
+            if isinstance(decoded, (bytes, bytearray)):
+                # Video decoders return None on failure, and WebDataset then passes the raw bytes on.
+                raise ValueError(f"Cannot decode '{self._key_map[video_key]}' of sample {item['__key__']}")
+            if not isinstance(decoded, dict):
+                decoded = {"frames": decoded}
+            video, cropping_params = self._transform_video(decoded["frames"])
             output[video_key] = video
-            if len(self.video_keys) == 1:
-                output["cropping_params"] = cropping_params
-            else:
-                output[f"{video_key}_cropping_params"] = cropping_params
+            # Per-video-key outputs keep bare names for the usual single video key; several keys each get their own.
+            prefix = "" if len(self.video_keys) == 1 else f"{video_key}_"
+            output[f"{prefix}cropping_params"] = cropping_params
+            output[f"{prefix}segment_start_frame"] = decoded.get("segment_start_frame", 0)
+        return output
+
+
+class CameraVideoWDSLoader(VideoWDSLoader):
+    """VideoWDSLoader with pre-computed camera poses and intrinsics (e.g. from VIPE).
+
+    Gathers the pose/intrinsics rows of the frames the decoder kept and rescales
+    intrinsics to the final resolution after resize + center-crop. Pose /
+    intrinsics arrays carry one row per *source* frame (e.g. VIPE output); when
+    ``target_fps`` drops or duplicates frames, each kept frame's source row is
+    taken, so no pose interpolation is needed. Full mode places frames by decode
+    order; segment mode places the first kept frame by its timestamp at the
+    source frame rate, so it needs constant-frame-rate video. Samples whose
+    frames cannot be placed, or whose sidecar lacks rows for them, raise: the
+    loader skips them with a warning, or stops with ``strict=True``.
+
+    Required key_map entries::
+
+        key_map={
+            "real_raw": "mp4",
+            "condition_raw": "txt",
+            "camera_poses": "poses.npy",           # (T, 4, 4) OpenCV c2w
+            "camera_intrinsics": "intrinsics.npy", # (T, 4) [fx, fy, cx, cy]
+        }
+    """
+
+    def __init__(
+        self,
+        *args,
+        camera_pose_key: str = "camera_poses",
+        camera_intrinsics_key: str = "camera_intrinsics",
+        **kwargs,
+    ):
+        self.camera_pose_key = camera_pose_key
+        self.camera_intrinsics_key = camera_intrinsics_key
+        super().__init__(*args, **kwargs)
+        # `_preprocess` reads one decoded video directly and the bare `output["cropping_params"]`,
+        # which `VideoWDSLoader._preprocess` only writes for single-video-key configs.
+        assert len(self.video_keys) == 1, (
+            f"{type(self).__name__} requires exactly one video key (got {self.video_keys}); "
+            "camera alignment relies on one decoded video and the bare 'cropping_params' entry."
+        )
+        camera_keys = (self.camera_pose_key, self.camera_intrinsics_key)
+        if not all(key in self._key_map for key in camera_keys):
+            raise ValueError(f"`{list(camera_keys)}` keys are required but got {list(self._key_map.keys())}")
+
+    def _camera_sidecars(self, output: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-source-frame ``(poses (T, 4, 4), intrinsics (T, 4))`` of the sample; subclasses whose shards
+        store camera data in another format convert it here before the kept frames' rows are gathered."""
+        return output[self.camera_pose_key], output[self.camera_intrinsics_key]
+
+    @staticmethod
+    def _select_camera(arr: torch.Tensor, indices: Optional[list]) -> torch.Tensor:
+        """Rows of ``arr`` for the kept frames, gathered by the source frame indices the decoder reports.
+
+        Raises ``ValueError``, like ``transform_video`` on a short clip, when the decoder could not place the
+        frames or the sidecar lacks a row for one of them; the loader then skips the sample, or stops with
+        ``strict=True``. Slicing at the decoded cadence or clamping would silently train on misaligned poses.
+        """
+        if indices is None:
+            raise ValueError(
+                "decoder could not place the kept frames in the source stream (unknown or uneven frame rate)"
+            )
+        index = torch.as_tensor(indices, dtype=torch.long)
+        if index.min() < 0 or index.max() >= arr.shape[0]:
+            raise ValueError(
+                f"camera sidecar has {arr.shape[0]} rows but the kept source frames span "
+                f"{int(index.min())}..{int(index.max())}"
+            )
+        return arr[index]
+
+    def _preprocess(self, item: dict) -> Dict[str, Any]:
+        decoded = item[self._key_map[self.video_keys[0]]]
+        indices = decoded.get("source_frame_indices") if isinstance(decoded, dict) else None
+        if indices is not None:
+            decoded_frame_count = decoded["frames"].shape[0]
+            if len(indices) != decoded_frame_count:
+                raise ValueError(
+                    f"decoder returned {decoded_frame_count} frames but {len(indices)} source frame indices"
+                )
+            # Full decoding may return more frames than ``transform_video`` keeps.
+            indices = indices[: self.sequence_length]
+
+        # VideoWDSLoader handles unpacking, transformation, segment_start_frame, and cropping_params.
+        output = super()._preprocess(item)
+        poses, intrinsics = self._camera_sidecars(output)
+        output[self.camera_pose_key] = self._select_camera(poses, indices)
+        intrinsics = self._select_camera(intrinsics, indices)
+        output[self.camera_intrinsics_key] = transform_intrinsics(intrinsics, output["cropping_params"])
+        return output
+
+
+class AudioVideoWDSLoader(VideoWDSLoader):
+    """WebDataset loader that extracts both video frames and audio from MP4.
+
+    Extends :class:`VideoWDSLoader` to additionally decode the audio track
+    embedded in the video container.  Per-sample (pre-collate), the
+    audio waveform is resampled to ``target_sample_rate`` (when provided),
+    then trimmed/padded to ``num_video_frames / fps`` seconds at the
+    target rate, then packed together with the video tensor into a
+    modality dict under each ``video_key``::
+
+        output[video_key] = {
+            "video": Tensor[C, T, H, W],
+            "audio": Tensor[A_C, target_duration * target_sample_rate],
+        }
+
+    When ``target_sample_rate`` is ``None`` no resampling is performed
+    and the audio is packed at its native rate; in that mode mixed-SR
+    batches will fail collate (different per-sample lengths).
+
+    The ``"audio"`` key is **omitted** for clips whose mp4 container
+    carries no audio stream — in that case the dict contains only
+    ``"video"``.  Such clips will not collate with audio-bearing clips
+    in the same batch (the loader rejects mismatched nested key sets
+    before collation, stopping the loader regardless of ``strict``), so
+    **mixed audio presence requires ``batch_size=1``** or excluding the
+    audio-less clips via ``ignore_index_paths``.
+
+    A clip with audio but no frame rate (no ``target_fps`` and none in
+    the container) raises ``ValueError``, since its audio cannot be
+    sized to the kept frames; the loader skips it, or stops with
+    ``strict=True``.
+
+    Args:
+        target_sample_rate: Target sample rate (Hz) to resample every
+            audio clip to before collate.  If ``None``, audio is kept
+            at its native rate.  Defaults to ``None``.
+        **kwargs: Forwarded to :class:`VideoWDSLoader`.
+    """
+
+    def __init__(self, *args, target_sample_rate: Optional[int] = None, **kwargs):
+        if target_sample_rate is not None and target_sample_rate <= 0:
+            raise ValueError(f"target_sample_rate must be positive, got {target_sample_rate}")
+        self.target_sample_rate = target_sample_rate
+        super().__init__(*args, **kwargs)
+
+    @property
+    def decoders(self) -> list[Callable[[str, bytes], Any]]:
+        if self.decoder_type == "segment":
+            va_decoder = functools.partial(
+                decode_video_audio_segment,
+                num_frames=self.sequence_length,
+                output_format="torch",
+                target_fps=self.target_fps,
+            )
+        else:  # "full", validated in __init__
+            va_decoder = functools.partial(
+                decode_video_audio_full,
+                output_format="torch",
+                target_fps=self.target_fps,
+            )
+        # The video-audio decoder replaces the plain video decoder but we
+        # keep the parent's non-video decoders (npy, npz, txt).
+        return WDSLoader.decoders.fget(self) + [va_decoder]  # type: ignore[attr-defined]
+
+    def _preprocess(self, item: dict) -> Dict[str, Any]:
+        # The video-audio decoder returns a dict for each video key; hand
+        # VideoWDSLoader._preprocess the frames and the segment start (0 for full decoding).
+        # Audio data is stashed separately since it's not in the key_map.
+        audio_data = {}
+        for video_key in self.video_keys:
+            item_key = self._key_map[video_key]
+            va = item[item_key]
+            if isinstance(va, (bytes, bytearray)):
+                raise ValueError(f"Cannot decode '{item_key}' of sample {item['__key__']}")
+            if va.get("audio") is not None and va.get("video_fps", 0.0) <= 0:
+                raise ValueError(
+                    f"Cannot size the audio of '{item_key}' in sample {item['__key__']}: unknown video frame rate"
+                )
+            item[item_key] = {"frames": va["video"], "segment_start_frame": va.get("segment_start_frame", 0)}
+            audio_data[video_key] = (
+                va.get("audio"),
+                va.get("audio_sr"),
+                va.get("video_fps", 0.0),
+            )
+
+        output = super()._preprocess(item)
+
+        # Resample-then-trim-then-pack. Order matters: doing the trim against
+        # target_sample_rate (rather than native audio_sr) gives a uniform
+        # output length across mixed-SR batches and avoids the boundary
+        # discontinuity from trimming the signal before sinc resampling.
+        for video_key, (audio, audio_sr, video_fps) in audio_data.items():
+            video_tensor = output[video_key]
+            modality_dict: Dict[str, torch.Tensor] = {"video": video_tensor}
+
+            if audio is not None and audio_sr is not None:
+                if self.target_sample_rate is not None and audio_sr != self.target_sample_rate:
+                    audio = resample_audio(audio, audio_sr, self.target_sample_rate)
+                    audio_sr = self.target_sample_rate
+
+                # Decoder always emits stereo [2, samples] (reference LTX-2 channel
+                # handling, see ``decoders._downmix_to_stereo``).
+                assert audio.ndim == 2, f"expected audio [channels, samples], got shape {tuple(audio.shape)}"
+                num_video_frames = video_tensor.shape[1]  # (C, T, H, W)
+                # Multiply before dividing (exact for integral counts); mirrors the decoder
+                # and ``LTX2._compute_audio_shape``.
+                target_samples = int(num_video_frames * audio_sr / video_fps)
+                if audio.shape[-1] > target_samples:
+                    audio = audio[..., :target_samples]
+                elif audio.shape[-1] < target_samples:
+                    pad_size = target_samples - audio.shape[-1]
+                    audio = torch.nn.functional.pad(audio, (0, pad_size))
+
+                modality_dict["audio"] = audio
+
+            output[video_key] = modality_dict
+
         return output

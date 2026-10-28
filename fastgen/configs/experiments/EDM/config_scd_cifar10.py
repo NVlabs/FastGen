@@ -11,15 +11,16 @@ def create_config():
     config = scm_create_config()
 
     # Recommended setting for 2-step:
-    # config.model.sample_t_cfg.t_list = [80.0, 0.821, 0.0]
-    # config.model.student_sample_steps = 2
+    # config.model.student_grid_cfg.grid_type = "explicit"
+    # config.model.student_grid_cfg.grid_kwargs = {"timesteps": [80.0, 0.821, 0.0]}
+    # config.model.student_grid_cfg.steps = 2
 
-    config.model.net.dropout = 0.0
+    config.model.net.backbone.dropout = 0.0
     config.model.loss_config.use_cd = True
 
     config.model.pretrained_model_path = f"{CKPT_ROOT_DIR}/cifar10/edm-cifar10-32x32-uncond-vp.pth"
 
-    config.model.use_ema = ["ema_9999", "ema_99995", "ema_9996", "ema"]
+    config.model.use_ema = ["ema_9999", "ema_99995", "ema_9996"]
     config.trainer.callbacks = DictConfig(
         {k: v for k, v in config.trainer.callbacks.items() if not k.startswith("ema")}
     )

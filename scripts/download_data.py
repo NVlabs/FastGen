@@ -41,8 +41,8 @@ The EDM/EDM2 repos are cloned temporarily to:
 - Unpickle the .pkl model files (which require the repos' custom modules)
 
 Usage:
-    # Download CIFAR-10 (default):
-    python scripts/download_data.py
+    # Download CIFAR-10:
+    python scripts/download_data.py --dataset cifar10
 
     # Download ImageNet-64 (requires Kaggle ImageNet download):
     python scripts/download_data.py --dataset imagenet-64 --imagenet-source /path/to/imagenet
@@ -54,14 +54,15 @@ Usage:
     python scripts/download_data.py --dataset cifar10 --compute-fid-refs
 
     # Download only data or only models:
-    python scripts/download_data.py --only-data
+    python scripts/download_data.py --dataset cifar10 --only-data
     python scripts/download_data.py --only-models
 
     # Specify custom directories:
-    python scripts/download_data.py --output-dir /path/to/data --ckpt-dir /path/to/checkpoints
+    python scripts/download_data.py --dataset cifar10 --output-dir /path/to/data --ckpt-dir /path/to/checkpoints
 """
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import io
 import json
@@ -79,6 +80,9 @@ from tqdm import tqdm
 
 import fastgen.utils.logging_utils as logger
 from fastgen.utils.logging_utils import set_log_level
+from fastgen.utils.env import hf_load
+import fastgen.utils.s3 as s3
+from fastgen.utils.cache_utils import is_http_url
 from fastgen.configs.data import DATA_ROOT_DIR
 from fastgen.configs.net import CKPT_ROOT_DIR
 
@@ -147,6 +151,16 @@ def compute_md5(filepath: Path, chunk_size: int = 8192) -> str:
     return md5.hexdigest()
 
 
+@contextmanager
+def _staged_output(output_path: Path):
+    """Publish completed output atomically; keep any existing output on failure."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output_path.parent, prefix=f".{output_path.name}.") as temporary_dir:
+        temporary_path = Path(temporary_dir) / output_path.name
+        yield temporary_path
+        temporary_path.replace(output_path)
+
+
 def download_file(url: str, output_path: Path, description: str = "Downloading", expected_md5: Optional[str] = None):
     """Download a file with progress bar."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,24 +178,29 @@ def download_file(url: str, output_path: Path, description: str = "Downloading",
 
     req = Request(url, headers=headers)
 
-    with urlopen(req) as response:
+    with _staged_output(output_path) as temporary_path, urlopen(req) as response:
         total_size = int(response.headers.get("content-length", 0))
+        downloaded_size = 0
 
-        with open(output_path, "wb") as f:
+        with open(temporary_path, "wb") as f:
             with tqdm(total=total_size, unit="B", unit_scale=True, desc=description) as pbar:
                 while True:
                     chunk = response.read(8192)
                     if not chunk:
                         break
                     f.write(chunk)
+                    downloaded_size += len(chunk)
                     pbar.update(len(chunk))
 
-    # Verify hash if provided
-    if expected_md5:
-        actual_md5 = compute_md5(output_path)
-        if actual_md5 != expected_md5:
-            raise ValueError(f"MD5 mismatch: expected {expected_md5}, got {actual_md5}")
-        logger.debug(f"MD5 verified: {expected_md5}")
+        if total_size and downloaded_size != total_size:
+            raise ValueError(f"Incomplete download: expected {total_size} bytes, got {downloaded_size}")
+
+        # Verify before replacing the destination.
+        if expected_md5:
+            actual_md5 = compute_md5(temporary_path)
+            if actual_md5 != expected_md5:
+                raise ValueError(f"MD5 mismatch: expected {expected_md5}, got {actual_md5}")
+            logger.debug(f"MD5 verified: {expected_md5}")
 
 
 def clone_repo(repo_url: str, target_dir: Path, name: str) -> Path:
@@ -227,33 +246,34 @@ def run_dataset_tool(
 
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    cmd = [sys.executable, str(dataset_tool.absolute())]
-    if use_subcommand:
-        cmd.append(subcommand)
-    cmd.extend([f"--source={source.absolute()}", f"--dest={dest.absolute()}"])
-    if resolution:
-        cmd.append(f"--resolution={resolution}")
-    if transform:
-        cmd.append(f"--transform={transform}")
+    with _staged_output(dest) as temporary_path:
+        cmd = [sys.executable, str(dataset_tool.absolute())]
+        if use_subcommand:
+            cmd.append(subcommand)
+        cmd.extend([f"--source={source.absolute()}", f"--dest={temporary_path.absolute()}"])
+        if resolution:
+            cmd.append(f"--resolution={resolution}")
+        if transform:
+            cmd.append(f"--transform={transform}")
 
-    logger.info(f"Creating dataset: {dest.name}")
-    logger.debug(f"Running: {' '.join(cmd)}")
+        logger.info(f"Creating dataset: {dest.name}")
+        logger.debug(f"Running: {' '.join(cmd)}")
 
-    result = subprocess.run(cmd, cwd=str(repo_dir), capture_output=True, text=True)
+        result = subprocess.run(cmd, cwd=str(repo_dir), capture_output=True, text=True)
 
-    if result.returncode != 0:
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
-        raise RuntimeError(f"dataset_tool.py failed with return code {result.returncode}")
+        if result.returncode != 0:
+            logger.error(f"stdout: {result.stdout}")
+            logger.error(f"stderr: {result.stderr}")
+            raise RuntimeError(f"dataset_tool.py failed with return code {result.returncode}")
 
-    if result.stdout:
-        for line in result.stdout.strip().split("\n"):
-            logger.debug(line)
+        if result.stdout:
+            for line in result.stdout.strip().split("\n"):
+                logger.debug(line)
 
-    if not dest.exists():
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
-        raise RuntimeError(f"dataset_tool.py did not create output file at {dest}")
+        if not temporary_path.exists():
+            logger.error(f"stdout: {result.stdout}")
+            logger.error(f"stderr: {result.stderr}")
+            raise RuntimeError(f"dataset_tool.py did not create output file at {dest}")
 
     logger.success(f"Dataset created: {dest}")
     return True
@@ -311,11 +331,13 @@ def convert_pickle_to_pth(pkl_path: Path, pth_path: Path, repo_dir: Path):
 
         logger.info(f"Saving to {pth_path.name}...")
         pth_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(state_dict, pth_path)
-
-        # Verify
-        loaded = torch.load(pth_path, weights_only=True)
-        logger.debug(f"Verified: saved file has {len(loaded)} keys")
+        # Only publish a complete, verified checkpoint. prepare_models skips
+        # existing destinations, so a failed save must not leave one behind or
+        # replace a previous valid checkpoint during --force.
+        with _staged_output(pth_path) as temporary_path:
+            torch.save(state_dict, temporary_path)
+            loaded = torch.load(temporary_path, weights_only=True)
+            logger.debug(f"Verified: saved file has {len(loaded)} keys")
 
     finally:
         sys.path = original_path
@@ -408,34 +430,35 @@ def compute_fid_refs(
     if not script.exists():
         raise FileNotFoundError(f"FID script not found at {script}")
 
-    cmd = [
-        sys.executable,
-        str(script.absolute()),
-        "ref",
-        f"--data={dataset_path.absolute()}",
-        f"--dest={output_path.absolute()}",
-        "--batch=64",
-    ]
+    with _staged_output(output_path) as temporary_path:
+        cmd = [
+            sys.executable,
+            str(script.absolute()),
+            "ref",
+            f"--data={dataset_path.absolute()}",
+            f"--dest={temporary_path.absolute()}",
+            "--batch=64",
+        ]
 
-    logger.info(f"Computing FID reference: {output_path.name}")
-    logger.info(f"Dataset: {dataset_path}")
-    logger.debug(f"Running: {' '.join(cmd)}")
+        logger.info(f"Computing FID reference: {output_path.name}")
+        logger.info(f"Dataset: {dataset_path}")
+        logger.debug(f"Running: {' '.join(cmd)}")
 
-    result = subprocess.run(cmd, cwd=str(repo_dir), capture_output=True, text=True)
+        result = subprocess.run(cmd, cwd=str(repo_dir), capture_output=True, text=True)
 
-    if result.returncode != 0:
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
-        raise RuntimeError(f"FID computation failed with return code {result.returncode}")
+        if result.returncode != 0:
+            logger.error(f"stdout: {result.stdout}")
+            logger.error(f"stderr: {result.stderr}")
+            raise RuntimeError(f"FID computation failed with return code {result.returncode}")
 
-    if result.stdout:
-        for line in result.stdout.strip().split("\n"):
-            logger.debug(line)
+        if result.stdout:
+            for line in result.stdout.strip().split("\n"):
+                logger.debug(line)
 
-    if not output_path.exists():
-        logger.error(f"stdout: {result.stdout}")
-        logger.error(f"stderr: {result.stderr}")
-        raise RuntimeError(f"FID script did not create output file at {output_path}")
+        if not temporary_path.exists():
+            logger.error(f"stdout: {result.stdout}")
+            logger.error(f"stderr: {result.stderr}")
+            raise RuntimeError(f"FID script did not create output file at {output_path}")
 
     logger.success(f"FID reference saved: {output_path}")
 
@@ -468,10 +491,10 @@ def encode_dit_style(rgb_path: Path, output_path: Path, force: bool = False) -> 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(f"Creating dataset: {output_path.name}")
     logger.info("Loading Stability VAE encoder...")
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+    vae = hf_load(AutoencoderKL.from_pretrained, "stabilityai/sd-vae-ft-mse")
     vae = vae.eval().requires_grad_(False).cuda()
 
-    with zipfile.ZipFile(rgb_path, "r") as src_zip:
+    with _staged_output(output_path) as temporary_path, zipfile.ZipFile(rgb_path, "r") as src_zip:
         image_files = sorted([f for f in src_zip.namelist() if f.endswith(".png")])
 
         # Load labels from source
@@ -484,7 +507,7 @@ def encode_dit_style(rgb_path: Path, output_path: Path, force: bool = False) -> 
 
         logger.info(f"Encoding {len(image_files)} images...")
 
-        with zipfile.ZipFile(output_path, mode="w", compression=zipfile.ZIP_STORED) as dst_zip:
+        with zipfile.ZipFile(temporary_path, mode="w", compression=zipfile.ZIP_STORED) as dst_zip:
             all_labels = []
 
             for idx, img_fname in enumerate(tqdm(image_files, desc="Encoding images")):
@@ -526,8 +549,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Download CIFAR-10 (default):
-    python scripts/download_data.py
+    # Download CIFAR-10:
+    python scripts/download_data.py --dataset cifar10
 
     # Download ImageNet-64 (requires Kaggle ImageNet download):
     python scripts/download_data.py --dataset imagenet-64 --imagenet-source /path/to/imagenet
@@ -539,14 +562,14 @@ Examples:
     python scripts/download_data.py --dataset all --imagenet-source /path/to/imagenet
 
     # Specify custom directories:
-    python scripts/download_data.py --output-dir ./data --ckpt-dir ./checkpoints
+    python scripts/download_data.py --dataset cifar10 --output-dir ./data --ckpt-dir ./checkpoints
 
     # Download only data or models:
-    python scripts/download_data.py --only-data
+    python scripts/download_data.py --dataset cifar10 --only-data
     python scripts/download_data.py --only-models
 
     # Force re-download:
-    python scripts/download_data.py --force
+    python scripts/download_data.py --dataset cifar10 --force
         """,
     )
 
@@ -616,6 +639,12 @@ Examples:
         if not args.only_models:
             parser.error(f"--imagenet-source is required for dataset '{args.dataset}' (unless --only-models is set)")
 
+    # Remote training roots do not define a local download destination.
+    if not args.only_models and args.output_dir is None and (s3.is_uri(DATA_ROOT_DIR) or is_http_url(DATA_ROOT_DIR)):
+        parser.error("DATA_ROOT_DIR is a remote URI; provide a local --output-dir")
+    if not args.only_data and args.ckpt_dir is None and (s3.is_uri(CKPT_ROOT_DIR) or is_http_url(CKPT_ROOT_DIR)):
+        parser.error("CKPT_ROOT_DIR is a remote URI; provide a local --ckpt-dir")
+
     # Determine output directories
     output_dir = args.output_dir or Path(DATA_ROOT_DIR)
     ckpt_dir = args.ckpt_dir or Path(CKPT_ROOT_DIR)
@@ -668,11 +697,11 @@ Examples:
             logger.info("Processing ImageNet-64")
             logger.info("=" * 50)
 
-            train_path = validate_imagenet_source(args.imagenet_source)
             edm_path = output_dir / "imagenet-64" / "imagenet-64x64.zip"
             edm2_path = output_dir / "imagenet-64" / "imagenet-64x64-edmv2.zip"
 
             if not args.only_models:
+                train_path = validate_imagenet_source(args.imagenet_source)
                 run_dataset_tool(
                     edm_dir, train_path, edm_path, resolution="64x64", transform="center-crop", force=args.force
                 )

@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 
 class ForcedWeightNormCallback(Callback):
+    def __init__(self) -> None:
+        self._warned = False
+
     def on_training_accum_step_begin(
         self,
         model: FastGenModel,
@@ -22,7 +25,8 @@ class ForcedWeightNormCallback(Callback):
     ) -> None:
         if hasattr(model.net, "forced_weight_normalization"):
             model.net.forced_weight_normalization()
-        else:
+        elif not self._warned:
+            self._warned = True
             logger.warning(
                 "Enabled ForcedWeightNormCallback but model.net does not have the forced_weight_normalization method."
             )

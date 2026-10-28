@@ -10,6 +10,8 @@ Built around the same concepts that were originally proposed in the paper
 import numpy as np
 import torch
 
+from fastgen.utils.tree_utils import assert_same
+
 
 # ----------------------------------------------------------------------------
 # Cached construction of constant tensors. Avoids CPU=>GPU copy when the
@@ -304,8 +306,10 @@ class AugmentPipe:
         contrast_std=0.5,
         hue_max=1,
         saturation_std=1,
+        input_key="real_raw",
     ):
         super().__init__()
+        self.input_key = input_key
         self.p = float(p)  # Overall multiplier for augmentation probability.
 
         # Pixel blitting.
@@ -546,15 +550,29 @@ class AugmentPipe:
         labels = torch.cat([x.to(torch.float32).reshape(N, -1) for x in labels], dim=1)
         return images, labels
 
-    def __call__(self, data):
-        images = data["real"]
-        images, aug_cond = self.process(images)
-        data["real"] = images
-        aug_cond = {"aug_condition": aug_cond}
-        if "condition" in data:
-            data["condition"] = {"orig_condition": data["condition"], **aug_cond}
-        else:
-            data["condition"] = aug_cond
+    def __call__(self, data: dict) -> dict:
+        """Augment the configured pixel input and attach the sampled labels.
+
+        Configuring ``input_key="real"`` explicitly asserts that the authoritative model input is
+        pixel-space. The augmenter cannot infer representation from tensor shape.
+        """
+        if data.get("aug_condition") is not None:
+            raise ValueError("AugmentPipe cannot augment a batch with non-None data['aug_condition']")
+
+        if self.input_key == "real_raw" and data.get("real") is not None:
+            raise ValueError(
+                "AugmentPipe cannot augment non-authoritative data['real_raw'] while data['real'] is present; "
+                "configure input_key='real' for pixel-space data or disable augmentation"
+            )
+
+        augment_input = data.get(self.input_key)
+        if augment_input is None:
+            raise ValueError(f"AugmentPipe requires a non-None `{self.input_key}` input")
+
+        augment_output, aug_condition = self.process(augment_input)
+        assert_same(dtype=True, device=True, augment_input=augment_input, augment_output=augment_output)
+        data[self.input_key] = augment_output
+        data["aug_condition"] = aug_condition
         return data
 
 

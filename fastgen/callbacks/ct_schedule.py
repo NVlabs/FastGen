@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 from typing import Callable, TYPE_CHECKING
+import math
 import wandb
 
 import torch
@@ -27,6 +28,8 @@ class CTScheduleCallback(Callback):
         kimg_per_stage: int = 12500,
         batch_size: int = 1,
     ):
+        if not math.isfinite(q) or q <= 1:
+            raise ValueError(f"q must be finite and greater than 1, got {q!r}.")
         self.q = q
         self.ratio_limit = ratio_limit
         self.kimg_per_stage = kimg_per_stage
@@ -52,7 +55,7 @@ class CTScheduleCallback(Callback):
 
     def _update_schedule(self, stage):
         self.stage = stage
-        self.ratio = 1 - 1 / self.q ** (stage + 1)
+        self.ratio = 1 - self.q ** (-(stage + 1))
         if self.ratio > self.ratio_limit:
             logger.info(f"Clipping ratio from {self.ratio} -> {self.ratio_limit}")
             self.ratio = self.ratio_limit

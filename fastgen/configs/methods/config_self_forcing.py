@@ -4,37 +4,35 @@
 import attrs
 from omegaconf import DictConfig
 
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
+from fastgen.configs.methods.config_causvid import ModelConfig as CausVidModelConfig
 from fastgen.configs.methods.config_dmd2 import (
     Config as DMD2Config,
-    ModelConfig as DMD2ModelConfig,
 )
 from fastgen.methods import SelfForcingModel
+from fastgen.configs.callbacks import BASE_CALLBACKS
 from fastgen.configs.callbacks import (
-    WANDB_CALLBACK,
     GradClip_CALLBACK,
-    ParamCount_CALLBACK,
-    TrainProfiler_CALLBACK,
-    GPUStats_CALLBACK,
     EMA_CALLBACK,
 )
 
 
-@attrs.define(slots=False)
-class ModelConfig(DMD2ModelConfig):
-    enable_gradient_in_rollout: bool = True
+@attrs.define
+class ModelConfig(CausVidModelConfig):
+    # Self-Forcing starts from fresh noise and completes its causal rollout in-iteration, so it
+    # requires the carry-free "default" mode. Real data is optional, although inherited GAN
+    # terms still use it when both present and weighted.
+    backward_simulation: str | None = "default"
     start_gradient_frame: int = 0
     same_step_across_blocks: bool = True
     last_step_only: bool = False
-    context_noise: float = 0.0
+    grad_through_kv_cache: bool = False
 
 
-@attrs.define(slots=False)
+@attrs.define
 class Config(DMD2Config):
     model: ModelConfig = attrs.field(factory=ModelConfig)
-    model_class: DictConfig = L(SelfForcingModel)(
-        config=None,
-    )
+    model_class: DictConfig = attrs.field(factory=lambda: L(SelfForcingModel)(config=None))
 
 
 def create_config():
@@ -42,16 +40,13 @@ def create_config():
     config.trainer.callbacks = DictConfig(
         {
             **GradClip_CALLBACK,
-            **GPUStats_CALLBACK,
-            **TrainProfiler_CALLBACK,
-            **ParamCount_CALLBACK,
             **EMA_CALLBACK,
-            **WANDB_CALLBACK,
+            **BASE_CALLBACKS,
         }
     )
 
     config.dataloader_train.batch_size = 256
-    config.model.student_sample_steps = 4
+    config.model.student_grid_cfg.steps = 4
     config.model.discriminator_scheduler.warm_up_steps = [0]
     config.model.fake_score_scheduler.warm_up_steps = [0]
     config.model.net_scheduler.warm_up_steps = [0]

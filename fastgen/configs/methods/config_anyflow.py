@@ -9,31 +9,28 @@ config. The flow-map pretrain stage (paper Stage 1) is MeanFlow with
 AnyFlow's hyperparameters — see ``configs/experiments/WanT2V/config_anyflow.py``.
 """
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import attrs
 from omegaconf import DictConfig
 
+from fastgen.callbacks.grad_clip import GradClipCallback
+from fastgen.configs.callbacks import BASE_CALLBACKS
 from fastgen.configs.callbacks import (
     EMA_CALLBACK,
-    GPUStats_CALLBACK,
     GradClip_CALLBACK,
-    ParamCount_CALLBACK,
-    TrainProfiler_CALLBACK,
-    WANDB_CALLBACK,
 )
 from fastgen.configs.config import BaseConfig
 from fastgen.configs.methods.config_dmd2 import ModelConfig as DMD2ModelConfig
 from fastgen.configs.methods.config_mean_flow import (
     LossConfig as MeanFlowLossConfig,
-    SampleRConfig as MeanFlowSampleRConfig,
     SampleTConfig as MeanFlowSampleTConfig,
 )
 from fastgen.methods import AnyFlowModel
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
 
 
-@attrs.define(slots=False)
+@attrs.define
 class ModelConfig(DMD2ModelConfig):
     """AnyFlow on-policy model config — DMD2 plus the rollout / cotrain knobs.
 
@@ -42,11 +39,21 @@ class ModelConfig(DMD2ModelConfig):
     ``cotrain_forward_kl``).
     """
 
+    # AnyFlow starts from fresh noise and completes its flow-map rollout in-iteration, so it
+    # requires the carry-free "default" mode. Real data is required only when the co-trained
+    # flow-map loss is enabled; cotrain_pretrain_weight=0 permits data-free training (the
+    # inherited GAN terms likewise require real data to be active).
+    backward_simulation: str | None = "default"
+
+    # The reference rollout uses flow-map ODE steps.
+    student_sample_type: str = "ode"
+
     # MeanFlow-style (t, r) sampling for the co-trained flow-map loss. Separate from
     # the inherited `sample_t_cfg`, which DMD2 uses for the noising time: the reference
     # draws these from its `scheduler` and the noising time from its `dmd_scheduler`.
+    # `cotrain_sample_r_overrides` changes `cotrain_sample_t_cfg` for r (None samples r like t).
     cotrain_sample_t_cfg: MeanFlowSampleTConfig = attrs.field(factory=MeanFlowSampleTConfig)
-    cotrain_sample_r_cfg: MeanFlowSampleRConfig = attrs.field(factory=MeanFlowSampleRConfig)
+    cotrain_sample_r_overrides: Optional[Dict[str, Any]] = None
     loss_config: MeanFlowLossConfig = attrs.field(factory=MeanFlowLossConfig)
 
     # Weight of the co-trained Stage-1 flow-map loss in the student update.
@@ -55,8 +62,12 @@ class ModelConfig(DMD2ModelConfig):
 
     # Rollout NFE list, sampled uniformly per iteration with rank-0 broadcast
     # (reference rollout_cfg.num_inference_steps_list). None falls back to
-    # the fixed student_sample_steps.
-    student_sample_steps_list: Optional[List[int]] = None
+    # ``student_grid_cfg.steps``.
+    student_steps_list: Optional[List[int]] = None
+
+    # Maximum number of differentiable student forwards in the compressed rollout.
+    # The reference first step -> fine step -> last step construction corresponds to 3.
+    max_steps_rollout: int = 3
 
     # Prediction-side guidance fusion for the co-trained flow-map loss; see
     # `config_mean_flow.ModelConfig`.
@@ -71,41 +82,36 @@ class ModelConfig(DMD2ModelConfig):
     cond_dropout_prob: Optional[float] = None
     cond_keys_no_dropout: List[str] = attrs.field(factory=list)
 
-    # Precision for autocast in the co-trained loss JVP (None disables autocast there).
+    # Autocast dtype for the co-trained loss JVP (None disables autocast there). The JVP state and its network input
+    # are kept in at least this dtype; the conditioning stays in precision_model. Unlike FastGen's own dropout, native
+    # dropout layers, such as LoRA's, replay the forward's masks only if this dtype equals precision_amp.
     precision_amp_jvp: str | None = None
 
-    # MeanFlow's target-side guidance knobs. AnyFlow typically guides on the
-    # PREDICTION side (`guidance_fuse_scale`), so these stay at their
-    # no-op defaults
-    guidance_mixture_ratio: Optional[float] = None
-    guidance_t_start: float = 0.0
-    guidance_t_end: float = 1.0
 
-
-@attrs.define(slots=False)
+@attrs.define
 class Config(BaseConfig):
     model: ModelConfig = attrs.field(factory=ModelConfig)
-    model_class: DictConfig = L(AnyFlowModel)(
-        config=None,
-    )
+    model_class: DictConfig = attrs.field(factory=lambda: L(AnyFlowModel)(config=None))
 
 
 def create_config():
     config = Config()
+    # Same callback set as DMD2's `create_config` (this stage trains a fake
+    # score net too, so it keeps the per-model grad-clip hooks, disabled by
+    # default) plus the EMA the flow-map student needs.
     config.trainer.callbacks = DictConfig(
         {
             **GradClip_CALLBACK,
+            "grad_clip_fake_score": L(GradClipCallback)(grad_norm=None, model_key="fake_score"),
+            "grad_clip_discriminator": L(GradClipCallback)(grad_norm=None, model_key="discriminator"),
             **EMA_CALLBACK,
-            **GPUStats_CALLBACK,
-            **TrainProfiler_CALLBACK,
-            **ParamCount_CALLBACK,
-            **WANDB_CALLBACK,
+            **BASE_CALLBACKS,
         }
     )
 
     # The student is a flow-map network with a dual-timestep input.
     config.model.use_ema = True
-    config.model.net.r_timestep = True
+    config.model.net.backbone.r_timestep = True
     config.model.net_scheduler.warm_up_steps = [0]
     config.model.fake_score_scheduler.warm_up_steps = [0]
     config.model.discriminator_scheduler.warm_up_steps = [0]

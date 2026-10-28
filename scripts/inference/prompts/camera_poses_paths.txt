@@ -1,0 +1,5 @@
+scripts/inference/examples/camera/00_child_swings_rusty_swing_set
+scripts/inference/examples/camera/01_impressionist_rubber_duck_sunset
+scripts/inference/examples/camera/02_two_cyclists_stop_sign
+scripts/inference/examples/camera/03_astronaut_cow_beach_van_gogh
+scripts/inference/examples/camera/04_bird_flying_church_tower_clock

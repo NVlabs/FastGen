@@ -1,22 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Configs for the sCM model, on CIFAR-10 dataset."""
+
 from typing import Any
 import copy
 
 import attrs
 from omegaconf import DictConfig
 
+from fastgen.configs.callbacks import BASE_CALLBACKS
 from fastgen.configs.callbacks import (
-    WANDB_CALLBACK,
     GradClip_CALLBACK,
     EMA_CALLBACK,
-    GPUStats_CALLBACK,
-    TrainProfiler_CALLBACK,
-    ParamCount_CALLBACK,
 )
 from fastgen.configs.opt import RAdamOptimizerConfig
-from fastgen.utils import LazyCall as L
+from fastgen.configs.instantiate import LazyCall as L
 from fastgen.configs.config import (
     BaseModelConfig,
     BaseConfig,
@@ -24,10 +23,8 @@ from fastgen.configs.config import (
 )
 from fastgen.methods import SCMModel
 
-""" Configs for the sCM model, on CIFAR-10 dataset. """
 
-
-@attrs.define(slots=False)
+@attrs.define
 class SampleTConfig(BaseSampleTConfig):
     """Config for sampling t from a time distribution for SCM."""
 
@@ -37,11 +34,9 @@ class SampleTConfig(BaseSampleTConfig):
 
     # sigma in data distribution
     sigma_data: float = 0.5
-    # quantize t
-    quantize: bool = False
 
 
-@attrs.define(slots=False)
+@attrs.define
 class LossConfig:
     """Config for the losses in sCM"""
 
@@ -51,20 +46,22 @@ class LossConfig:
     tangent_warmup_steps: int = 10000
     # tangent normalization constant
     tangent_warmup_const: float = 0.1
-    # enable prior weighting
-    prior_weighting_enabled: bool = True
+    # Extra 1 / (sigma_d tan t) loss weight on top of the paper's prior weighting, which is already the cos(t) in g.
+    # From github.com/xandergos/sCM-mnist (also in Sana-Sprint), whose author found it unstable and disabled it.
+    prior_weighting_enabled: bool = False
     # enable g_norm_spatial_invariance
     g_norm_spatial_invariance: bool = True
-    # enable divide_x_0_spatial_dim
-    divide_x_0_spatial_dim: bool = True
     # enable finite difference estimate of JVP
     use_jvp_finite_diff: bool = False
-    # episilon t in finite difference estimation of JVP
-    jvp_finite_diff_eps: float = 1e-3
+    # step in TrigFlow time of the finite-difference JVP estimate
+    jvp_finite_diff_eps: float = 5e-4
 
 
-@attrs.define(slots=False)
+@attrs.define
 class ModelConfig(BaseModelConfig):
+    # The inherited guidance_cfg drives the TrigFlow-wrapped teacher: piecewise ``boundary`` values are in TrigFlow
+    # time t_hat = atan2(sigma, alpha * sigma_data), not the wrapped network's time.
+
     # config for sampling t
     sample_t_cfg: SampleTConfig = attrs.field(factory=SampleTConfig)
 
@@ -77,16 +74,16 @@ class ModelConfig(BaseModelConfig):
     # optimizer
     net_optimizer: DictConfig = attrs.field(factory=lambda: copy.deepcopy(RAdamOptimizerConfig))
 
-    # precision for autocast in JVP (none disables autocast in the JVP region)
+    # Autocast dtype for the JVP (None disables autocast there). The JVP state and its network input are kept in at
+    # least this dtype; the conditioning stays in precision_model. Unlike FastGen's own dropout, native dropout layers,
+    # such as LoRA's, replay the forward's masks only if this dtype equals precision_amp.
     precision_amp_jvp: str | None = None
 
 
-@attrs.define(slots=False)
+@attrs.define
 class Config(BaseConfig):
     model: ModelConfig = attrs.field(factory=ModelConfig)
-    model_class: DictConfig = L(SCMModel)(
-        config=None,
-    )
+    model_class: DictConfig = attrs.field(factory=lambda: L(SCMModel)(config=None))
 
 
 def create_config():
@@ -95,25 +92,23 @@ def create_config():
         {
             **GradClip_CALLBACK,
             **EMA_CALLBACK,
-            **GPUStats_CALLBACK,
-            **TrainProfiler_CALLBACK,
-            **ParamCount_CALLBACK,
-            **WANDB_CALLBACK,
+            **BASE_CALLBACKS,
         }
     )
     config.trainer.callbacks.grad_clip.grad_norm = 1000000
-    config.trainer.tf32_enabled = False
+    config.trainer.tf32_conv = False
+    config.trainer.fp16_reduced_precision_reduction = False
 
     config.trainer.callbacks.ema.type = "halflife"
 
-    config.model.net.dropout = 0.2  # set dropout=0.2 for cifar10, by default
+    config.model.net.backbone.dropout = 0.2  # set dropout=0.2 for cifar10, by default
     config.model.net_optimizer.betas = (0.9, 0.99)
     config.model.net_optimizer.weight_decay = 0.0
 
     config.model.net_scheduler.warm_up_steps = [0]
     # During inference, sigma_shift can improve 2-step results
     # config.model.net.sigma_shift = 0.003
-    config.model.net.label_dim = 0
+    config.model.net.backbone.label_dim = 0
 
     # dataloader (unconditional CIFAR-10)
     config.dataloader_train.use_labels = False

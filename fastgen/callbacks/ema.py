@@ -7,10 +7,11 @@ from typing import Callable, TYPE_CHECKING, Optional
 
 import torch
 import wandb
+from torch.distributed.tensor import DTensor
 
 from fastgen.callbacks.callback import Callback
 from fastgen.utils.basic_utils import get_batch_size_total
-from fastgen.utils.distributed import synchronize, is_rank0
+from fastgen.utils.distributed import is_rank0
 import fastgen.utils.logging_utils as logger
 
 if TYPE_CHECKING:
@@ -31,7 +32,6 @@ class EMACallback(Callback):
         start_iter: int = 0,
         ema_name: str = "ema",
         batch_size: int = 1,  # overwritten by self.config if it exists
-        fsdp: bool = False,  # overwritten by self.config if it exists
     ):
         self.type = type
         self.beta = beta
@@ -41,18 +41,15 @@ class EMACallback(Callback):
         self.start_iter = start_iter
         self.ema_name = ema_name
         self.batch_size = batch_size
-        self._is_fsdp = fsdp
         self._enabled = True
+        self._warned_missing_tensors: set[tuple[str, str]] = set()
 
     def on_app_begin(self) -> None:
         if hasattr(self, "config"):
             # override using config
-            self._is_fsdp = self.config.trainer.fsdp
             self.batch_size = get_batch_size_total(self.config)
 
-    def on_model_init_end(
-        self, model: FastGenModel | torch.nn.parallel.DistributedDataParallel, iteration: int = 0
-    ) -> None:
+    def on_model_init_end(self, model: FastGenModel | torch.nn.parallel.DistributedDataParallel) -> None:
         # Unwrap DDP if needed to access the original model's attributes
         if hasattr(model, "module"):
             model = model.module
@@ -67,6 +64,13 @@ class EMACallback(Callback):
         assert ema.training is False, f"EMA {self.ema_name} should be in eval mode"
         for name, p_net in ema.named_parameters():
             assert not p_net.requires_grad, f"EMA parameter {name} should not require gradients"
+
+        dtypes = sorted({str(p.dtype) for p in ema.parameters() if p.dtype in (torch.float16, torch.bfloat16)})
+        if dtypes:
+            logger.warning(
+                f"EMA {self.ema_name} parameters are stored in {', '.join(dtypes)}, where updates with beta close "
+                'to 1 round away. Set `model.precision_opt="float32"` to keep the EMA moving.'
+            )
 
     def _total_iteration(self, model: FastGenModel, iteration: int) -> int:
         if hasattr(model, "resume_iter"):
@@ -90,6 +94,77 @@ class EMACallback(Callback):
         ema_beta = 0.5 ** (batch_size / max(ema_halflife_nimg, 1e-8))
         return ema_beta
 
+    @staticmethod
+    def _collect_named_tensors(named_tensors, owner: str = "module", kind: str = "tensor") -> dict[str, torch.Tensor]:
+        """Index parameters or buffers by their wrapper-independent name."""
+        tensors = {}
+        for raw_name, tensor in named_tensors:
+            name = raw_name.replace("_checkpoint_wrapped_module.", "")
+            if name in tensors:
+                raise RuntimeError(f"Duplicate canonical {kind} name {name!r} in {owner}.")
+            tensors[name] = tensor
+        return tensors
+
+    @staticmethod
+    def _validate_tensor_pair(
+        name: str,
+        ema_tensor: torch.Tensor,
+        net_tensor: torch.Tensor,
+        kind: str = "tensor",
+        shape_kind: str | None = None,
+    ) -> None:
+        """Validate the shape shared by an EMA tensor and its student source.
+
+        Device and dtype may differ intentionally: the update casts the student tensor to
+        the EMA tensor, and CPU offload may place otherwise compatible tensors differently.
+        """
+        if tuple(ema_tensor.shape) != tuple(net_tensor.shape):
+            shape = "shape" if shape_kind is None else f"{shape_kind} shape"
+            raise RuntimeError(
+                f"EMA {kind} {name!r} has {shape} {tuple(ema_tensor.shape)}, "
+                f"but the student {kind} has {tuple(net_tensor.shape)}."
+            )
+
+    @classmethod
+    def _validate_dtensor_pair(
+        cls,
+        name: str,
+        ema_tensor: DTensor,
+        net_tensor: torch.Tensor,
+        kind: str = "tensor",
+    ) -> None:
+        """Validate matching global and local layouts for a pair of sharded tensors."""
+        if not isinstance(net_tensor, DTensor):
+            raise RuntimeError(f"EMA {kind} {name!r} is sharded but the corresponding student {kind} is not.")
+        if ema_tensor.device_mesh != net_tensor.device_mesh:
+            raise RuntimeError(f"EMA {kind} {name!r} has a different device mesh from the student {kind}.")
+        if ema_tensor.placements != net_tensor.placements:
+            raise RuntimeError(
+                f"EMA {kind} {name!r} has placements {ema_tensor.placements}, "
+                f"but the student {kind} has {net_tensor.placements}."
+            )
+        cls._validate_tensor_pair(
+            name,
+            ema_tensor,
+            net_tensor,
+            kind=kind,
+            shape_kind="global",
+        )
+        cls._validate_tensor_pair(
+            name,
+            ema_tensor.to_local(),
+            net_tensor.to_local(),
+            kind=kind,
+            shape_kind="local",
+        )
+
+    def _warn_missing_tensor(self, name: str, kind: str = "tensor") -> None:
+        """Warn once per student tensor without an EMA counterpart, so its update is skipped."""
+        if (kind, name) in self._warned_missing_tensors:
+            return
+        self._warned_missing_tensors.add((kind, name))
+        logger.warning(f"EMA {kind} {name} not found, skipping update.")
+
     def on_training_step_end(
         self,
         model: FastGenModel,
@@ -103,6 +178,8 @@ class EMACallback(Callback):
         # Check if EMA is enabled
         if not self._enabled:
             return
+
+        ema = getattr(model, self.ema_name)
 
         # Get total iteration and skip if before start_iter
         total_iteration = self._total_iteration(model, iteration)
@@ -121,49 +198,52 @@ class EMACallback(Callback):
             raise ValueError(f"Invalid {self.ema_name} type: {self.type}")
 
         with torch.no_grad():
-            ema = getattr(model, self.ema_name)
-            ema_state_dict = ema.state_dict()
+            # Trainer establishes sharded state before the step-end callback chain. Any
+            # earlier callback that materializes these roots owns that intra-chain handoff.
+            net_params = self._collect_named_tensors(model.net.named_parameters(), owner="student", kind="parameter")
+            ema_params = self._collect_named_tensors(
+                ema.named_parameters(),
+                owner=self.ema_name,
+                kind="parameter",
+            )
+            for name, net_param in net_params.items():
+                ema_param = ema_params.get(name)
+                if ema_param is None:
+                    self._warn_missing_tensor(name, kind="parameter")
+                    continue
 
-            for name, p_net in model.net.named_parameters():
-                if self._is_fsdp and hasattr(p_net, "full_tensor"):
-                    # Gather the full tensor from all ranks if using FSDP with DTensor
-                    # When CPU offloading is enabled, we need to move to CUDA first because
-                    # full_tensor() performs an all_gather which requires a CUDA backend
-                    if p_net.device.type == "cpu":
-                        # Move local shard to CUDA, gather, then the result stays on CUDA
-                        # which is fine since we'll copy to EMA (which handles device placement)
-                        full_tensor = p_net.to("cuda").full_tensor()
-                    else:
-                        full_tensor = p_net.full_tensor()
+                if isinstance(ema_param, DTensor):
+                    self._validate_dtensor_pair(name, ema_param, net_param, kind="parameter")
+                    ema_param = ema_param.to_local()
+                    net_param = net_param.to_local()
                 else:
-                    full_tensor = p_net
-                # Strip checkpoint wrapper prefix if present (EMA doesn't have checkpointing)
-                ema_name = name.replace("_checkpoint_wrapped_module.", "")
-                # Cast to EMA dtype and device for lerp_ compatibility
-                if ema_name in ema_state_dict:
-                    ema_param = ema_state_dict[ema_name]
-                    if total_iteration == self.start_iter:
-                        # re-initialize EMA parameter
-                        ema_param.copy_(full_tensor.to(device=ema_param.device, dtype=ema_param.dtype))
-                    else:
-                        # interpolate EMA parameter
-                        ema_param.lerp_(full_tensor.to(device=ema_param.device, dtype=ema_param.dtype), 1.0 - beta)
-                elif iteration == 1:
-                    # only warn on first iteration if parameter is not found
-                    logger.warning(f"EMA parameter {ema_name} not found in EMA state dict, skipping update.")
+                    if hasattr(net_param, "full_tensor"):
+                        # Compatibility path for a sharded student with a replicated EMA. A live
+                        # sharded EMA takes the branch above and never materializes a full parameter.
+                        if isinstance(net_param, DTensor) and net_param.to_local().device.type == "cpu":
+                            net_param = net_param.to("cuda")
+                        net_param = net_param.full_tensor()
+                    self._validate_tensor_pair(name, ema_param, net_param, kind="parameter")
+
+                net_param = net_param.to(device=ema_param.device, dtype=ema_param.dtype)
+                if total_iteration == self.start_iter:
+                    ema_param.copy_(net_param)
+                else:
+                    ema_param.lerp_(net_param, 1.0 - beta)
 
             # FSDP2 doesn't shard buffers, so we can just copy them
-            for name, p_net in model.net.named_buffers():
-                if name in ema_state_dict:
-                    ema_param = ema_state_dict[name]
-                    ema_param.copy_(p_net.to(device=ema_param.device, dtype=ema_param.dtype))
-                elif iteration == 1:
-                    # only warn on first iteration if buffer is not found
-                    logger.warning(f"EMA buffer {name} not found in EMA state dict, skipping update.")
+            net_buffers = self._collect_named_tensors(model.net.named_buffers(), owner="student", kind="buffer")
+            ema_buffers = self._collect_named_tensors(ema.named_buffers(), owner=self.ema_name, kind="buffer")
+            for name, p_net in net_buffers.items():
+                if name not in ema_buffers:
+                    self._warn_missing_tensor(name, kind="buffer")
+                    continue
+                ema_buffer = ema_buffers[name]
+                self._validate_tensor_pair(name, ema_buffer, p_net, kind="buffer")
+                ema_buffer.copy_(p_net.to(device=ema_buffer.device, dtype=ema_buffer.dtype))
 
             if hasattr(self, "config"):
                 # only wandb log when config exists
                 if iteration % self.config.trainer.logging_iter == 0 and is_rank0():
                     if wandb.run:
                         wandb.log({f"ema/{self.ema_name}_beta": beta}, step=iteration)
-        synchronize()

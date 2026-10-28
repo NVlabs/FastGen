@@ -8,13 +8,15 @@ on:
 
 env:
   WANDB_MODE: disabled
+  # Keep pip's cache inside the workspace so the actions/cache step below can save and restore it.
+  PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
 
 jobs:
   lint:
     runs-on: [FG_Runner]
     
     container:
-      image: ghcr.io/juliusberner/fastgen:0.0.3c
+      image: ghcr.io/juliusberner/fastgen:0.0.6
       options: --entrypoint "" --gpus all --shm-size=8g
       credentials:
         username: ${{ github.actor }}
@@ -48,7 +50,7 @@ jobs:
     runs-on: [FG_Runner]
     
     container:
-      image: ghcr.io/juliusberner/fastgen:0.0.3c
+      image: ghcr.io/juliusberner/fastgen:0.0.6
       options: --entrypoint "" --gpus all --shm-size=8g
       credentials:
         username: ${{ github.actor }}
@@ -68,9 +70,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-mypy-
 
-      - name: Increase file descriptor limit
-        run: ulimit -n 4096 || echo "Could not increase file descriptor limit"
-
       - name: Run Pytest
         run: make pytest
 
@@ -79,7 +78,7 @@ jobs:
     runs-on: [FG_Runner] 
     
     container:
-      image: ghcr.io/juliusberner/fastgen:0.0.3c
+      image: ghcr.io/juliusberner/fastgen:0.0.6
       options: --entrypoint "" --gpus all --shm-size=8g
       credentials:
         username: ${{ github.actor }}

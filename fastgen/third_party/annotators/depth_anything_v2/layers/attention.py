@@ -31,7 +31,7 @@ try:
 
     XFORMERS_AVAILABLE = True
 except ImportError:
-    logger.warning("xFormers not available")
+    logger.debug("xFormers not available")
     XFORMERS_AVAILABLE = False
 
 

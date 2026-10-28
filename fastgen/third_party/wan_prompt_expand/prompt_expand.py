@@ -312,7 +312,6 @@ class QwenPromptExpander(PromptExpander):
 
         expanded_prompt = self.tokenizer.batch_decode(
             generated_ids, skip_special_tokens=True)[0]
-        self.model = self.model.to("cpu")
         return PromptOutput(
             status=True,
             prompt=expanded_prompt,
@@ -373,7 +372,6 @@ class QwenPromptExpander(PromptExpander):
             generated_ids_trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False)[0]
-        self.model = self.model.to("cpu")
         return PromptOutput(
             status=True,
             prompt=expanded_prompt,

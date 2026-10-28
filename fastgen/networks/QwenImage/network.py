@@ -14,48 +14,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import types
 
 import numpy as np
 import torch
 import torch.utils.checkpoint
-from torch import dtype
 from torch.distributed.fsdp import fully_shard
 
 from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKLQwenImage
 from diffusers.models import QwenImageTransformer2DModel
 from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformerBlock
 from diffusers.models.transformers.transformer_qwenimage import QwenEmbedRope
-from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, PretrainedConfig
+from diffusers.models.embeddings import TimestepEmbedding
+from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
 
-from fastgen.networks.network import FastGenNetwork
+from fastgen.networks.network import FastGenNetwork, FastGenModule
+from fastgen.networks.lora_utils import LoRAMixin
 
-from fastgen.networks.noise_schedule import NET_PRED_TYPES
-from fastgen.utils.basic_utils import str2bool
+from fastgen.utils.basic_utils import attr_override
 from fastgen.utils.distributed.fsdp import apply_fsdp_checkpointing
+from fastgen.utils.guidance import (
+    GuidanceConfig,
+    apply_cfg,
+    apply_mix,
+    apply_rescale,
+    GuidanceContext,
+    predict_with_guidance,
+)
+from fastgen.utils.env import hf_load
+from fastgen.utils.tree_utils import OutputDtype, assert_same
 import fastgen.utils.logging_utils as logger
 
 
-# Workaround for transformers<4.50 bug: Qwen2.5-VL config has sub-configs as plain dicts
-# but GenerationConfig.from_model_config() expects .to_dict() on them.
-_sub_config_names = ("decoder", "generator", "text_config", "text_encoder")
-_orig_get_text_config = PretrainedConfig.get_text_config
-
-
-def _patched_get_text_config(self, decoder=False):
-    for name in _sub_config_names:
-        val = getattr(self, name, None)
-        if isinstance(val, dict):
-            setattr(self, name, PretrainedConfig(**val))
-    return _orig_get_text_config(self, decoder=decoder)
-
-
-PretrainedConfig.get_text_config = _patched_get_text_config
-
-
-class QwenImageTextEncoder:
+class QwenImageTextEncoder(FastGenModule):
     """Text encoder for Qwen-Image using Qwen2.5-VL-7B-Instruct.
 
     Uses a single VLM (Qwen2.5-VL-7B) to encode text prompts into embeddings
@@ -69,32 +61,27 @@ class QwenImageTextEncoder:
     )
     PROMPT_TEMPLATE_DROP_IDX = 34
 
-    def __init__(self, model_id: str, torch_dtype: Optional[dtype] = torch.bfloat16):
+    def __init__(self, model_id_or_local_path: str, dtype: Optional[torch.dtype] = torch.bfloat16):
         """
         Args:
-            model_id: The HuggingFace model ID to load.
-            torch_dtype: The data type for the output embeddings. Default to bfloat16 for Qwen image text encoder.
-            Note that setting it to float32 will produce embeddings with large
-            differences compared to bfloat16, leading to poor performance.
+            model_id_or_local_path: The HuggingFace model ID or local path to load.
+            dtype: Data type used to load the text encoder weights. Defaults to
+                bfloat16; loading them in float32 produces embeddings with large
+                differences from the bfloat16 path, leading to poor performance.
         """
-        local_files_only = str2bool(os.getenv("LOCAL_FILES_ONLY", "false"))
-        cache_dir = os.environ["HF_HOME"]
+        super().__init__()
 
-        self.tokenizer = Qwen2Tokenizer.from_pretrained(
-            model_id,
-            cache_dir=cache_dir,
+        self.tokenizer = hf_load(
+            Qwen2Tokenizer.from_pretrained,
+            model_id_or_local_path,
             subfolder="tokenizer",
-            local_files_only=local_files_only,
         )
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_id,
-            cache_dir=cache_dir,
+        self.text_encoder = hf_load(
+            Qwen2_5_VLForConditionalGeneration.from_pretrained,
+            model_id_or_local_path,
             subfolder="text_encoder",
-            local_files_only=local_files_only,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
         )
-        self.text_encoder.eval().requires_grad_(False)
-        self.max_sequence_length = 1024
 
     @staticmethod
     def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor) -> list:
@@ -107,14 +94,12 @@ class QwenImageTextEncoder:
     def encode(
         self,
         conditioning: Optional[Any] = None,
-        precision: dtype = torch.float32,
         max_sequence_length: int = 512,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode text prompts to embeddings.
 
         Args:
             conditioning: Text prompt(s) to encode.
-            precision: Data type for the output embeddings.
             max_sequence_length: Maximum sequence length for tokenization.
 
         Returns:
@@ -134,17 +119,29 @@ class QwenImageTextEncoder:
             padding=True,
             truncation=True,
             return_tensors="pt",
-        ).to(self.text_encoder.device)
+        )
+        return self(
+            txt_tokens.input_ids.to(self.device),
+            txt_tokens.attention_mask.to(self.device),
+            max_sequence_length=max_sequence_length,
+        )
 
-        with torch.no_grad():
-            outputs = self.text_encoder(
-                input_ids=txt_tokens.input_ids,
-                attention_mask=txt_tokens.attention_mask,
-                output_hidden_states=True,
-            )
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_sequence_length: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        drop_idx = self.PROMPT_TEMPLATE_DROP_IDX
+        outputs = self.text_encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            logits_to_keep=1,  # only hidden_states is used; skips the full-vocabulary lm_head projection
+        )
 
         hidden_states = outputs.hidden_states[-1]
-        split_hidden_states = self._extract_masked_hidden(hidden_states, txt_tokens.attention_mask)
+        split_hidden_states = self._extract_masked_hidden(hidden_states, attention_mask)
         split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
         attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
 
@@ -160,34 +157,40 @@ class QwenImageTextEncoder:
         prompt_embeds = prompt_embeds[:, :max_sequence_length]
         encoder_attention_mask = encoder_attention_mask[:, :max_sequence_length]
 
-        return prompt_embeds.to(dtype=precision), encoder_attention_mask
-
-    def to(self, *args, **kwargs):
-        """Moves the model to the specified device."""
-        self.text_encoder.to(*args, **kwargs)
-        return self
+        return prompt_embeds, encoder_attention_mask
 
 
-class QwenImageImageEncoder:
+class QwenImageImageEncoder(FastGenModule):
     """VAE encoder/decoder for Qwen-Image (Wan 2.1 based).
 
     Uses per-channel latents_mean/latents_std normalization instead of
     Flux's scalar shift_factor/scaling_factor. The VAE operates on 5D
     tensors [B, C, T, H, W] so we add/remove the temporal dimension.
+
+    The official Qwen-Image repository does not contain a separate native VAE
+    implementation: its executable reference is the Diffusers pipeline, loaded as a
+    whole in BF16 on CUDA by the official examples. That pipeline applies these
+    statistics outside ``AutoencoderKLQwenImage`` in the VAE/result dtype and casts
+    denoised state to ``vae.dtype`` before the inverse. This wrapper retains that
+    boundary ordering and returns results in the VAE dtype.
     """
 
-    def __init__(self, model_id: str):
-        self.vae: AutoencoderKLQwenImage = AutoencoderKLQwenImage.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="vae",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
+    def __init__(self, model_id_or_local_path: str):
+        super().__init__()
+        self.vae: AutoencoderKLQwenImage = hf_load(
+            AutoencoderKLQwenImage.from_pretrained, model_id_or_local_path, subfolder="vae"
         )
-        self.vae.eval().requires_grad_(False)
 
-        # Per-channel normalization vectors (16 elements each)
-        self.latents_mean = torch.tensor(self.vae.config.latents_mean).view(1, -1, 1, 1)
-        self.latents_std = torch.tensor(self.vae.config.latents_std).view(1, -1, 1, 1)
+        # Keep auxiliary constants as Python values so ambient meta construction
+        # cannot strand undeclared tensors that preparation cannot materialize.
+        self.latents_mean = tuple(self.vae.config.latents_mean)
+        self.latents_std = tuple(self.vae.config.latents_std)
+
+    @property
+    def latent_compression_factors(self) -> tuple[int, int]:
+        """Pixel-to-latent ``(H, W)`` downsampling of the VAE: every downsampling stage halves the resolution."""
+        factor = 2 ** len(self.vae.config.temperal_downsample)
+        return (factor, factor)
 
     def encode(self, real_images: torch.Tensor) -> torch.Tensor:
         """Encode images to latent space.
@@ -198,16 +201,35 @@ class QwenImageImageEncoder:
         Returns:
             torch.Tensor: Normalized latent representations [B, 16, H//8, W//8].
         """
-        # VAE expects 5D: [B, C, T, H, W] with T=1 for images
-        x = real_images.unsqueeze(2)
-        latents = self.vae.encode(x, return_dict=False)[0].sample()
-        # Remove temporal dim: [B, 16, 1, H', W'] -> [B, 16, H', W']
-        latents = latents.squeeze(2)
-        # Normalize per-channel: (latents - mean) / std
-        mean = self.latents_mean.to(latents.device, latents.dtype)
-        std = self.latents_std.to(latents.device, latents.dtype)
-        latents = (latents - mean) / std
-        return latents
+        return self(real_images, operation="encode")
+
+    def forward(self, data: torch.Tensor, operation: str) -> torch.Tensor:
+        if operation == "encode":
+            # VAE expects 5D: [B, C, T, H, W] with T=1 for images
+            latents = self.vae.encode(
+                data.unsqueeze(2).to(dtype=self.precision_model),
+                return_dict=False,
+            )[0].sample()
+            # Remove temporal dim: [B, 16, 1, H', W'] -> [B, 16, H', W']
+            latents = latents.squeeze(2)
+            # Normalize per-channel: (latents - mean) / std
+            mean = torch.as_tensor(self.latents_mean, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1)
+            std = torch.as_tensor(self.latents_std, device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1)
+            return (latents - mean) / std
+        if operation == "decode":
+            # De-normalize per-channel: latents * std + mean
+            model_latents = data.to(dtype=self.precision_model)
+            mean = torch.as_tensor(self.latents_mean, device=model_latents.device, dtype=model_latents.dtype).view(
+                1, -1, 1, 1
+            )
+            std = torch.as_tensor(self.latents_std, device=model_latents.device, dtype=model_latents.dtype).view(
+                1, -1, 1, 1
+            )
+            latents = (model_latents * std + mean).unsqueeze(2)
+            images = self.vae.decode(latents, return_dict=False)[0]
+            # Remove temporal dim: [B, C, T, H, W] -> [B, C, H, W]
+            return images[:, :, 0].clip(-1.0, 1.0)
+        raise ValueError(f"Unsupported preprocessor operation: {operation!r}")
 
     def decode(self, latent_images: torch.Tensor) -> torch.Tensor:
         """Decode latents to images.
@@ -218,31 +240,18 @@ class QwenImageImageEncoder:
         Returns:
             torch.Tensor: Decoded images in [-1, 1] range, shape [B, C, H, W].
         """
-        # De-normalize per-channel: latents * std + mean
-        mean = self.latents_mean.to(latent_images.device, latent_images.dtype)
-        std = self.latents_std.to(latent_images.device, latent_images.dtype)
-        latents = latent_images * std + mean
-        # Add temporal dim: [B, C, H', W'] -> [B, C, 1, H', W']
-        latents = latents.unsqueeze(2)
-        images = self.vae.decode(latents, return_dict=False)[0]
-        # Remove temporal dim: [B, C, T, H, W] -> [B, C, H, W]
-        images = images[:, :, 0]
-        return images.clip(-1.0, 1.0)
-
-    def to(self, *args, **kwargs):
-        """Moves the model to the specified device."""
-        self.vae.to(*args, **kwargs)
-        return self
+        return self(latent_images, operation="decode")
 
 
 def classify_forward(
     self,
     hidden_states: torch.Tensor,
+    img_shapes: List,
     encoder_hidden_states: torch.Tensor = None,
     encoder_hidden_states_mask: torch.Tensor = None,
     timestep: torch.LongTensor = None,
-    img_shapes: Optional[List] = None,
-    txt_seq_lens: Optional[List[int]] = None,
+    r: Optional[torch.Tensor] = None,
+    guidance: Optional[torch.Tensor] = None,
     attention_kwargs: Optional[Dict[str, Any]] = None,
     return_features_early: bool = False,
     feature_indices: Optional[Set[int]] = None,
@@ -257,11 +266,10 @@ def classify_forward(
 
     Args:
         hidden_states: Input packed latent states [B, seq_len, in_channels].
+        img_shapes: Packed image shapes, e.g. [[(1, H, W)]], for RoPE and the ``[B, C, H, W]`` feature reshape.
         encoder_hidden_states: Text encoder hidden states [B, text_seq_len, 3584].
         encoder_hidden_states_mask: Text attention mask [B, text_seq_len].
         timestep: Current timestep in [0, 1] range.
-        img_shapes: Image spatial shapes for RoPE, e.g. [[(1, H, W)]].
-        txt_seq_lens: Text sequence lengths per batch item.
         attention_kwargs: Additional attention kwargs.
         return_features_early: If True, return features as soon as collected.
         feature_indices: Set of block indices to extract features from.
@@ -270,23 +278,27 @@ def classify_forward(
     Returns:
         Model output, optionally with features or logvar.
     """
-    if feature_indices is None:
-        feature_indices = set()
-
-    if return_features_early and len(feature_indices) == 0:
-        return []
-
     features = []
+
+    # diffusers >= 0.39 concatenates this mask with a *bool* image mask inside
+    # QwenDoubleStreamAttnProcessor2_0; a long mask promotes that to int64, which SDPA rejects.
+    # Upstream normalizes the mask inside its own forward (compute_text_seq_len_from_mask), but
+    # classify_forward replaces that forward entirely -- so we redo the coercion here.
+    if encoder_hidden_states_mask is not None and encoder_hidden_states_mask.dtype != torch.bool:
+        encoder_hidden_states_mask = encoder_hidden_states_mask.bool()
 
     # Store spatial size for feature reshaping
     # hidden_states: [B, seq_len, C*4] where seq_len = (H//2) * (W//2)
-    seq_len = hidden_states.shape[1]
-    spatial_size = (
-        (img_shapes[0][0][1], img_shapes[0][0][2]) if img_shapes is not None else (int(seq_len**0.5), int(seq_len**0.5))
-    )
+    spatial_size = (img_shapes[0][0][1], img_shapes[0][0][2])
 
     # 1. Patch embedding
     hidden_states = self.img_in(hidden_states)
+
+    # Qwen's official repo delegates to Diffusers; QwenImageTransformer2DModel
+    # casts raw time to the hidden dtype before computing the sinusoid.
+    timestep = timestep.to(hidden_states.dtype)
+    r = None if r is None else r.to(hidden_states.dtype)
+    guidance = None if guidance is None else guidance.to(hidden_states.dtype)
 
     # 2. Text processing
     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
@@ -295,8 +307,33 @@ def classify_forward(
     # 3. Time embedding (QwenTimestepProjEmbeddings takes timestep and hidden_states for dtype)
     temb = self.time_text_embed(timestep, hidden_states)
 
-    # 4. RoPE (handled internally by QwenEmbedRope)
-    image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+    # 3b. Second-timestep (``r``) embedding for flow-map methods: a fresh additive
+    # ``r_embedder`` (zero-init -> no-op at start). ``time_proj`` bakes in the *1000
+    # scale, so ``r`` is passed in [0, 1].
+    if getattr(self, "r_embedder", None) is not None and r is not None:
+        r_in = (timestep - r) if self.time_cond_type == "diff" else r
+        r_proj = self.time_text_embed.time_proj(r_in)
+        temb = temb + self.r_embedder(r_proj.to(hidden_states.dtype))
+    elif getattr(self, "r_embedder", None) is None and r is not None:
+        raise ValueError("`r` was provided but the network has no `r_embedder` (set net.r_timestep=True).")
+
+    # 3c. Guidance (CFG-scale) embedding for guidance distillation: the raw scale
+    # feeds the shared ``time_proj`` (which already bakes the *1000 phase scale);
+    # zero-init -> no-op at start.
+    if getattr(self, "guidance_embedder", None) is not None and guidance is not None:
+        guidance_proj = self.time_text_embed.time_proj(guidance)
+        temb = temb + self.guidance_embedder(guidance_proj.to(hidden_states.dtype))
+    elif getattr(self, "guidance_embedder", None) is None and guidance is not None:
+        raise ValueError(
+            "`guidance` was provided but the network has no `guidance_embedder` (set net.guidance_embeds=True)."
+        )
+
+    # 4. RoPE (handled internally by QwenEmbedRope). The text table must span the padded text length, as upstream
+    # does since https://github.com/huggingface/diffusers/pull/12702: a mask-derived length is shorter whenever
+    # every row is padded, and then fails to broadcast against the text tokens.
+    image_rotary_emb = self.pos_embed(
+        img_shapes, max_txt_seq_len=encoder_hidden_states.shape[1], device=hidden_states.device
+    )
 
     # 5. Transformer blocks (single list of 60 dual-stream blocks)
     for idx, block in enumerate(self.transformer_blocks):
@@ -320,13 +357,13 @@ def classify_forward(
             )
 
         # Extract features at specified block indices
-        if idx in feature_indices:
+        if feature_indices is not None and idx in feature_indices:
             feat = hidden_states.clone()
             B, S, C = feat.shape
             feat = feat.permute(0, 2, 1).reshape(B, C, spatial_size[0], spatial_size[1])
             features.append(feat)
 
-        if return_features_early and len(features) == len(feature_indices):
+        if return_features_early and feature_indices is not None and len(features) == len(feature_indices):
             return features
 
     # 6. Final projection
@@ -334,14 +371,11 @@ def classify_forward(
     output = self.proj_out(hidden_states)
 
     if return_features_early:
+        assert feature_indices is not None
         assert len(features) == len(feature_indices), f"{len(features)} != {len(feature_indices)}"
         return features
 
-    # Prepare output
-    if len(feature_indices) == 0:
-        out = output
-    else:
-        out = [output, features]
+    out = [output, features] if feature_indices is not None else output
 
     if return_logvar:
         logvar = self.logvar_linear(temb)
@@ -350,7 +384,23 @@ def classify_forward(
     return out
 
 
-class QwenImage(FastGenNetwork):
+DEFAULT_QWEN_LORA_TARGETS: List[str] = [
+    "to_q",
+    "to_k",
+    "to_v",
+    "to_out.0",
+    "add_q_proj",
+    "add_k_proj",
+    "add_v_proj",
+    "to_add_out",
+    "img_mlp.net.0.proj",
+    "img_mlp.net.2",
+    "txt_mlp.net.0.proj",
+    "txt_mlp.net.2",
+]
+
+
+class QwenImage(LoRAMixin, FastGenNetwork):
     """Qwen-Image network for text-to-image generation.
 
     A ~20B parameter MMDiT model using flow matching with true classifier-free guidance.
@@ -360,32 +410,69 @@ class QwenImage(FastGenNetwork):
     """
 
     MODEL_ID = "Qwen/Qwen-Image"
+    latent_compression_factors = (8, 8)
 
     def __init__(
         self,
-        model_id: str = MODEL_ID,
+        model_id_or_local_path: str = MODEL_ID,
         net_pred_type: str = "flow",
         schedule_type: str = "rf",
         disable_grad_ckpt: bool = False,
         load_pretrained: bool = True,
-        **model_kwargs,
+        r_timestep: bool = False,
+        r_embedder_init: str = "zero",
+        time_cond_type: str = "diff",
+        guidance_embeds: bool = False,
+        guidance_embedder_init: str = "zero",
+        guidance_scale: Optional[float] = None,
+        **schedule_kwargs,
     ):
         """QwenImage constructor.
 
         Args:
-            model_id: The HuggingFace model ID to load. Defaults to "Qwen/Qwen-Image".
+            model_id_or_local_path: The HuggingFace model ID or local path to load. Defaults to "Qwen/Qwen-Image".
             net_pred_type: Prediction type. Defaults to "flow" for flow matching.
-            schedule_type: Schedule type. Defaults to "rf" (rectified flow).
-            disable_grad_ckpt: Whether to disable gradient checkpointing during training.
-                Defaults to False. Set to True when using FSDP to avoid memory access errors.
+            schedule_type: Schedule type. Defaults to "rf" (rectified flow), which the released weights require.
+            disable_grad_ckpt: Disable activation checkpointing. FSDP needs no override: ``fully_shard``
+                replaces the Diffusers checkpointing with FSDP-compatible wrappers.
             load_pretrained: Whether to load pretrained weights.
+            r_timestep: Whether to support a second timestep (flow-map / mean-flow /
+                AYF methods) via an additive ``r_embedder``.
+            r_embedder_init: ``"zero"`` (no-op at init), ``"warm"`` (pretrained
+                linear_1 features, zero linear_2 -- still a no-op), or ``"pretrained"``
+                (initialize from the pretrained time embedder).
+            time_cond_type: ``"diff"`` embeds ``t - r``; ``"abs"`` embeds ``r``.
+            guidance_embeds: Attach an additive zero-init ``guidance_embedder`` so a
+                distilled student can condition on a CFG-scale value (Qwen-Image
+                itself is not guidance-distilled).
+            guidance_embedder_init: ``"zero"`` (fresh linear_1) or ``"pretrained"``
+                (linear_1 from the pretrained time embedder). linear_2 is always
+                zeroed, so the embedder is a no-op at init either way.
+            guidance_scale: Default embedded guidance value, auto-filled by
+                ``forward`` (FLUX contract); requires ``guidance_embeds=True``.
         """
-        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **model_kwargs)
+        # Only the released weights fix the time convention; weights trained from scratch learn their schedule's.
+        if load_pretrained and schedule_type != "rf":
+            raise ValueError(
+                f"Qwen-Image's released weights read the raw time t as the noise level, which holds only for "
+                f"rectified flow; `schedule_type` must be 'rf', got {schedule_type!r}."
+            )
+        # The native sampler grids start at sigma 1.0, so the raw-time bound defaults to 1.0 (configs may lower it).
+        schedule_kwargs.setdefault("max_t", 1.0)
+        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **schedule_kwargs)
 
-        self.model_id = model_id
-        self._disable_grad_ckpt = disable_grad_ckpt
+        self.model_id_or_local_path = model_id_or_local_path
+        self.guidance_scale = guidance_scale
 
-        self._initialize_network(model_id, load_pretrained)
+        self._initialize_network(model_id_or_local_path, load_pretrained)
+
+        # Optional second-timestep (``r``) embedder for flow-map / mean-flow / AYF methods.
+        self._init_r_embedder(r_timestep, r_embedder_init, time_cond_type)
+
+        # Optional additive guidance embedder (CFG-scale conditioning for distillation).
+        self._init_guidance_embedder(guidance_embeds, guidance_embedder_init)
+        if guidance_scale is not None and not guidance_embeds:
+            raise ValueError("guidance_scale requires guidance_embeds=True; set guidance_scale=None to sample with CFG")
 
         # Override forward with classify_forward for feature extraction support
         self.transformer.forward = types.MethodType(classify_forward, self.transformer)
@@ -398,32 +485,28 @@ class QwenImage(FastGenNetwork):
 
         torch.cuda.empty_cache()
 
-    def _initialize_network(self, model_id: str, load_pretrained: bool) -> None:
+    def _initialize_network(self, model_id_or_local_path: str, load_pretrained: bool) -> None:
         """Initialize the transformer network.
 
         Args:
-            model_id: The HuggingFace model ID or local path.
+            model_id_or_local_path: The HuggingFace model ID or local path.
             load_pretrained: Whether to load pretrained weights.
         """
         in_meta_context = self._is_in_meta_context()
         should_load_weights = load_pretrained and (not in_meta_context)
 
-        local_files_only = str2bool(os.getenv("LOCAL_FILES_ONLY", "false"))
-
         if should_load_weights:
             logger.info("Loading QwenImage transformer from pretrained")
-            self.transformer: QwenImageTransformer2DModel = QwenImageTransformer2DModel.from_pretrained(
-                model_id,
-                cache_dir=os.environ["HF_HOME"],
+            self.transformer: QwenImageTransformer2DModel = hf_load(
+                QwenImageTransformer2DModel.from_pretrained,
+                model_id_or_local_path,
                 subfolder="transformer",
-                local_files_only=local_files_only,
             )
         else:
-            config = QwenImageTransformer2DModel.load_config(
-                model_id,
-                cache_dir=os.environ["HF_HOME"],
+            config = hf_load(
+                QwenImageTransformer2DModel.load_config,
+                model_id_or_local_path,
                 subfolder="transformer",
-                local_files_only=local_files_only,
             )
             if in_meta_context:
                 logger.info(
@@ -435,20 +518,91 @@ class QwenImage(FastGenNetwork):
                 logger.warning("QwenImage transformer being initialized from config. No weights are loaded!")
             self.transformer: QwenImageTransformer2DModel = QwenImageTransformer2DModel.from_config(config)
 
-        # Add logvar linear layer for variance estimation - QwenImage uses 3072-dim time embeddings
-        self.transformer.logvar_linear = torch.nn.Linear(3072, 1)
+        # Add logvar linear layer for variance estimation on the time embedding
+        inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
+        self.transformer.logvar_linear = torch.nn.Linear(inner_dim, 1)
+
+    def default_lora_target_modules(self) -> List[str]:
+        return DEFAULT_QWEN_LORA_TARGETS
+
+    def _init_r_embedder(self, r_timestep: bool, r_embedder_init: str, time_cond_type: str) -> None:
+        """Attach an additive second-timestep (``r``) embedder to the transformer,
+        added to the time embedding inside ``classify_forward`` (Wan/DiT pattern)."""
+        if time_cond_type not in ("abs", "diff"):
+            raise ValueError(f"Invalid time condition: {time_cond_type}")
+        self.transformer.time_cond_type = time_cond_type
+        if not r_timestep:
+            self.transformer.r_embedder = None
+            return
+
+        if r_embedder_init not in ("zero", "pretrained", "warm"):
+            raise ValueError(f"Unknown r_embedder_init '{r_embedder_init}' ('zero', 'pretrained', or 'warm').")
+        self._r_embedder_init = r_embedder_init
+
+        inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
+        self.transformer.r_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=inner_dim)
+        # Under FSDP meta-init the params are meta tensors ('pretrained' cannot even be
+        # copied); skip -- rank 0 initializes for real and FSDP broadcasts its weights.
+        if self._is_in_meta_context():
+            logger.info("Skipping r_embedder weight init on meta device (weights will arrive via FSDP sync)")
+            return
+        self._reset_r_embedder_parameters()
+        logger.info(f"Initialized QwenImage r_embedder (init={r_embedder_init}, time_cond_type={time_cond_type}).")
+
+    def _reset_r_embedder_parameters(self) -> None:
+        """Apply the configured r_embedder init; the zero-init keeps the r_embedder a no-op at start."""
+        r_embedder = getattr(self.transformer, "r_embedder", None)
+        if r_embedder is None:
+            return
+        if self._r_embedder_init == "pretrained":
+            r_embedder.load_state_dict(self.transformer.time_text_embed.timestep_embedder.state_dict())
+            return
+        if self._r_embedder_init == "warm":
+            # Feature warm start: linear_1 from the pretrained time embedder;
+            # linear_2 stays zero so the embedder remains a no-op at init.
+            r_embedder.linear_1.load_state_dict(
+                self.transformer.time_text_embed.timestep_embedder.linear_1.state_dict()
+            )
+        torch.nn.init.zeros_(r_embedder.linear_2.weight)
+        if r_embedder.linear_2.bias is not None:
+            torch.nn.init.zeros_(r_embedder.linear_2.bias)
+
+    def _init_guidance_embedder(self, guidance_embeds: bool, guidance_embedder_init: str = "zero") -> None:
+        """Attach an additive guidance embedder to the transformer (same pattern as
+        ``_init_r_embedder``); active whenever ``guidance`` is passed to forward."""
+        if not guidance_embeds:
+            self.transformer.guidance_embedder = None
+            return
+
+        if guidance_embedder_init not in ("zero", "pretrained"):
+            raise ValueError(f"Unknown guidance_embedder_init '{guidance_embedder_init}' ('zero' or 'pretrained').")
+        self._guidance_embedder_init = guidance_embedder_init
+
+        inner_dim = self.transformer.config.num_attention_heads * self.transformer.config.attention_head_dim
+        self.transformer.guidance_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=inner_dim)
+        if self._is_in_meta_context():
+            logger.info("Skipping guidance_embedder weight init on meta device (weights will arrive via FSDP sync)")
+            return
+        self._reset_guidance_embedder_parameters()
+        logger.info(f"Initialized QwenImage guidance_embedder (init={guidance_embedder_init}).")
+
+    def _reset_guidance_embedder_parameters(self) -> None:
+        """Apply the guidance_embedder init (see ``_reset_r_embedder_parameters``)."""
+        guidance_embedder = getattr(self.transformer, "guidance_embedder", None)
+        if guidance_embedder is None:
+            return
+        if self._guidance_embedder_init == "pretrained":
+            # Feature warm start: linear_1 from the pretrained time embedder;
+            # linear_2 stays zero so the embedder remains a no-op at init.
+            guidance_embedder.linear_1.load_state_dict(
+                self.transformer.time_text_embed.timestep_embedder.linear_1.state_dict()
+            )
+        torch.nn.init.zeros_(guidance_embedder.linear_2.weight)
+        if guidance_embedder.linear_2.bias is not None:
+            torch.nn.init.zeros_(guidance_embedder.linear_2.bias)
 
     def reset_parameters(self):
-        """Reinitialize parameters for FSDP meta device initialization."""
-
-        for m in self.modules():
-            if isinstance(m, torch.nn.Linear):
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    torch.nn.init.zeros_(m.bias)
-            elif isinstance(m, torch.nn.Embedding):
-                torch.nn.init.normal_(m.weight, std=0.02)
-
+        """Rebuild the QwenEmbedRope frequency tables after meta materialization."""
         # Reinitialize QwenEmbedRope tensors — these are plain tensors (not nn.Parameters)
         # that end up on meta device during FSDP meta init and don't get materialized by FSDP.
         for m in self.modules():
@@ -471,7 +625,6 @@ class QwenImage(FastGenNetwork):
                     ],
                     dim=1,
                 )
-                m.rope_cache = {}
                 logger.debug("Reinitialized QwenEmbedRope pos_freqs/neg_freqs from meta device")
 
         super().reset_parameters()
@@ -479,21 +632,13 @@ class QwenImage(FastGenNetwork):
         logger.debug("Reinitialized QwenImage parameters")
 
     def fully_shard(self, **kwargs):
-        """Fully shard the QwenImage network for FSDP.
+        """Shard ``self.transformer``; see ``FastGenNetwork.fully_shard``.
 
         QwenImage has a single list of 60 dual-stream QwenImageTransformerBlock instances.
-
-        We shard `self.transformer` instead of `self` because the network wrapper
-        class may have complex multiple inheritance with ABC, which causes Python's
-        __class__ assignment to fail due to incompatible memory layouts.
         """
         if self.transformer.gradient_checkpointing:
             self.transformer.disable_gradient_checkpointing()
-            apply_fsdp_checkpointing(
-                self.transformer,
-                check_fn=lambda block: isinstance(block, QwenImageTransformerBlock),
-            )
-            logger.info("Applied FSDP activation checkpointing to QwenImage transformer blocks")
+            apply_fsdp_checkpointing(self.transformer, QwenImageTransformerBlock)
 
         for block in self.transformer.transformer_blocks:
             fully_shard(block, **kwargs)
@@ -502,27 +647,20 @@ class QwenImage(FastGenNetwork):
 
     def init_preprocessors(self):
         """Initialize text and image encoders."""
-        if not hasattr(self, "text_encoder"):
+        if "text_encoder" not in self.preprocessors:
             self.init_text_encoder()
-        if not hasattr(self, "vae"):
+        if "vae" not in self.preprocessors:
             self.init_vae()
 
-    def init_text_encoder(self, torch_dtype: Optional[dtype] = torch.bfloat16):
+    def init_text_encoder(self, dtype: Optional[torch.dtype] = torch.bfloat16):
         """Initialize the text encoder for QwenImage."""
-        self.text_encoder = QwenImageTextEncoder(model_id=self.model_id, torch_dtype=torch_dtype)
+        self.preprocessors["text_encoder"] = QwenImageTextEncoder(
+            model_id_or_local_path=self.model_id_or_local_path, dtype=dtype
+        )
 
     def init_vae(self):
         """Initialize only the VAE for visualization."""
-        self.vae = QwenImageImageEncoder(model_id=self.model_id)
-
-    def to(self, *args, **kwargs):
-        """Moves the model to the specified device."""
-        super().to(*args, **kwargs)
-        if hasattr(self, "text_encoder"):
-            self.text_encoder.to(*args, **kwargs)
-        if hasattr(self, "vae"):
-            self.vae.to(*args, **kwargs)
-        return self
+        self.preprocessors["vae"] = QwenImageImageEncoder(model_id_or_local_path=self.model_id_or_local_path)
 
     def _pack_latents(self, latents: torch.Tensor) -> torch.Tensor:
         """Pack latents from [B, C, H, W] to [B, (H//2)*(W//2), C*4] for transformer.
@@ -565,10 +703,13 @@ class QwenImage(FastGenNetwork):
         t: torch.Tensor,
         condition: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         r: Optional[torch.Tensor] = None,
+        guidance: Optional[torch.Tensor] = None,
         return_features_early: bool = False,
         feature_indices: Optional[Set[int]] = None,
         return_logvar: bool = False,
         fwd_pred_type: Optional[str] = None,
+        apply_output_conditioning: bool = True,
+        output_dtype: OutputDtype = "same",
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass of QwenImage diffusion model.
@@ -577,47 +718,60 @@ class QwenImage(FastGenNetwork):
             x_t: The diffused data sample [B, C, H, W].
             t: The current timestep in [0, 1] range.
             condition: Tuple of (encoder_hidden_states, encoder_hidden_states_mask).
-            r: Another timestep (for mean flow methods), unused.
+            r: Second timestep for flow-map / mean-flow / AYF (None -> ignored).
+            guidance: Per-sample CFG-scale conditioning. ``None`` is auto-filled from
+                ``self.guidance_scale`` when a ``guidance_embedder`` exists (FLUX contract).
             return_features_early: If True, return features once collected.
             feature_indices: Set of block indices for feature extraction.
             return_logvar: If True, return the logvar.
             fwd_pred_type: Override network prediction type.
-
+            apply_output_conditioning: Apply the output constraint after the conversion.
+            output_dtype: ``"same"`` rounds the prediction to the state dtype; ``None`` keeps it in high precision.
         Returns:
             Model output tensor or tuple with logvar/features.
         """
-        if feature_indices is None:
-            feature_indices = set()
-        if return_features_early and len(feature_indices) == 0:
+        self._validate_forward_kwargs(
+            fwd_kwargs,
+            r=r,
+            return_features_early=return_features_early,
+            feature_indices=feature_indices,
+            supports_r_timestep=getattr(self.transformer, "r_embedder", None) is not None,
+            num_features=len(self.transformer.transformer_blocks),
+        )
+        if return_features_early and feature_indices is not None and not feature_indices:
             return []
 
-        if fwd_pred_type is None:
-            fwd_pred_type = self.net_pred_type
-        else:
-            assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported"
-
-        batch_size = x_t.shape[0]
-        height, width = x_t.shape[2], x_t.shape[3]
-
-        # Unpack condition: (encoder_hidden_states, encoder_hidden_states_mask)
+        x_t_model = self.cast_to_model_precision(x_t)
         encoder_hidden_states, encoder_hidden_states_mask = condition
+        assert_same(dtype=self.precision_model, device=x_t_model.device, encoder_hidden_states=encoder_hidden_states)
+        assert_same(
+            shape=True,
+            dtype=self.noise_scheduler.t_precision,
+            device=True,
+            t=t,
+            r=r,
+        )
+        batch_size = x_t_model.shape[0]
+        height, width = x_t_model.shape[2], x_t_model.shape[3]
 
+        # Guidance-distilled nets fill the embedded default (FLUX contract); ``__init__`` ties the scale to an embedder.
+        if guidance is None and self.guidance_scale is not None:
+            guidance = torch.full((batch_size,), self.guidance_scale, device=x_t_model.device, dtype=x_t_model.dtype)
+        assert_same(shape=True, device=True, t=t, guidance=guidance)
         # Pack latents for transformer: [B, C, H, W] -> [B, (H//2)*(W//2), C*4]
-        hidden_states = self._pack_latents(x_t)
+        hidden_states = self._pack_latents(x_t_model)
 
         # Prepare img_shapes: [[(1, latent_H_packed, latent_W_packed)]] per batch item
         img_shapes = [[(1, height // 2, width // 2)]] * batch_size
-
-        # Prepare txt_seq_lens from attention mask (must be ints for slice indices in pos_embed)
-        txt_seq_lens = encoder_hidden_states_mask.sum(dim=1).int().tolist()
 
         model_outputs = self.transformer(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             timestep=t,
+            r=r,
+            guidance=guidance,
             img_shapes=img_shapes,
-            txt_seq_lens=txt_seq_lens,
             return_features_early=return_features_early,
             feature_indices=feature_indices,
             return_logvar=return_logvar,
@@ -634,94 +788,156 @@ class QwenImage(FastGenNetwork):
         # Unpack output: [B, seq_len, C] -> [B, C, H, W]
         if isinstance(out, torch.Tensor):
             out = self._unpack_latents(out, height, width)
-            out = self.noise_scheduler.convert_model_output(
-                x_t, out, t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
+            out = self.transform_output(out, x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning)
         else:
             out[0] = self._unpack_latents(out[0], height, width)
-            out[0] = self.noise_scheduler.convert_model_output(
-                x_t, out[0], t, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
+            out[0] = self.transform_output(
+                out[0], x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning
             )
 
         if return_logvar:
-            return out, logvar
+            return out, logvar.to(dtype=x_t.dtype)
         return out
+
+    @staticmethod
+    def default_guidance_cfg() -> GuidanceConfig:
+        """Default guidance recipe: CFG at 4.0 + per-token L2 rescale (matches the upstream pipeline)."""
+        g = GuidanceConfig()
+        g.cfg.scale = 4.0
+        g.rescale = 1.0
+        g.rescale_type = "norm"
+        g.rescale_dims = (-1,)
+        return g
+
+    def predict_with_guidance(self, ctx: GuidanceContext) -> torch.Tensor:
+        """Compose Qwen-Image's packed-token rescaling on the provider's native predictions (flow, as upstream)."""
+        g = ctx.guidance_cfg
+        g.validate(supported_terms=("cfg", "mix", "rescale"), network_name=type(self).__name__)
+        cond = ctx.predict("pos", condition=ctx.condition)
+        # Linear CFG/mix commute with packing; keep these operations in BCHW.
+        guided = apply_cfg(ctx, cond)
+        guided = apply_mix(ctx, guided)
+        if g.rescale is not None:
+            # Per-token norms require [B, tokens, 4*C], not BCHW's spatial last axis.
+            height, width = guided.shape[-2:]
+            guided = self._unpack_latents(
+                apply_rescale(ctx, self._pack_latents(guided), condition_prediction=self._pack_latents(cond)),
+                height,
+                width,
+            )
+        return guided
+
+    def sample_scheduler_and_grid(
+        self, sample_steps: int, image_seq_len: int, device: Optional[torch.device] = None
+    ) -> Tuple[FlowMatchEulerDiscreteScheduler, torch.Tensor]:
+        """Lazily load the pipeline's flow-matching Euler scheduler and set it to the official pipeline's grid.
+
+        That is dynamic shifting on ``linspace(1, 1/steps, steps)``, with ``mu`` interpolated from the scheduler config
+        in ``image_seq_len`` (the token count after 2x2 packing). Needs ``sample_steps >= 2``.
+
+        Returns:
+            The scheduler, set to begin at the first step, and the times to query the network at, one per step: its
+            sigmas in ``t_precision``.
+        """
+        # At 1 step the scheduler's shift_terminal stretch divides by zero -> NaN timesteps.
+        assert sample_steps >= 2, f"QwenImage sampling needs sample_steps >= 2, got {sample_steps}"
+        if not hasattr(self, "scheduler"):
+            self.scheduler = hf_load(
+                FlowMatchEulerDiscreteScheduler.from_pretrained,
+                self.model_id_or_local_path,
+                subfolder="scheduler",
+            )
+        scheduler = self.scheduler
+
+        cfg = scheduler.config
+        mu = cfg.base_shift + (cfg.max_shift - cfg.base_shift) / (cfg.max_image_seq_len - cfg.base_image_seq_len) * (
+            image_seq_len - cfg.base_image_seq_len
+        )
+        scheduler.set_timesteps(sigmas=np.linspace(1.0, 1.0 / sample_steps, sample_steps), device=device, mu=mu)
+        # Start at step 0: high shifts repeat the first timestep, and the lookup (a device sync) takes the second match.
+        scheduler.set_begin_index(0)
+        t_grid = self.noise_scheduler.safe_clamp(
+            scheduler.sigmas[:-1].to(device=device, dtype=self.noise_scheduler.t_precision),
+            min=self.noise_scheduler.min_t,
+            max=self.noise_scheduler.max_t,
+            warn=True,
+        )
+        return scheduler, t_grid
 
     def sample(
         self,
         noise: torch.Tensor,
         condition: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         neg_condition: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        guidance_scale: Optional[float] = 4.0,
-        num_steps: int = 50,
-        **kwargs,
+        sample_steps: int = 50,
+        sample_type: str = "ode",
+        guidance_cfg: Optional[GuidanceConfig] = None,
+        guidance: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Generate samples using Euler flow matching with classifier-free guidance.
+        """Generate samples using Euler flow matching.
+
+        Embedded-guidance mode (a ``guidance_embedder`` net) runs one conditioned
+        forward per step, ignoring ``neg_condition``/``guidance_cfg``; CFG mode
+        (undistilled base) applies true CFG via ``predict_with_guidance``.
 
         Args:
             noise: Initial noise tensor [B, C, H, W].
             condition: Tuple of (encoder_hidden_states, encoder_hidden_states_mask).
-            neg_condition: Optional negative condition tuple for CFG.
-            guidance_scale: CFG scale. When > 1.0 and neg_condition is provided,
-                enables classifier-free guidance with double forward passes.
-            num_steps: Number of sampling steps (default 50).
+            neg_condition: Optional negative condition tuple; CFG mode only.
+            sample_steps: Number of sampling steps (default 50).
+            sample_type: Integration policy; only ``"ode"`` is supported.
+            guidance_cfg: Guidance config; CFG mode only. ``None`` →
+                ``default_guidance_cfg()`` (CFG at 4.0 + per-token L2 rescale).
+            guidance: Per-sample guidance value for a ``guidance_embedder`` net; passing it
+                selects embedded-guidance mode. ``None`` uses ``self.guidance_scale`` when the
+                net has a ``guidance_embedder`` and runs CFG otherwise.
 
         Returns:
             Generated latent samples.
         """
+        self._validate_sample_kwargs(
+            sample_type,
+            supported_schedule_types=("rf",),
+            supported_sample_types=("ode",),
+        )
+
         batch_size, _, height, width = noise.shape
 
-        if not hasattr(self, "scheduler"):
-            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                self.model_id,
-                subfolder="scheduler",
-                local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-            )
-        scheduler = self.scheduler
-
-        # Calculate resolution-dependent shift (mu) from scheduler config
-        image_seq_len = (height // 2) * (width // 2)
-        cfg = scheduler.config
-        mu = cfg.base_shift + (cfg.max_shift - cfg.base_shift) / (cfg.max_image_seq_len - cfg.base_image_seq_len) * (
-            image_seq_len - cfg.base_image_seq_len
+        # Embedded mode iff an explicit guidance kwarg or a configured default with
+        # an embedder present.
+        embedded_cfg = guidance is not None or (
+            self.guidance_scale is not None and getattr(self.transformer, "guidance_embedder", None) is not None
         )
+        if not embedded_cfg and guidance_cfg is None:
+            guidance_cfg = self.default_guidance_cfg()
 
-        # Set timesteps with sigmas (matching pipeline pattern)
-        sigmas = np.linspace(1.0, 1.0 / num_steps, num_steps)
-        scheduler.set_timesteps(sigmas=sigmas, device=noise.device, mu=mu)
-        timesteps = scheduler.timesteps
+        image_seq_len = (height // 2) * (width // 2)
+        scheduler, t_grid = self.sample_scheduler_and_grid(sample_steps, image_seq_len, device=noise.device)
 
         # Initialize latents with proper scaling based on the initial timestep
-        t_init = self.noise_scheduler.safe_clamp(
-            timesteps[0] / 1000.0, min=self.noise_scheduler.min_t, max=self.noise_scheduler.max_t
-        )
-        latents = self.noise_scheduler.latents(noise=noise, t_init=t_init)
-
-        do_cfg = guidance_scale is not None and guidance_scale > 1.0 and neg_condition is not None
+        latents = self.noise_scheduler.latents(noise=noise, t_init=t_grid[0])
 
         # Sampling loop
-        scheduler.set_begin_index(0)
-        for timestep in timesteps:
-            # Pipeline passes timestep/1000 directly to transformer — no clamping
-            t = (timestep / 1000.0).expand(batch_size).to(latents.dtype)
+        for sched_step, t in zip(scheduler.timesteps, t_grid, strict=True):
+            t = t.expand(batch_size)
 
-            # Conditional prediction
-            pred = self(latents, t, condition, fwd_pred_type="flow")
-
-            # CFG: separate unconditional prediction + combination
-            if do_cfg:
-                neg_pred = self(latents, t, neg_condition, fwd_pred_type="flow")
-                comb_pred = neg_pred + guidance_scale * (pred - neg_pred)
-                # Norm-preserving rescaling in packed token space (matching pipeline behavior).
-                # Pipeline operates on [B, seq, 64] with dim=-1 (per-token norm).
-                # We have [B, C, H, W], so pack to [B, seq, C*4], rescale, then unpack.
-                pred_packed = self._pack_latents(pred)
-                comb_packed = self._pack_latents(comb_pred)
-                cond_norm = torch.norm(pred_packed, dim=-1, keepdim=True)
-                comb_norm = torch.norm(comb_packed, dim=-1, keepdim=True)
-                pred = self._unpack_latents(comb_packed * (cond_norm / (comb_norm + 1e-8)), height, width)
+            if embedded_cfg:
+                # Embedded guidance
+                pred = self(latents, t, condition=condition, guidance=guidance, fwd_pred_type="flow")
+            else:
+                # Manual guidance (true CFG; block the embedded auto-fill).
+                with attr_override(self, "guidance_scale", None):
+                    pred = predict_with_guidance(
+                        self,
+                        latents,
+                        t,
+                        guidance_cfg=guidance_cfg,
+                        condition=condition,
+                        neg_condition=neg_condition,
+                        fwd_pred_type="flow",
+                    )
 
             # Euler step
-            latents = scheduler.step(pred, timestep, latents, return_dict=False)[0]
+            latents = scheduler.step(pred, sched_step, latents, return_dict=False)[0]
 
         return latents

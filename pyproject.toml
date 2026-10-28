@@ -1,9 +1,24 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.ruff]
 line-length = 120
 
-[tool.ruff.lint]
-exclude = []
+[tool.pytest.ini_options]
+filterwarnings = [
+    # Emitted inside the pinned Hugging Face stack; FastGen does not pass this deprecated argument.
+    "ignore:The `local_dir_use_symlinks` argument is deprecated and ignored.*:UserWarning",
+    # Emitted by tokenizers while Transformers constructs its CLIP and Qwen2 fast-tokenizer wrappers.
+    "ignore::DeprecationWarning:transformers.models.clip.tokenization_clip",
+    "ignore::DeprecationWarning:transformers.models.qwen2.tokenization_qwen2",
+    # Emitted by the pinned third-party MiniMax audio VAE implementation.
+    "ignore:`torch.nn.utils.weight_norm` is deprecated.*:FutureWarning",
+    # Emitted at import time by the torchao version pinned in the CI image.
+    "ignore:Importing.*from torchao.dtypes.*:DeprecationWarning",
+    # Emitted internally by the pinned PyTorch build when reading legacy TF32 flags.
+    "ignore:Please use the new API settings to control TF32 behavior.*:UserWarning",
+    # Emitted internally by torch.rms_norm for pretrained checkpoints that keep
+    # fp32 norm weights while running bf16 activations (e.g. FLUX).
+    "ignore:Mismatch dtype between input and weight.*:UserWarning",
+]

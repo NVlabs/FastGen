@@ -3,16 +3,19 @@
 
 """The implementation is based on the EDM2 repo."""
 
-from typing import Set, Optional, Union, List, Tuple
+from typing import Dict, Set, Optional, Union, List, Tuple
 import numpy as np
 import torch
 from torch.distributed.fsdp import fully_shard
 
 from fastgen.networks.network import FastGenNetwork
-from fastgen.networks.noise_schedule import NET_PRED_TYPES
 
-from fastgen.networks.EDM.network import precond_input, precond_output
-from fastgen.utils import expand_like
+from fastgen.networks.EDM.network import EDMPreconditioningMixin
+from fastgen.utils.distributed.fsdp import make_fully_shard_kwargs
+from fastgen.utils.guidance import GuidanceConfig, predict_with_guidance
+from fastgen.utils.module import module_state_names
+from fastgen.utils.tensor import dtype_invariant_dropout, promote_dtype
+from fastgen.utils.tree_utils import OutputDtype, assert_same
 
 # ----------------------------------------------------------------------------
 # Cached construction of constant tensors. Avoids CPU=>GPU copy when the
@@ -44,22 +47,6 @@ def constant(value, shape=None, dtype=None, device=None, memory_format=None):
 
 
 # ----------------------------------------------------------------------------
-# Replace NaN/Inf with specified numerical values.
-
-try:
-    nan_to_num = torch.nan_to_num  # 1.8.0a0
-except AttributeError:
-
-    def nan_to_num(input, nan=0.0, posinf=None, neginf=None, *, out=None):  # pylint: disable=redefined-builtin
-        assert isinstance(input, torch.Tensor)
-        if posinf is None:
-            posinf = torch.finfo(input.dtype).max
-        if neginf is None:
-            neginf = torch.finfo(input.dtype).min
-        assert nan == 0
-        return torch.clamp(input.unsqueeze(0).nansum(0), min=neginf, max=posinf, out=out)
-
-
 # Variant of constant() that inherits dtype and device from the given
 # reference tensor by default.
 
@@ -81,7 +68,7 @@ def const_like(ref, value, shape=None, dtype=None, device=None, memory_format=No
 
 
 def normalize(x, dim=None, eps=1e-4):
-    dtype = torch.float64 if x.dtype is torch.float64 else torch.float32
+    dtype = promote_dtype(x, torch.float32)
     if dim is None:
         dim = list(range(1, x.ndim))
     norm = torch.linalg.vector_norm(x, dim=dim, keepdim=True, dtype=dtype)
@@ -150,13 +137,10 @@ class MPFourier(torch.nn.Module):
         self.register_buffer("phases", 2 * np.pi * torch.rand(num_channels))
 
     def forward(self, x):
-        dtype = torch.float64 if x.dtype is torch.float64 else torch.float32
+        dtype = promote_dtype(x, torch.float32)
         y = x.to(dtype)
-        # Move buffers to input device and dtype
-        freqs = self.freqs.to(device=x.device, dtype=dtype)
-        phases = self.phases.to(device=x.device, dtype=dtype)
-        y = y.ger(freqs)
-        y = y + phases
+        y = y.ger(self.freqs.to(dtype=dtype))
+        y = y + self.phases.to(dtype=dtype)
         y = y.cos() * np.sqrt(2)
         return y.to(x.dtype)
 
@@ -199,7 +183,7 @@ class MPConv(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel))
 
     def forward(self, x, gain=1):
-        dtype = torch.float64 if x.dtype is torch.float64 else torch.float32
+        dtype = promote_dtype(x, torch.float32)
         w = self.weight.to(dtype)
         w = normalize(w)  # traditional weight normalization
         w = w * (gain / np.sqrt(w[0].numel()))  # magnitude-preserving scaling
@@ -261,7 +245,7 @@ class Block(torch.nn.Module):
         c = self.emb_linear(emb, gain=self.emb_gain) + 1
         y = mp_silu(y * c.unsqueeze(2).unsqueeze(3).to(y.dtype))
         if self.training and self.dropout != 0:
-            y = torch.nn.functional.dropout(y, p=self.dropout)
+            y = dtype_invariant_dropout(y, p=self.dropout)
         y = self.conv_res1(y)
 
         # Connect the branches.
@@ -291,7 +275,7 @@ class Block(torch.nn.Module):
 # EDM2 U-Net model (Figure 21).
 
 
-class EMD2UNet(torch.nn.Module):
+class EDM2UNet(torch.nn.Module):
     def __init__(
         self,
         img_resolution,  # Image resolution.
@@ -323,6 +307,7 @@ class EMD2UNet(torch.nn.Module):
         self.dropout = dropout
         self.label_balance = label_balance
         self.concat_balance = concat_balance
+        self.num_blocks = num_blocks
         self.out_gain = torch.nn.Parameter(torch.zeros([1]))
 
         # Embedding.
@@ -402,10 +387,12 @@ class EMD2UNet(torch.nn.Module):
         feature_indices=None,
     ):
         # Embedding.
+        # NVLabs EDM2 keeps c_noise and its Fourier/mapping path in FP32 even
+        # when the image UNet runs in FP16.
         emb = self.emb_noise(self.emb_fourier(noise_labels))
 
         if r_noise_labels is not None:
-            if self.r_timestep is not None:
+            if self.emb_noise_r is not None:
                 emb_r = self.emb_noise_r(self.emb_fourier_r(r_noise_labels))
                 emb = mp_sum(emb, emb_r, t=0.5)
             else:
@@ -424,13 +411,14 @@ class EMD2UNet(torch.nn.Module):
         for name, block in self.enc.items():
             x = block(x) if "conv" in name else block(x, emb)
             skips.append(x)
-            if "block2" in name:
-                if idx in feature_indices:
+            if name.endswith(f"_block{self.num_blocks - 1}"):  # last residual block of each resolution
+                if feature_indices is not None and idx in feature_indices:
                     features.append(x)
                 idx += 1
 
         # If we have all the features, we can exit early
         if return_features_early:
+            assert feature_indices is not None
             assert len(features) == len(feature_indices)
             return features
 
@@ -441,12 +429,7 @@ class EMD2UNet(torch.nn.Module):
             x = block(x, emb)
         x = self.out_conv(x, gain=self.out_gain)
 
-        if len(feature_indices) == 0:
-            # no features requested, return only the model output
-            out = x
-        else:
-            # score and features； score, features
-            out = [x, features]
+        out = [x, features] if feature_indices is not None else x
         return out
 
 
@@ -454,7 +437,19 @@ class EMD2UNet(torch.nn.Module):
 # Preconditioning and uncertainty estimation.
 
 
-class EDM2Precond(FastGenNetwork):
+class EDM2Precond(EDMPreconditioningMixin, FastGenNetwork):
+    """EDM2 preconditioning wrapper (Karras et al. 2024).
+
+    Runs on pixels to match this repo's ImageNet-64 configs: ``real_raw`` is used
+    as the model-space state. For latent EDM2 (e.g. SD-VAE ImageNet-512, as in the
+    original paper), supply precomputed latents as ``real``.
+    """
+
+    latent_compression_factors = (1, 1)
+
+    def encode_real(self, real_raw):
+        return real_raw
+
     def __init__(
         self,
         img_resolution,  # Image resolution.
@@ -463,27 +458,51 @@ class EDM2Precond(FastGenNetwork):
         sigma_data=0.5,  # Expected standard deviation of the training data.
         sigma_shift=0.0,  # Shift sigma during inference as done in ECT.
         logvar_channels=128,  # Intermediate dimensionality for uncertainty estimation.
+        model_channels=192,  # Base multiplier for the number of channels.
+        channel_mult=[1, 2, 3, 4],  # Per-resolution multipliers for the number of channels.
+        channel_mult_noise=None,  # Multiplier for noise embedding dimensionality. None = select based on channel_mult.
+        channel_mult_emb=None,  # Multiplier for final embedding dimensionality. None = select based on channel_mult.
+        num_blocks=3,  # Number of residual blocks per resolution.
+        attn_resolutions=[16, 8],  # List of resolutions with self-attention.
+        label_balance=0.5,  # Balance between noise embedding (0) and class embedding (1).
+        concat_balance=0.5,  # Balance between skip connections (0) and main path (1).
+        dropout=0,  # Dropout probability.
+        dropout_resolutions=None,  # List of resolutions at which to apply dropout. None = all resolutions.
+        embedding_type="mp_fourier",  # Time embedding type: "mp_fourier" or "positional".
+        mp_fourier_bandwidth=1.0,  # Bandwidth of the mp_fourier embedding.
+        r_timestep=False,  # Flag for taking target time r
         drop_precond=None,  # Can be set to 'input'/'output'/'both' to drop the preconditioning of the input/output/both.
         net_pred_type="x0",  # Prediction type for FastGenNetwork
         schedule_type="edm",  # Schedule type for FastGenNetwork
-        **model_kwargs,  # Keyword arguments for UNet and noise_scheduler.
+        **schedule_kwargs,  # Keyword arguments for the noise scheduler.
     ):
         # Initialize FastGenNetwork with EDM2-specific defaults
-        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **model_kwargs)
+        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **schedule_kwargs)
 
-        self.img_resolution = img_resolution
-        self.img_channels = img_channels
         self.label_dim = label_dim
         self.sigma_data = sigma_data
         self.sigma_shift = sigma_shift
         if drop_precond is not None and drop_precond not in ["input", "output", "both"]:
             raise ValueError(f"drop_precond must be one of 'input', 'output', 'both', or None, got {drop_precond}")
         self.drop_precond = drop_precond
-        self.unet = EMD2UNet(
-            img_resolution=img_resolution, img_channels=img_channels, label_dim=label_dim, **model_kwargs
+        self.unet = EDM2UNet(
+            img_resolution=img_resolution,
+            img_channels=img_channels,
+            label_dim=label_dim,
+            model_channels=model_channels,
+            channel_mult=channel_mult,
+            channel_mult_noise=channel_mult_noise,
+            channel_mult_emb=channel_mult_emb,
+            num_blocks=num_blocks,
+            attn_resolutions=attn_resolutions,
+            label_balance=label_balance,
+            concat_balance=concat_balance,
+            dropout=dropout,
+            dropout_resolutions=dropout_resolutions,
+            embedding_type=embedding_type,
+            mp_fourier_bandwidth=mp_fourier_bandwidth,
+            r_timestep=r_timestep,
         )
-        embedding_type = model_kwargs.get("embedding_type", "mp_fourier")
-        mp_fourier_bandwidth = model_kwargs.get("mp_fourier_bandwidth", 1.0)
         self.logvar_fourier = (
             PositionalEmbedding(logvar_channels, endpoint=True)
             if embedding_type == "positional"
@@ -494,35 +513,35 @@ class EDM2Precond(FastGenNetwork):
     def forced_weight_normalization(self):
         self.apply(normalize_weights)
 
-    def reset_parameters(self):
-        """Reinitialize parameters for FSDP meta device initialization.
+    def _state_dtype(self) -> torch.dtype:
+        """The storage dtype of all EDM2 state: the requested storage, but at least FP32."""
+        return promote_dtype(self.precision_opt, torch.float32)
 
-        This is required when using meta device initialization for FSDP2.
-        Reinitializes all linear and convolutional layers, then applies weight normalization.
+    def _fixed_precision_overrides(self) -> Dict[str, torch.dtype]:
+        """Keep all state in at least FP32, as NVLabs EDM2 stores it in every precision.
+
+        ``MPConv`` normalizes and scales each stored weight in at least FP32 before casting it to its input dtype,
+        and the embedding path runs in FP32, so only this storage makes a frozen or inference copy compute exactly
+        what FP32 master weights compute.
         """
-        import torch.nn as nn
-
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Embedding):
-                nn.init.normal_(m.weight, std=0.02)
-
-        super().reset_parameters()
+        owned = module_state_names(self, exclude=self._nearest_nested_modules())
+        return {**super()._fixed_precision_overrides(), **{name: self._state_dtype() for name in owned}}
 
     def fully_shard(self, **kwargs):
         """Fully shard the EDM2 network for FSDP.
 
-        Note: EDM2 wraps the EMD2UNet with preconditioning.
+        Note: EDM2 wraps the EDM2UNet with preconditioning.
         The underlying unet has encoder (enc) and decoder (dec) blocks stored as ModuleDicts.
-        We shard each Block for optimal memory efficiency.
+        We shard each Block for optimal memory efficiency. Every group gathers the storage dtype that
+        ``_fixed_precision_overrides`` pins, which ``MPConv`` casts to its input after normalizing.
         """
+        kwargs = (
+            make_fully_shard_kwargs(
+                kwargs, param_dtype=self._state_dtype(), storage_dtype=self.precision_opt, enabled=True
+            )
+            or kwargs
+        )
+
         # Shard encoder blocks
         for name, block in self.unet.enc.items():
             if isinstance(block, Block):
@@ -535,6 +554,7 @@ class EDM2Precond(FastGenNetwork):
 
         # Shard the entire unet
         fully_shard(self.unet, **kwargs)
+        fully_shard(self.logvar_linear, **kwargs)
 
     def forward(
         self,
@@ -546,119 +566,126 @@ class EDM2Precond(FastGenNetwork):
         feature_indices: Optional[Set[int]] = None,
         return_logvar: bool = False,
         fwd_pred_type: Optional[str] = None,
+        apply_output_conditioning: bool = True,
+        output_dtype: OutputDtype = "same",
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-        if feature_indices is None:
-            feature_indices = {}
-        if return_features_early and len(feature_indices) == 0:
-            # Exit immediately if user requested this.
+        self._validate_forward_kwargs(
+            fwd_kwargs,
+            r=r,
+            return_features_early=return_features_early,
+            feature_indices=feature_indices,
+            supports_r_timestep=self.unet.emb_noise_r is not None,
+            num_features=sum(name.endswith(f"_block{self.unet.num_blocks - 1}") for name in self.unet.enc),
+        )
+        if return_features_early and feature_indices is not None and not feature_indices:
             return []
-        if fwd_pred_type is None:
-            fwd_pred_type = self.net_pred_type
-        else:
-            assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
 
+        # NVLabs EDM2 preconditions in FP32: the state and sigma are upcast, only the network input
+        # is cast to the model dtype, and F_x is cast back to FP32 for the skip/output arithmetic.
+        model_input, model_t, model_r = self._prepare_edm_inputs(x_t, t, r)
+        assert_same(dtype=torch.float32, device=model_input.device, model_t=model_t, condition=condition)
         class_labels = (
             None
             if self.label_dim == 0
-            else torch.zeros([1, self.label_dim], device=x_t.device, dtype=x_t.dtype)
+            else torch.zeros([1, self.label_dim], device=model_input.device, dtype=model_t.dtype)
             if condition is None
             else condition.reshape(-1, self.label_dim)
         )
-
-        # Preconditioning weights for input
-        x_t_in, t_in = x_t, t
-        if self.drop_precond not in ["input", "both"]:
-            x_t, t, r = precond_input(x_t, t, r=r, sigma_data=self.sigma_data, eps=self.noise_scheduler.clamp_min)
-
-        t = t.to(x_t.dtype)
-        if r is not None:
-            r = r.to(x_t.dtype)
-
         out = self.unet(
-            x_t,
-            t,
+            model_input,
+            model_t,
             class_labels=class_labels,
-            r_noise_labels=r,
+            r_noise_labels=model_r,
             return_features_early=return_features_early,
             feature_indices=feature_indices,
-            **fwd_kwargs,
         )
 
         if return_features_early:
             return out
 
         sigma_shift = None if self.training else self.sigma_shift
-        if len(feature_indices) == 0:
+
+        output_args = (sigma_shift, fwd_pred_type, apply_output_conditioning, output_dtype)
+        if feature_indices is None:
             assert isinstance(out, torch.Tensor)
-            if self.drop_precond not in ["output", "both"]:
-                out = precond_output(out, x_t_in, t_in, sigma_shift=sigma_shift, sigma_data=self.sigma_data)
-            out = self.noise_scheduler.convert_model_output(
-                x_t_in, out, t_in, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
+            out = self._finalize_edm_prediction(out, x_t, t, *output_args)
         else:
             assert isinstance(out, list)
-            if self.drop_precond not in ["output", "both"]:
-                out[0] = precond_output(out[0], x_t_in, t_in, sigma_shift=sigma_shift, sigma_data=self.sigma_data)
-            out[0] = self.noise_scheduler.convert_model_output(
-                x_t_in, out[0], t_in, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
-            )
+            out[0] = self._finalize_edm_prediction(out[0], x_t, t, *output_args)
 
         # Estimate uncertainty if requested.
         if return_logvar:
-            logvar = self.logvar_linear(self.logvar_fourier(t)).reshape(-1, 1)
-            return out, logvar  # u(sigma) in Equation 21
+            logvar = self.logvar_linear(self.logvar_fourier(model_t)).reshape(-1, 1)
+            return out, logvar.to(dtype=x_t.dtype)  # u(sigma) in Equation 21
         return out
+
+    @staticmethod
+    def default_guidance_cfg() -> GuidanceConfig:
+        """Default guidance recipe: no CFG (guidance disabled).
+
+        Note that ImageNet-512 models benefit from CFG (~1.4-2.2); such a config should set
+        ``config.model.guidance_cfg.cfg.scale`` explicitly.
+        """
+        return GuidanceConfig()
 
     def sample(
         self,
         noise: torch.Tensor,
         condition: Optional[torch.Tensor] = None,
         neg_condition: Optional[torch.Tensor] = None,
-        guidance_scale: Optional[float] = 5.0,
-        num_steps: int = 50,
-        **kwargs,
+        sample_steps: int = 50,
+        sample_type: str = "ode",
+        guidance_cfg: Optional[GuidanceConfig] = None,
     ) -> torch.Tensor:
-        """Generate samples using EDM2's deterministic Euler sampler.
+        """Generate samples with deterministic first-order Euler steps on the schedule's grid.
+
+        EDM2's reference ``edm_sampler`` adds Heun's second-order correction to every step but the last.
 
         Args:
-            noise: Initial noise tensor [B, C, H, W] (should be scaled by max sigma).
-            condition: Class label conditioning (one-hot or class indices).
+            noise: Initial standard-normal noise tensor [B, C, H, W]; the sampler scales it to the first sigma.
+            condition: Dense floating-point class-label vectors.
             neg_condition: Negative conditioning for CFG.
-            guidance_scale: CFG guidance scale. None disables guidance.
-            num_steps: Number of sampling steps.
-            **kwargs: Additional keyword arguments.
+            sample_steps: Number of sampling steps.
+            sample_type: Integration policy; only ``"ode"`` is supported.
+            guidance_cfg: Composite guidance config; ``None`` →
+                ``default_guidance_cfg()`` (no CFG by default).
 
         Returns:
-            Generated samples in latent space.
+            Generated samples of shape [B, C, H, W] in the space of the training
+            state (pixels, or latents when trained on precomputed latents).
         """
-        assert self.schedule_type == "edm", f"{self.schedule_type} is not supported"
+        self._validate_sample_kwargs(
+            sample_type,
+            supported_schedule_types=("edm",),
+            supported_sample_types=("ode",),
+        )
+
+        if guidance_cfg is None:
+            guidance_cfg = self.default_guidance_cfg()
 
         # Get sigma schedule from noise scheduler (in EDM, t == sigma)
-        sigmas = self.noise_scheduler.get_t_list(num_steps, device=noise.device)
+        sigmas = self.noise_scheduler.grid(sample_steps, device=noise.device)
 
         x = self.noise_scheduler.latents(noise=noise, t_init=sigmas[0])
         for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
             # Expand sigma for batch
             t = sigma.expand(x.shape[0])
 
-            # Get x0 prediction with optional CFG
-            if guidance_scale is not None and guidance_scale > 1.0 and neg_condition is not None:
-                # CFG: predict with both conditions
-                x_input = torch.cat([x, x], dim=0)
-                t_input = torch.cat([t, t], dim=0)
-                cond_input = torch.cat([neg_condition, condition], dim=0)
+            x0_pred = predict_with_guidance(
+                self,
+                x,
+                t,
+                batched=True,
+                guidance_cfg=guidance_cfg,
+                condition=condition,
+                neg_condition=neg_condition,
+                output_dtype=None,
+                fwd_pred_type="x0",
+            )
 
-                x0_pred = self(x_input, t_input, condition=cond_input, fwd_pred_type="x0")
-                x0_uncond, x0_cond = x0_pred.chunk(2)
-                x0_pred = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
-            else:
-                x0_pred = self(x, t, condition=condition, fwd_pred_type="x0")
-
-            # EDM Euler step: x_next = x0 + sigma_next * (x - x0) / sigma
-            # Equivalent to: x_next = x + (sigma_next - sigma) * (x - x0) / sigma
-            d = (x - x0_pred) / expand_like(t, x)  # derivative estimate
-            x = x + (sigma_next - sigma).to(x.dtype) * d
+            # The DDIM step, x_next = x0 + sigma_next * (x - x0) / sigma: the Euler step on EDM.
+            x = self.noise_scheduler.step(x, x0_pred, t, sigma_next)
 
         return x
 

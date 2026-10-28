@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from omegaconf import DictConfig
+import copy
+
 from fastgen.configs.discriminator import Discriminator_EDM_ImageNet64_Config
 import fastgen.configs.methods.config_f_distill as config_f_distill_default
 from fastgen.configs.data import ImageNet64_Loader_Config
@@ -19,7 +21,13 @@ def create_config():
     config.model.fake_score_optimizer.lr = 2e-6
 
     config.model.input_shape = [3, 64, 64]
-    config.model.discriminator = Discriminator_EDM_ImageNet64_Config
+    # EDM's FP16 mode: the network casts its input and weights to FP16, without autocast.
+    config.model.precision_model = "float16"
+    config.model.precision_opt = "float32"
+    config.model.grad_scaler_enabled = True
+    config.model.grad_scaler_init_scale = 32768
+    config.model.grad_scaler_growth_interval = 20000
+    config.model.discriminator = copy.deepcopy(Discriminator_EDM_ImageNet64_Config)
     config.model.gan_loss_weight_gen = 3e-3
     config.model.f_distill.ratio_ema_rate = 0.5
 
@@ -32,10 +40,14 @@ def create_config():
 
     # path to the pretrained diffusion model ckpt
     config.model.pretrained_model_path = f"{CKPT_ROOT_DIR}/imagenet-64/edm-imagenet-64x64-cond-adm.pth"
-    config.model.net = EDM_ImageNet64_Config
+    config.model.net = copy.deepcopy(EDM_ImageNet64_Config)
+    # Polynomial draws within entries 2 and 998 of EDM's 1000-entry polynomial table (rho = 7).
+    config.model.sample_t_cfg.min_t, config.model.sample_t_cfg.max_t = 0.00210147, 79.5638
 
-    config.dataloader_train = ImageNet64_Loader_Config
+    config.dataloader_train = copy.deepcopy(ImageNet64_Loader_Config)
 
+    config.trainer.tf32_conv = False
+    config.trainer.fp16_reduced_precision_reduction = False
     config.trainer.batch_size_global = 512
     config.trainer.max_iter = 600000
     config.log_config.group = "edm_imagenet64_fdistill"

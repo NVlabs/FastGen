@@ -18,11 +18,22 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 import torch
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
+from diffusers import DDPMScheduler
 from diffusers.models import AutoencoderKL
-from diffusers import DDIMScheduler
 
-from fastgen.networks.network import FastGenNetwork
-from fastgen.networks.noise_schedule import NET_PRED_TYPES
+from fastgen.networks.network import FastGenNetwork, FastGenModule
+from fastgen.networks.lora_utils import LoRAMixin
+from fastgen.utils.tree_utils import OutputDtype, assert_same
+from fastgen.utils.guidance import (
+    GuidanceConfig,
+    predict_with_guidance,
+    apply_cfg,
+    apply_mix,
+    apply_rescale,
+    GuidanceContext,
+)
+from fastgen.utils.env import hf_load
+from fastgen.utils.tensor import to_high_precision
 import fastgen.utils.logging_utils as logger
 
 
@@ -75,7 +86,6 @@ class FourierTimeEmbedding(nn.Module):
         Returns:
             (B, dim) tensor of Fourier features
         """
-        original_dtype = timesteps.dtype
         half_dim = dim // 2
 
         # Compute frequency bands
@@ -93,11 +103,18 @@ class FourierTimeEmbedding(nn.Module):
         if dim % 2 == 1:
             fourier_features = torch.cat([fourier_features, torch.zeros_like(fourier_features[:, :1])], dim=-1)
 
-        return fourier_features.to(original_dtype)
+        return fourier_features
 
-    def forward(self, t):
+    def forward(
+        self,
+        t: torch.Tensor,
+        proj_input_dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
         fourier_feats = self.encode_timesteps(t, self.frequency_dim)
-        embeddings = self.proj_net(fourier_feats)
+        # SiT computes the sinusoidal features in FP32 and feeds them directly to this
+        # MLP. Cast at that boundary for mixed precision, using the configured compute
+        # dtype rather than a parameter dtype that may describe FP32 master storage.
+        embeddings = self.proj_net(fourier_feats.to(dtype=proj_input_dtype))
         return embeddings
 
 
@@ -225,10 +242,17 @@ class OutputProjection(nn.Module):
         return output
 
 
-class DiT(FastGenNetwork):
+class DiT(LoRAMixin, FastGenNetwork):
+    """Diffusion Transformer.
+
+    Runs in the SD-VAE's latent space for ImageNet-256/512 setups. To run the
+    same transformer backbone on raw pixels, set ``input_size`` / ``in_channels``
+    accordingly, disable preprocessors, and override ``encode_real`` to return
+    ``real_raw``.
     """
-    Diffusion model with a Transformer backbone.
-    """
+
+    # The SD-VAE that ``init_vae`` loads.
+    latent_compression_factors = (8, 8)
 
     def __init__(
         self,
@@ -241,31 +265,48 @@ class DiT(FastGenNetwork):
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         enable_class_dropout=False,
-        num_classes=1000,
+        label_dim=1000,
         learn_sigma=False,
         r_timestep=False,
         scale_t=True,  # whether to rescale the timesteps
         time_cond_type="abs",  # "abs" or "diff"
         net_pred_type="flow",  # Prediction type for FastGenNetwork
         schedule_type="rf",  # Schedule type for FastGenNetwork
-        enable_fused_attn=False,  # disable fused attention for jvp with DiT
+        enable_fused_attn=True,
         use_sit_convention=False,  # Use SiT convention: t -> 1-t and v -> -v
-        **model_kwargs,
+        cfg_channels: Optional[int] = None,  # Leading output channels CFG guides (None: all); the DiT/SiT releases: 3
+        vae_variant="mse",  # VAE variant: "mse" or "ema"
+        **schedule_kwargs,
     ):
         timm.layers.set_fused_attn(enable_fused_attn)
         self.use_sit_convention = use_sit_convention
+        if use_sit_convention and scale_t:
+            raise ValueError(
+                "use_sit_convention=True requires scale_t=False: SiT conditions on the continuous time 1 - t in [0, 1]."
+            )
+        if cfg_channels is not None and not 0 < cfg_channels <= in_channels:
+            raise ValueError(f"cfg_channels must be in [1, {in_channels}] or None, got {cfg_channels}.")
+        if class_dropout_prob <= 0:
+            raise ValueError(
+                "DiT needs class_dropout_prob > 0: the extra embedding row is its null class for unconditional and "
+                "CFG-negative forwards."
+            )
+        self.cfg_channels = cfg_channels
+        self.vae_variant = vae_variant
 
         # Initialize FastGenNetwork with DiT-specific defaults
-        super().__init__(net_pred_type=net_pred_type, schedule_type=schedule_type, **model_kwargs)
+        super().__init__(
+            net_pred_type=net_pred_type,
+            schedule_type=schedule_type,
+            **schedule_kwargs,
+        )
         self.input_size = input_size
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
-        self.num_classes = num_classes
-
-        self.img_resolution = input_size * 8
+        self.label_dim = label_dim
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = FourierTimeEmbedding(hidden_size)
@@ -278,7 +319,7 @@ class DiT(FastGenNetwork):
         else:
             self.r_embedder = None
 
-        self.y_embedder = ConditionalEmbedding(num_classes, hidden_size, enable_class_dropout, class_dropout_prob)
+        self.y_embedder = ConditionalEmbedding(label_dim, hidden_size, enable_class_dropout, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Positional embeddings (persistent=True to save in state_dict)
         self.register_buffer("pos_embed", torch.zeros(1, num_patches, hidden_size), persistent=True)
@@ -330,19 +371,6 @@ class DiT(FastGenNetwork):
         nn.init.constant_(self.final_layer.projection.weight, 0)
         nn.init.constant_(self.final_layer.projection.bias, 0)
 
-    def reset_parameters(self):
-        """Reinitialize parameters for FSDP meta device initialization.
-
-        This is required when using meta device initialization for FSDP2. Non-persistent
-        buffers (like positional embeddings) must be recomputed on all ranks after
-        materializing from meta device.
-        """
-        self.initialize_weights()
-
-        super().reset_parameters()
-
-        logger.debug("Reinitialized DiT parameters")
-
     def load_state_dict(self, state_dict: Mapping[str, Any], **kwargs):
         """Load state dict with automatic conversion for Facebook DiT checkpoints.
 
@@ -362,15 +390,9 @@ class DiT(FastGenNetwork):
         if is_facebook_format:
             logger.info("Detected Facebook DiT checkpoint format, converting keys...")
             new_state_dict = {}
-            pos_embed_value = None
 
             for key, value in state_dict.items():
                 new_key = key
-
-                # Store pos_embed to load directly into buffer
-                if key == "pos_embed":
-                    pos_embed_value = value
-                    continue
 
                 # Apply key conversions (order matters - more specific rules first)
                 new_key = new_key.replace("t_embedder.mlp", "t_embedder.proj_net")
@@ -387,16 +409,6 @@ class DiT(FastGenNetwork):
             logger.info(f"Converted {len(new_state_dict)} keys from Facebook DiT format")
             state_dict = new_state_dict
 
-            # Load pos_embed directly into buffer (important for SiT!)
-            if pos_embed_value is not None:
-                if pos_embed_value.shape == self.pos_embed.shape:
-                    self.pos_embed.data.copy_(pos_embed_value)
-                    logger.info("Loaded pos_embed from checkpoint")
-                else:
-                    logger.warning(
-                        f"pos_embed shape mismatch: checkpoint {pos_embed_value.shape} vs model {self.pos_embed.shape}"
-                    )
-
         return super().load_state_dict(state_dict, **kwargs)
 
     def fully_shard(self, **kwargs):
@@ -406,6 +418,11 @@ class DiT(FastGenNetwork):
         Shards each transformer block and embedding module independently
         for optimal memory efficiency in distributed training.
         """
+        # ``self`` is never sharded (see ``FastGenNetwork.fully_shard``), so every group here, blocks included, is an
+        # FSDP root. Roots keep their parameters gathered after forward by default, which elsewhere only affects the
+        # parameters outside the blocks but here would keep the whole model gathered, so reshard like nested groups.
+        kwargs = {**kwargs, "reshard_after_forward": True}
+
         # Shard each transformer block
         for block in self.blocks:
             fully_shard(block, **kwargs)
@@ -415,24 +432,18 @@ class DiT(FastGenNetwork):
         fully_shard(self.t_embedder, **kwargs)
         fully_shard(self.y_embedder, **kwargs)
         fully_shard(self.final_layer, **kwargs)
+        fully_shard(self.logvar_linear, **kwargs)
 
         if self.r_embedder is not None:
             fully_shard(self.r_embedder, **kwargs)
 
     def init_preprocessors(self):
-        if not hasattr(self, "vae"):
+        if "vae" not in self.preprocessors:
             self.init_vae()
 
     def init_vae(self):
         """Initialize the VAE for visualization/decoding."""
-        self.vae = SDVAE()
-
-    def to(self, *args, **kwargs):
-        """Moves the model to the specified device."""
-        super().to(*args, **kwargs)
-        if hasattr(self, "vae"):
-            self.vae.to(*args, **kwargs)
-        return self
+        self.preprocessors["vae"] = SDVAE(variant=self.vae_variant)
 
     def unpatchify(self, x):
         """
@@ -444,22 +455,31 @@ class DiT(FastGenNetwork):
         Returns:
             imgs: (N, C, H, W) tensor of spatial features
         """
-        c = self.out_channels
         p = self.x_embedder.patch_size[0]
         h = w = int(x.shape[1] ** 0.5)
         assert h * w == x.shape[1]
 
-        x = x.reshape(x.shape[0], h, w, p, p, c)
+        x = x.reshape(x.shape[0], h, w, p, p, -1)
         x = torch.einsum("bhwpqc->bchpwq", x)
-        imgs = x.reshape(x.shape[0], c, h * p, w * p)
+        imgs = x.reshape(x.shape[0], -1, h * p, w * p)
         return imgs
 
-    def prepare_t(self, t: Optional[torch.Tensor] = None, dtype: Optional[torch.dtype] = None) -> torch.Tensor | None:
+    def prepare_t(self, t: Optional[torch.Tensor] = None) -> torch.Tensor | None:
         if t is None:
             return t
-        elif self.scale_t:
+        if self.scale_t:
             t = self.noise_scheduler.rescale_t(t)
-        return t.to(dtype=dtype)
+        if self.use_sit_convention:
+            t = 1 - t
+        return t
+
+    def _convert_output(self, prediction, x_t, t, condition, fwd_pred_type, return_variance=False, **context):
+        """Convert the prediction channels; appended variance channels (``return_variance``) are not a prediction."""
+        if not return_variance:
+            return super()._convert_output(prediction, x_t, t, condition, fwd_pred_type)
+        prediction, variance = prediction.chunk(2, dim=1)
+        prediction = super()._convert_output(prediction, x_t, t, condition, fwd_pred_type)
+        return torch.cat([prediction, variance.to(dtype=prediction.dtype)], dim=1)
 
     def forward(
         self,
@@ -471,6 +491,9 @@ class DiT(FastGenNetwork):
         feature_indices: Optional[Set[int]] = None,
         return_logvar: bool = False,
         fwd_pred_type: Optional[str] = None,
+        return_variance: bool = False,
+        apply_output_conditioning: bool = True,
+        output_dtype: OutputDtype = "same",
         **fwd_kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
         """
@@ -479,66 +502,98 @@ class DiT(FastGenNetwork):
         t: (N, ) tensor of diffusion timesteps
         condition: (N, C) tensor of class labels
         r: (N, ) tensor of another diffusion timesteps
+        return_variance: append a ``learn_sigma`` model's variance channels to the prediction, the reference DiT's
+            output layout
+        apply_output_conditioning: apply the output constraint after the conversion
+        output_dtype: ``"same"`` rounds the prediction to the state dtype; ``None`` keeps it in high precision
         """
-        if feature_indices is None:
-            feature_indices = {}
-        if fwd_pred_type is None:
-            fwd_pred_type = self.net_pred_type
-        else:
-            assert fwd_pred_type in NET_PRED_TYPES, f"{fwd_pred_type} is not supported as fwd_pred_type"
-        x_in, t_in = x_t, t
+        if return_variance and not self.learn_sigma:
+            raise ValueError("return_variance requires a learn_sigma=True DiT.")
+        self._validate_forward_kwargs(
+            fwd_kwargs,
+            r=r,
+            return_features_early=return_features_early,
+            feature_indices=feature_indices,
+            supports_r_timestep=self.r_embedder is not None,
+            num_features=len(self.blocks),
+        )
+        if return_features_early and feature_indices is not None and not feature_indices:
+            return []
 
-        # condition is passed in as one-hot encodings
-        if condition.ndim == 2:
-            # this mimics the behavior of LabelEmbedder.token_drop, mapping a zero-vector to `self.num_classes`
-            # note that this requires `class_dropout_prob > 0`
-            # such that LabelEmbedder.embedding_table is initialized with one embedding more
+        # Match EDM's conditioning contract: None denotes unconditional
+        # inference. DiT represents that state with its learned null-class token.
+        if condition is None:
+            condition = torch.full(
+                (x_t.shape[0],),
+                self.label_dim,
+                device=x_t.device,
+                dtype=torch.long,
+            )
+        # Non-None conditions are passed in as class indices or one-hot encodings.
+        elif condition.ndim == 2:
+            # this mimics the behavior of LabelEmbedder.token_drop, mapping a zero-vector to `self.label_dim`
+            # (`__init__` requires `class_dropout_prob > 0`, which allocates that extra embedding row)
             mask = torch.any(condition, dim=1)
-            condition = torch.where(~mask, self.num_classes, condition.argmax(dim=1))
+            condition = torch.where(~mask, self.label_dim, condition.argmax(dim=1))
 
-        t = self.prepare_t(t, dtype=x_t.dtype)
-        r = self.prepare_t(r, dtype=x_t.dtype)
-
-        # SiT convention: t=0 is noise, t=1 is data (opposite of RF)
-        # Transform timestep so SiT-trained network sees its expected convention
-        if self.use_sit_convention:
-            t = 1 - t
-
-        # Ensure pos_embed buffer is on the same device as input
-        if self.pos_embed.device != x_t.device:
-            self.pos_embed = self.pos_embed.to(x_t.device)
+        assert_same(
+            shape=True,
+            dtype=self.noise_scheduler.t_precision,
+            device=True,
+            t=t,
+            r=r,
+        )
+        x_t_model = self.cast_to_model_precision(x_t)
+        t_model = self.prepare_t(t)
+        r_model = self.prepare_t(r)
+        assert condition.dtype in (
+            torch.int32,
+            torch.int64,
+        ), f"condition must contain integer class indices, got {condition.dtype}"
+        assert_same(shape=True, device=True, t=t, condition=condition)
 
         # Embed spatial patches and add positional information
-        x = self.x_embedder(x_t) + self.pos_embed
+        x = self.x_embedder(x_t_model)
+        x = x + self.pos_embed.to(dtype=x.dtype)
 
         # Embed time conditioning
-        t_emb = self.t_embedder(t)
+        t_emb = self.t_embedder(t_model, proj_input_dtype=x_t_model.dtype)
 
         # Handle secondary time conditioning (for two-stage models)
-        if self.r_embedder is not None and r is not None:
+        if self.r_embedder is not None and r_model is not None:
             if self.time_cond_type == "diff":
-                r_emb = self.r_embedder(t - r)
+                r_emb = self.r_embedder(t_model - r_model, proj_input_dtype=x_t_model.dtype)
             elif self.time_cond_type == "abs":
-                r_emb = self.r_embedder(r)
+                r_emb = self.r_embedder(r_model, proj_input_dtype=x_t_model.dtype)
             else:
                 raise ValueError(f"Invalid time_cond_type: {self.time_cond_type}")
         else:
             r_emb = torch.zeros_like(t_emb)
 
         # Embed class conditioning
-        y = self.y_embedder(condition, self.training)
+        y = self.y_embedder(condition, self.training).to(dtype=t_emb.dtype)
 
         # Combine all conditioning signals
+        assert_same(dtype=True, device=True, x=x, t_emb=t_emb, class_embedding=y, r_emb=r_emb)
+        assert_same(shape=True, t_emb=t_emb, class_embedding=y, r_emb=r_emb)
         c = t_emb + y + r_emb
 
         # Process through transformer blocks
         features = []
         for idx, block in enumerate(self.blocks):
             x = block(x, c)
-            if idx in feature_indices:
-                features.append(x)
+            if feature_indices is not None and idx in feature_indices:
+                # Match the image-DiT discriminator contract used by Flux and
+                # Qwen: [B, tokens, hidden] -> [B, hidden, patch_h, patch_w].
+                batch_size, num_tokens, hidden_size = x.shape
+                patch_h, patch_w = self.x_embedder.grid_size
+                if num_tokens != patch_h * patch_w:
+                    raise ValueError(
+                        f"Cannot reshape {num_tokens} DiT feature tokens into " f"the patch grid {patch_h}x{patch_w}."
+                    )
+                features.append(x.permute(0, 2, 1).reshape(batch_size, hidden_size, patch_h, patch_w))
 
-            if return_features_early and len(features) == len(feature_indices):
+            if return_features_early and feature_indices is not None and len(features) == len(feature_indices):
                 return features
 
         # Project to output space
@@ -547,40 +602,55 @@ class DiT(FastGenNetwork):
         # Reconstruct spatial output
         x = self.unpatchify(x)
 
-        # legacy issue from SiT, where the second half of the channels are unused
+        # The second half of a learn_sigma model's channels is its learned variance, which only the reference DiT's
+        # DDPM sampler uses; SiT leaves it unused.
+        variance = None
         if self.learn_sigma:
-            x = x.chunk(2, dim=1)[0]
+            x, variance = x.chunk(2, dim=1)
 
         # SiT convention: v_sit = x_0 - eps, but RF expects v_rf = eps - x_0
         # Note: "eps" and "x0" predictions don't need negation
         if self.use_sit_convention and self.net_pred_type == "flow":
             x = -x
 
-        x = self.noise_scheduler.convert_model_output(
-            x_in, x, t_in, src_pred_type=self.net_pred_type, target_pred_type=fwd_pred_type
+        if return_variance:
+            x = torch.cat([x, variance], dim=1)
+        x = self.transform_output(
+            x,
+            x_t,
+            t,
+            condition,
+            fwd_pred_type,
+            output_dtype,
+            apply_output_conditioning,
+            return_variance=return_variance,
         )
 
-        # Prepare output
-        if len(feature_indices) == 0:
-            out = x
-        else:
-            out = [x, features]
+        out = [x, features] if feature_indices is not None else x
 
         # Optionally compute log variance
         if return_logvar:
             logvar = self.logvar_linear(t_emb)
-            return out, logvar
+            return out, logvar.to(dtype=x_t.dtype)
 
         return out
+
+    @staticmethod
+    def default_guidance_cfg() -> GuidanceConfig:
+        """Default guidance recipe: CFG only at scale 1.5 (SiT default)."""
+        g = GuidanceConfig()
+        g.cfg.scale = 1.5
+        return g
 
     def sample(
         self,
         noise: torch.Tensor,
         condition: Optional[torch.Tensor] = None,
         neg_condition: Optional[torch.Tensor] = None,
-        guidance_scale: Optional[float] = 5.0,
-        num_steps: int = 50,
-        **kwargs,
+        sample_steps: int = 250,
+        sample_type: Optional[str] = None,
+        guidance_cfg: Optional[GuidanceConfig] = None,
+        last_step_size: float = 0.04,
     ) -> torch.Tensor:
         """Generate samples using appropriate sampler based on schedule_type.
 
@@ -588,120 +658,279 @@ class DiT(FastGenNetwork):
             noise: Initial noise tensor [B, C, H, W].
             condition: Class label conditioning (class indices or one-hot).
             neg_condition: Negative conditioning for CFG.
-            guidance_scale: CFG guidance scale. None disables guidance.
-            num_steps: Number of sampling steps.
-            **kwargs: Additional keyword arguments.
+            sample_steps: Number of model evaluations (250 in the DiT and SiT references).
+            sample_type: Optional integration-policy override. RF defaults to
+                SiT's stochastic ``"sde"``; DDPM schedules default to ``"ddpm"``,
+                the reference DiT's ancestral sampler, and take DDIM steps with
+                ``"ode"``.
+            guidance_cfg: Composite ``GuidanceConfig``; ``None`` →
+                ``default_guidance_cfg()``. Supported terms flow through
+                ``predict_with_guidance``; unsupported perturbation modifiers raise.
+                With ``self.cfg_channels``, CFG guides only that many leading
+                channels and takes the rest from the conditional prediction, as
+                the DiT and SiT releases do with 3.
+            last_step_size: Size of the final deterministic step for RF SDE sampling.
 
         Returns:
-            Generated samples in latent space.
+            Generated samples of shape [B, C, H, W].
         """
-        if self.schedule_type in ("sd", "sdxl", "alphas"):
-            return self._sample_ddim(noise, condition, neg_condition, guidance_scale, num_steps)
-        elif self.schedule_type == "rf":
-            return self._sample_flow(noise, condition, neg_condition, guidance_scale, num_steps)
+        if sample_type is None:
+            sample_type = "sde" if self.schedule_type == "rf" else "ddpm"
+        supported_sample_types = ("ode", "sde") if self.schedule_type == "rf" else ("ode", "ddpm")
+        self._validate_sample_kwargs(
+            sample_type,
+            supported_schedule_types=("ddpm", "sd", "sdxl", "alphas", "rf"),
+            supported_sample_types=supported_sample_types,
+        )
+        if guidance_cfg is None:
+            guidance_cfg = self.default_guidance_cfg()
+
+        if self.schedule_type != "rf":
+            return self._sample_ddpm(
+                noise,
+                condition=condition,
+                neg_condition=neg_condition,
+                guidance_cfg=guidance_cfg,
+                sample_steps=sample_steps,
+                sample_type=sample_type,
+            )
+        if sample_type == "sde":
+            return self._sample_flow_sde(
+                noise,
+                condition=condition,
+                neg_condition=neg_condition,
+                guidance_cfg=guidance_cfg,
+                sample_steps=sample_steps,
+                last_step_size=last_step_size,
+            )
+        return self._sample_flow(
+            noise,
+            condition=condition,
+            neg_condition=neg_condition,
+            guidance_cfg=guidance_cfg,
+            sample_steps=sample_steps,
+        )
+
+    def predict_with_guidance(self, ctx: GuidanceContext) -> torch.Tensor:
+        """Compose DiT/SiT's channel convention on the provider's native predictions."""
+        ctx.guidance_cfg.validate(supported_terms=("cfg", "mix", "rescale"), network_name=type(self).__name__)
+        cond = ctx.predict("pos", condition=ctx.condition)
+        guided = apply_cfg(ctx, cond)
+        if self.cfg_channels is not None and guided is not cond:
+            guided = torch.cat([guided[:, : self.cfg_channels], cond[:, self.cfg_channels :]], dim=1)
+        guided = apply_mix(ctx, guided)
+        # A learn_sigma model's variance channels ride along (return_variance=True); rescale the prediction only.
+        if ctx.fwd_kwargs.get("return_variance"):
+            c = guided.shape[1] // 2
+            guided = torch.cat([apply_rescale(ctx, guided[:, :c], cond[:, :c]), cond[:, c:]], dim=1)
         else:
-            raise ValueError(f"Invalid schedule_type: {self.schedule_type}")
+            guided = apply_rescale(ctx, guided)
+        return guided
 
     def _sample_flow(
         self,
         noise: torch.Tensor,
         condition: Optional[torch.Tensor] = None,
         neg_condition: Optional[torch.Tensor] = None,
-        guidance_scale: Optional[float] = 5.0,
-        num_steps: int = 50,
+        guidance_cfg: Optional[GuidanceConfig] = None,
+        sample_steps: int = 250,
     ) -> torch.Tensor:
-        """Generate samples using Euler method for flow matching.
+        """Generate samples using Euler method for flow matching (ODE).
 
-        Supports both RF and RF2 noise schedules via the noise_scheduler:
-        - RF:  x_t = (1-t)*x_0 + t*eps, t: max_t → min_t (descending)
-        - RF2: x_t = t*x_0 + (1-t)*eps, t: min_t → max_t (ascending)
-
-        The ODE is integrated using: x = x + dt * v
-        where dt and v signs are determined by the noise schedule convention.
+        Uses the RF noise schedule via the noise_scheduler:
+        x_t = (1-t)*x_0 + t*eps, integrated over the descending grid t: max_t → 0
+        with the DDIM step on the flow, which on unshifted RF is the Euler step x = x + (t_next - t) * v.
 
         Args:
             noise: Initial noise tensor.
             condition: Class conditioning (one-hot or indices).
             neg_condition: Negative/null conditioning for CFG.
-            guidance_scale: CFG scale. >1.0 enables guidance.
-            num_steps: Number of sampling steps.
+            guidance_cfg: Composite ``GuidanceConfig`` forwarded to
+                ``predict_with_guidance``.
+            sample_steps: Number of sampling steps.
         """
-        t_list = self.noise_scheduler.get_t_list(num_steps, device=noise.device)
+        grid = self.noise_scheduler.grid(sample_steps, device=noise.device)
 
-        x = self.noise_scheduler.latents(noise=noise, t_init=t_list[0])
-        for t, t_next in zip(t_list[:-1], t_list[1:]):
+        x = self.noise_scheduler.latents(noise=noise, t_init=grid[0])
+        for t, t_next in zip(grid[:-1], grid[1:]):
             t_batch = t.expand(x.shape[0])
-            dt = (t_next - t).to(x.dtype)
-
-            # Get velocity prediction with optional CFG
-            if guidance_scale is not None and guidance_scale > 1.0 and neg_condition is not None:
-                x_input = torch.cat([x, x], dim=0)
-                t_input = torch.cat([t_batch, t_batch], dim=0)
-                cond_input = torch.cat([neg_condition, condition], dim=0)
-
-                v = self(x_input, t_input, condition=cond_input, fwd_pred_type="flow")
-                v_uncond, v_cond = v.chunk(2)
-                v = v_uncond + guidance_scale * (v_cond - v_uncond)
-            else:
-                v = self(x, t_batch, condition=condition, fwd_pred_type="flow")
-
-            # Euler step: x = x + dt * v
-            x = x + dt * v
+            v = predict_with_guidance(
+                self,
+                x,
+                t_batch,
+                condition,
+                guidance_cfg=guidance_cfg,
+                neg_condition=neg_condition,
+                batched=True,
+                output_dtype=None,
+                fwd_pred_type="flow",
+            )
+            x = self.noise_scheduler.step(x, v, t_batch, t_next, pred_type="flow")
 
         return x
 
-    def _sample_ddim(
+    def _sample_flow_sde(
         self,
         noise: torch.Tensor,
         condition: Optional[torch.Tensor] = None,
         neg_condition: Optional[torch.Tensor] = None,
-        guidance_scale: Optional[float] = 5.0,
-        num_steps: int = 50,
+        guidance_cfg: Optional[GuidanceConfig] = None,
+        sample_steps: int = 250,
+        last_step_size: float = 0.04,
     ) -> torch.Tensor:
-        """Generate samples using DDIM (for DDPM schedule with epsilon prediction).
+        """Generate samples using SDE sampling.
 
-        Uses diffusers DDIMScheduler which provides integer timesteps (0-999).
-        We normalize them to [0, 1] before passing to forward().
+        Implements SiT's default SDE sampler (``Sampler.sample_sde``): Euler-Maruyama steps with diffusion
+        ``sigma = t`` from ``max_t`` over ``linspace(max_t, last_step_size, sample_steps)``, then the deterministic
+        "Mean" step to t=0 (if last_step_size > 0): ``sample_steps`` model evaluations, one fewer when
+        ``last_step_size == 0``. SiT starts from pure noise at ``max_t = 1``.
+
+        Reference: https://github.com/willisma/SiT
+
+        Args:
+            noise: Initial noise tensor.
+            condition: Class conditioning (one-hot or indices).
+            neg_condition: Negative/null conditioning for CFG.
+            guidance_cfg: Composite ``GuidanceConfig`` forwarded to
+                ``predict_with_guidance``.
+            sample_steps: Number of model evaluations, at least 2.
+            last_step_size: Size of the final deterministic step (0 to skip).
         """
-        num_train_timesteps = 1000
-        scheduler = DDIMScheduler(
-            num_train_timesteps=num_train_timesteps,
-            beta_start=0.0001,
-            beta_end=0.02,
-            beta_schedule="linear",
-            clip_sample=False,
-            set_alpha_to_one=False,
-            prediction_type="epsilon",
+        if sample_steps < 2:
+            raise ValueError(f"The SiT SDE sampler needs at least 2 sample steps, got {sample_steps}.")
+        times = torch.linspace(
+            self.noise_scheduler.max_t, last_step_size, sample_steps, dtype=self.noise_scheduler.t_precision
         )
-        scheduler.set_timesteps(num_steps, device=noise.device)
+        times = self.noise_scheduler.safe_clamp(times, max=self.noise_scheduler.max_t)
+        dt = (times[0] - times[1]).item()
 
-        # Initialize latents with proper scaling based on the initial timestep
-        t_init = torch.as_tensor(
-            scheduler.timesteps[0].float() / num_train_timesteps,
-            device=noise.device,
-            dtype=noise.dtype,
-        )
-        x = self.noise_scheduler.latents(noise=noise, t_init=t_init)
-        for t in scheduler.timesteps:
-            # Normalize timestep from [0, 999] to [0, 1]
-            t_normalized = t.float() / num_train_timesteps
-            t_batch = t_normalized.expand(x.shape[0])
+        x = self.noise_scheduler.latents(noise=noise, t_init=times[0].to(device=noise.device))
+        state_dtype = x.dtype
 
-            if guidance_scale is not None and guidance_scale > 1.0 and neg_condition is not None:
-                x_input = torch.cat([x, x], dim=0)
-                t_input = torch.cat([t_batch, t_batch], dim=0)
-                cond_input = torch.cat([neg_condition, condition], dim=0)
+        for t in times[:-1].tolist():
+            t_batch = torch.full([x.shape[0]], t, device=x.device, dtype=self.noise_scheduler.t_precision)
 
-                eps_pred = self(x_input, t_input, condition=cond_input)
-                eps_uncond, eps_cond = eps_pred.chunk(2)
-                eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-            else:
-                eps_pred = self(x, t_batch, condition=condition)
+            v = predict_with_guidance(
+                self,
+                x,
+                t_batch,
+                condition,
+                guidance_cfg=guidance_cfg,
+                neg_condition=neg_condition,
+                batched=True,
+                output_dtype=None,
+                fwd_pred_type="flow",
+            )
 
-            # DDIM step (uses original integer timestep)
-            x = scheduler.step(eps_pred, t, x, return_dict=False)[0]
+            # SiT integrates dx = (v_sit + w * score) dτ with τ = 1 - t, v_sit = -v, w = sigma = t and
+            # score = -eps / t = -(x + (1 - t) v) / t, so per unit τ the drift is -(v + eps) = -((2 - t) v + x).
+            # Each update runs in the prediction's high precision and rounds once to the state dtype, like ``step``.
+            # Fresh noise is drawn like the state, so the draw does not depend on the prediction's precision.
+            fresh_noise = torch.randn_like(x)
+            x, v, fresh_noise = to_high_precision(x, v, fresh_noise)
+            mean_x = x - ((2.0 - t) * v + x) * dt
+            x = (mean_x + math.sqrt(2.0 * t * dt) * fresh_noise).to(state_dtype)
+
+        if last_step_size > 0:
+            # Final deterministic step
+            t = last_step_size
+            t_batch = torch.full([x.shape[0]], t, device=x.device, dtype=self.noise_scheduler.t_precision)
+            v = predict_with_guidance(
+                self,
+                x,
+                t_batch,
+                condition,
+                guidance_cfg=guidance_cfg,
+                neg_condition=neg_condition,
+                batched=True,
+                output_dtype=None,
+                fwd_pred_type="flow",
+            )
+            x, v = to_high_precision(x, v)
+            x = (x - ((2.0 - t) * v + x) * last_step_size).to(state_dtype)
 
         return x
+
+    def _sample_ddpm(
+        self,
+        noise: torch.Tensor,
+        condition: Optional[torch.Tensor] = None,
+        neg_condition: Optional[torch.Tensor] = None,
+        guidance_cfg: Optional[GuidanceConfig] = None,
+        sample_steps: int = 250,
+        sample_type: str = "ddpm",
+    ) -> torch.Tensor:
+        """Sample the DiT release's respaced DDPM chain from pure noise: ``sample_steps`` evenly strided timesteps
+        of this network's schedule table, from the last one down to 0.
+
+        ``"ddpm"`` takes ancestral steps, whose variance a ``learn_sigma`` model interpolates between the
+        posterior's and ``beta`` and which is ``beta`` otherwise; ``"ode"`` takes DDIM steps. Both end on the x0
+        prediction at timestep 0. The variance comes from the conditional prediction, which CFG leaves unguided.
+
+        The ancestral steps are diffusers' ``DDPMScheduler`` over the kept timesteps (float32 tables). No diffusers
+        scheduler takes the DDIM step on that grid (``DDIMScheduler`` strides by a fixed
+        ``num_train_timesteps // steps``), so it is the noise schedule's ``step``: into timestep 0, the table's
+        first, noisy entry (``clean_end=False``), and from it to x0.
+        """
+        schedule = self.noise_scheduler
+        alphas_cumprod = to_high_precision(schedule.alphas_cumprod)
+        num_timesteps = len(alphas_cumprod)
+        if schedule.min_t > 0 or schedule.max_t < (num_timesteps - 1) / num_timesteps:
+            raise ValueError(
+                f"{type(self).__name__}'s DDPM sampler runs the schedule's whole table, timesteps 0 to "
+                f"{num_timesteps - 1}, so it needs min_t = 0 and max_t >= {(num_timesteps - 1) / num_timesteps}; "
+                f"got [{schedule.min_t}, {schedule.max_t}]."
+            )
+        timesteps = _respaced_timesteps(num_timesteps, sample_steps)
+        channels = noise.shape[1]
+        if sample_type == "ddpm":
+            betas = 1 - alphas_cumprod / torch.cat([alphas_cumprod.new_ones(1), alphas_cumprod[:-1]])
+            ddpm_scheduler = DDPMScheduler(
+                num_train_timesteps=num_timesteps,
+                trained_betas=betas.cpu().numpy(),
+                variance_type="learned_range" if self.learn_sigma else "fixed_large",
+                clip_sample=False,
+                prediction_type="epsilon",
+            )
+            ddpm_scheduler.set_timesteps(timesteps=timesteps[:-1])
+
+        x = noise
+        for step, next_step in zip(timesteps, timesteps[1:]):
+            t = torch.full([x.shape[0]], step / num_timesteps, device=x.device, dtype=schedule.t_precision)
+            guided = predict_with_guidance(
+                self,
+                x,
+                t,
+                condition,
+                guidance_cfg=guidance_cfg,
+                neg_condition=neg_condition,
+                batched=True,
+                # Diffusers' step returns its inputs' dtype; the schedule's step rounds to the state dtype itself.
+                output_dtype="same" if sample_type == "ddpm" else None,
+                fwd_pred_type="eps",
+                return_variance=self.learn_sigma,
+            )
+            if sample_type == "ddpm":
+                x = ddpm_scheduler.step(guided, step, x).prev_sample
+            else:
+                # The chain always keeps timestep 0; the step from it, to ``alpha_bar_prev = 1``, is the x0 prediction.
+                t_next = torch.full_like(t, next_step / num_timesteps)
+                x = schedule.step(x, guided[:, :channels], t, t_next, pred_type="eps", clean_end=step == 0)
+
+        return x
+
+
+def _respaced_timesteps(num_timesteps: int, sample_steps: int) -> List[int]:
+    """The DiT release's respaced chain in sampling order: ``sample_steps`` rounded, evenly strided timesteps from
+    ``num_timesteps - 1`` down to 0, followed by the 0 that its last step, the x0 prediction, goes to."""
+    if not 1 <= sample_steps <= num_timesteps:
+        raise ValueError(f"sample_steps must be in [1, {num_timesteps}], got {sample_steps}.")
+    stride = 1 if sample_steps == 1 else (num_timesteps - 1) / (sample_steps - 1)
+    timesteps, position = [], 0.0
+    for _ in range(sample_steps):
+        timesteps.append(round(position))
+        position += stride
+    return sorted(set(timesteps), reverse=True) + [0]
 
 
 #################################################################################
@@ -791,18 +1020,37 @@ def _encode_1d_positions(positions: np.ndarray, output_dim: int, max_wavelength:
     return embeddings
 
 
-class SDVAE:
+class SDVAE(FastGenModule):
     """
     The Stable Diffusion VAE for DiT.
 
     Handles both:
     - Raw RGB images (3 channels) -> encodes to latents
     - Pre-encoded latents (8 channels = mean + std) -> samples and scales
+
+    The official DiT runtime and Stable Diffusion VAE are FP32 without autocast, and
+    DiT applies ``0.18215`` outside the VAE immediately to its sampled posterior. The
+    raw-image path retains that FP32 boundary; cached posterior moments bypass the VAE
+    and are consequently sampled and scaled in their incoming dtype.
     """
 
-    def __init__(self):
-        self._vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").eval().requires_grad_(False)
+    def __init__(self, variant="mse"):
+        super().__init__()
+        self._vae = hf_load(AutoencoderKL.from_pretrained, f"stabilityai/sd-vae-ft-{variant}")
         self.scaling_factor = self._vae.config.scaling_factor
+
+    @property
+    def precision_model(self) -> Optional[torch.dtype]:
+        """Keep the released FP32 VAE fixed while allowing custom replacements to opt out."""
+        if getattr(self._vae.config, "force_upcast", False):
+            return torch.float32
+        return super().precision_model
+
+    @property
+    def latent_compression_factors(self) -> tuple[int, int]:
+        """Pixel-to-latent ``(H, W)`` downsampling of the VAE; every down block but the last halves resolution."""
+        factor = 2 ** (len(self._vae.config.block_out_channels) - 1)
+        return (factor, factor)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode images to latents.
@@ -813,25 +1061,27 @@ class SDVAE:
         Returns:
             Scaled latents [B, 4, H//8, W//8].
         """
-        if x.shape[1] == 3:
-            # Raw RGB images - encode with VAE
-            d = self._vae.encode(x)["latent_dist"]
-            latents = d.mean + torch.randn_like(d.mean) * d.std
-        elif x.shape[1] == 8:
-            # Pre-encoded latents (mean + std) - sample from distribution
-            mean, std = x.chunk(2, dim=1)
-            latents = mean + torch.randn_like(mean) * std
-        else:
-            raise ValueError(f"Expected 3 (RGB) or 8 (mean+std) channels, got {x.shape[1]}")
-        return latents * self.scaling_factor
+        return self(x, operation="encode")
 
     def decode(self, x: torch.Tensor) -> torch.Tensor:
         """Decode latents to images."""
-        latents = x / self.scaling_factor
-        images = self._vae.decode(latents, return_dict=False)[0].clamp(-1.0, 1.0)
-        return images
+        return self(x, operation="decode")
 
-    def to(self, *args, **kwargs):
-        """Moves the model to the specified device."""
-        self._vae.to(*args, **kwargs)
-        return self
+    def forward(self, x: torch.Tensor, operation: str) -> torch.Tensor:
+        if operation == "encode":
+            if x.shape[1] == 3:
+                # Raw RGB images - encode with VAE
+                d = self._vae.encode(x.to(dtype=self.precision_model))["latent_dist"]
+                latents = d.mean + torch.randn_like(d.mean) * d.std
+            elif x.shape[1] == 8:
+                # Pre-encoded latents (mean + std) - sample from distribution
+                mean, std = x.chunk(2, dim=1)
+                latents = mean + torch.randn_like(mean) * std
+            else:
+                raise ValueError(f"Expected 3 (RGB) or 8 (mean+std) channels, got {x.shape[1]}")
+            return latents * self.scaling_factor
+        if operation == "decode":
+            latents = x.to(dtype=self.precision_model) / self.scaling_factor
+            images = self._vae.decode(latents, return_dict=False)[0]
+            return images.clamp(-1.0, 1.0)
+        raise ValueError(f"Unsupported preprocessor operation: {operation!r}")

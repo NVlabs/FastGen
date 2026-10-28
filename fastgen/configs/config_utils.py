@@ -1,9 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+"""Config loading, command-line overrides, and serialization.
+
+Overrides use Hydra's grammar. A dict value such as ``key={a: 1}`` merges into the existing dict and cannot add keys to
+it, so to replace a dict, clear it with ``key=null`` and add its entries with ``++key.a=1``.
+"""
+
 import os
-from typing import Any, Optional, List, Dict
-import inspect
+from collections.abc import Mapping
+from typing import Any, Optional, List, Dict, Tuple
 from copy import deepcopy
 
 import attrs
@@ -24,7 +30,7 @@ def import_config_from_python_file(config_file: str) -> Any:
     Import a config from a python file.
 
     Args:
-        config_file (str): The path to the python file.
+        config_file (str): The path to the python file, relative to the working directory.
 
     Returns:
         Any: The config object.
@@ -33,20 +39,44 @@ def import_config_from_python_file(config_file: str) -> Any:
     if not config_file.endswith(".py"):
         raise ValueError("Config file must be a Python file with a .py extension. " f"Received: {config_file}")
 
+    if os.path.isabs(config_file):
+        raise ValueError(
+            "Config file must be a path relative to the working directory, since it is converted to "
+            f"a module name. Received: {config_file}"
+        )
+
     if not os.path.isfile(config_file):
         raise FileNotFoundError(f"FastGen config file ({config_file}) not found.")
 
     # Convert to importable module format.
-    config_module = config_file.replace("/", ".").replace(".py", "")
+    normalized = os.path.normpath(config_file)
+    if normalized == os.pardir or normalized.startswith(os.pardir + os.sep):
+        raise ValueError(
+            "Config file must live below the working directory, since it is converted to a module name. "
+            f"Received: {config_file}"
+        )
+    config_module = os.path.splitext(normalized)[0].replace(os.sep, ".")
 
     # Import the module
     try:
-        config = importlib.import_module(config_module)
+        module = importlib.import_module(config_module)
     except ImportError as e:
         logger.error(f"Failed to import config from python file: {e}")
         raise e
 
-    return config.create_config()
+    return module.create_config()
+
+
+def model_pixel_shape(model_config: Any) -> Tuple[int, ...]:
+    """``(H, W)`` or ``(T, H, W)`` of the pixels that encode to ``model_config.input_shape``.
+
+    Asks the class of ``model_config.net`` through ``pixel_shape_for``, so a config can size its loaders before any
+    network exists. A modality dict contributes its ``"video"`` entry.
+    """
+    input_shape = model_config.input_shape
+    if isinstance(input_shape, Mapping):
+        input_shape = input_shape["video"]
+    return model_config.net._target_.pixel_shape_for(input_shape)
 
 
 def config_from_dict(ref_instance: Any, kwargs: Any) -> Any:
@@ -72,11 +102,9 @@ def config_from_dict(ref_instance: Any, kwargs: Any) -> Any:
         assert isinstance(kwargs, dict) or isinstance(kwargs, DictConfig), "kwargs must be a dictionary or a DictConfig"
         keys = set(kwargs.keys())
 
-        # ref_fields must equal to or include all keys
+        # ref_fields must include all keys
         extra_keys = keys - ref_fields
-        assert (
-            ref_fields == keys or keys.issubset(ref_fields)
-        ), f"Fields mismatch: {ref_fields} != {keys}. Extra keys found: {extra_keys} \n \t when constructing {type(ref_instance)} with {keys}"
+        assert keys <= ref_fields, f"Unknown config fields {extra_keys} for {type(ref_instance)}"
 
         resolved_kwargs: Dict[str, Any] = {}
         for f in keys:
@@ -90,48 +118,14 @@ def config_from_dict(ref_instance: Any, kwargs: Any) -> Any:
         return new_instance
 
 
-def flatten_dict(nested_dict, parent_key="", sep=".", exclude_key="_target_"):
-    """
-    Flattens a nested dictionary by joining keys with a separator.
-
-    Args:
-        nested_dict (dict): The dictionary to flatten.
-        parent_key (str, optional): The base key to prepend to flattened keys.
-                                    Used in recursion. Defaults to ''.
-        sep (str, optional): The separator to use between keys. Defaults to '.'.
-
-    Returns:
-        dict: A new, flattened dictionary.
-    """
-    items = []
-    for key, value in nested_dict.items():
-        if key == exclude_key:
-            continue
-        if value is None:
-            continue
-
-        # Create the new key by joining parent_key and key
-        new_key = parent_key + sep + key if parent_key else key
-
-        # If the value is a non-empty dictionary, recurse
-        if isinstance(value, DictConfig):
-            value = OmegaConf.to_container(value)
-        if isinstance(value, dict) and value:
-            items.extend(flatten_dict(value, new_key, sep=sep, exclude_key=exclude_key).items())
-        # If the value is not a dictionary, it's a leaf node
-        else:
-            items.append((new_key, value))
-
-    return dict(items)
-
-
 def override_config_with_opts(config: Any, opts: Optional[List[str]] = None) -> Any:
     """
     Override the config with the opts.
 
     Args:
         config (Any): The config object.
-        opts (Dict[str, Any]): Dict for the overrides.
+        opts (Optional[List[str]]): Hydra override strings, starting with the "-" separator
+            (e.g. ["-", "trainer.max_iter=10"]).
 
     Returns:
         Any: The config object.
@@ -166,22 +160,6 @@ def override_config_with_opts(config: Any, opts: Optional[List[str]] = None) -> 
     config = config_from_dict(config, cfg)
 
     return config
-
-
-def override_config_with_yaml(config: Any, yaml_path: str) -> Any:
-    """
-    Override the config with the yaml file. **_target_ field is excluded**.
-    """
-    with open(yaml_path, "r") as f:
-        yaml_dict = yaml.safe_load(f)
-    yaml_dict = flatten_dict(yaml_dict)
-    config_dict = flatten_dict(attrs.asdict(config))
-
-    # Loose overriding: all mismatched keys are ignored
-    override_dict = {k: v for k, v in yaml_dict.items() if k in config_dict}
-
-    opts = ["-"] + [f"{k}={v}" for k, v in override_dict.items()]
-    return override_config_with_opts(config, opts=opts)
 
 
 def is_attrs_or_dataclass(obj) -> bool:
@@ -223,7 +201,6 @@ def serialize_config(
     return_type: str = "dict",
     path: str | bytes | None = None,
     filename: str = "config.yaml",
-    include_defaults: bool = False,
 ) -> Dict[str, Any] | str:
     """
     Serialize a config (BaseConfig or DictConfig) to various formats.
@@ -233,7 +210,6 @@ def serialize_config(
         return_type: Output format - "dict" (plain dict), "yaml" (YAML string), or "file" (save to file).
         path: Directory path to save the file. Required if return_type is "file".
         filename: Name of the file to save. Only used if return_type is "file".
-        include_defaults: If True, add default parameter values from _target_ classes.
 
     Returns:
         Dict[str, Any] if return_type is "dict"
@@ -256,34 +232,13 @@ def serialize_config(
         config_omegaconf = config
 
     def is_serializable(item) -> bool:
-        try:
-            OmegaConf.to_yaml(item)
-            return True
-        except Exception:
-            return False
-
-    def get_default_params(cls_or_func):
-        if callable(cls_or_func):
-            signature = inspect.signature(cls_or_func)
-        else:
-            signature = inspect.signature(cls_or_func.__init__)
-        params = signature.parameters
-        return {name: param.default for name, param in params.items() if param.default is not inspect.Parameter.empty}
+        # Exact types: YAML tags subclasses, such as str-valued enums, as Python objects that safe loaders reject.
+        return type(item) in (bool, int, float, str)
 
     def process_config(conf):
         if isinstance(conf, DictConfig):
             for key, value in conf.items():
                 if isinstance(value, (DictConfig, ListConfig)):
-                    # Optionally add default params from _target_ classes
-                    if include_defaults:
-                        try:
-                            if "_target_" in value:
-                                default_params = get_default_params(value["_target_"])
-                                for default_key, default_v in default_params.items():
-                                    if default_key not in value:
-                                        value[default_key] = default_v
-                        except Exception as e:
-                            logger.error(f"Failed to add default argument values: {e}")
                     process_config(value)
                 else:
                     if not is_serializable(value) and value is not None:
