@@ -15,7 +15,21 @@ See [command-line arguments](/fastgen/configuration#command-line-arguments) for 
 
 ## CUDA runs out of memory
 
-Reduce the per-device `dataloader_train.batch_size`; FastGen can accumulate gradients to maintain the configured global batch size. For large models, review the recipe's precision and sharding settings and consider FSDP. Available memory and supported parallelism depend on the selected network and config.
+- Reduce `dataloader_train.batch_size` and set `trainer.batch_size_global` for automatic gradient accumulation. For manual accumulation, set `trainer.grad_accum_rounds` and clear the global batch override with `trainer.batch_size_global=null`.
+- Enable [FSDP](/fastgen/training#use-multiple-gpus) with `trainer.fsdp=True`, `trainer.ddp=False`, and `trainer.fsdp_cpu_offload=True`. Offloading saves GPU memory but uses more host RAM.
+- To shard and offload supported preprocessors too, append their names (e.g., `"text_encoder"`, `"vae"`) to `model.extra_fsdp_modules`, preserving existing entries. Preprocessing and decoding calls must run in the same order across ranks in each shard group.
+- Use [image](/fastgen/datasets#imagelatentloaderconfig) or [video](/fastgen/datasets#videolatentloaderconfig) latent loaders for pre-encoded latents and conditions. Set `model.enable_preprocessors=False` when all required inputs are precomputed. Sample decoding may still load a VAE.
+
+## CPU runs out of memory
+
+Loading multiple models or preprocessors, including CPU-offloaded parameters, can exhaust host RAM. Pre-encoded inputs help avoid unnecessary preprocessors.
+
+Data-loader workers also buffer and prefetch data. For WebDataset loaders, try smaller shuffle buffers and fewer workers; reduce these further if needed:
+
+```python
+config.dataloader_train.shuffle_size = 100
+config.dataloader_train.num_workers = 2
+```
 
 ## Model or dataset files are missing
 
