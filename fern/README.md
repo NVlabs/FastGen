@@ -14,7 +14,7 @@ Run from the checkout root:
 npm install -g pnpm@10.20.0
 npm install -g "fern-api@$(node -p 'require("./fern/fern.config.json").version')"
 python3 fern/scripts/build_docs.py
-python3 fern/scripts/check-docs-mdx fern
+python3 -B tests/test_fern.py
 python3 fern/scripts/check-docs-paths fern
 fern check
 fern docs md check

@@ -79,8 +79,7 @@ jobs:
         run: python3 fern/scripts/build_docs.py --source-ref "$SOURCE_REF"
       - name: Validate documentation
         run: |
-          python3 -B -m unittest discover -s fern/scripts/tests
-          python3 fern/scripts/check-docs-mdx fern
+          python3 -B tests/test_fern.py
           python3 fern/scripts/check-docs-paths fern
           fern check
           fern docs md check
