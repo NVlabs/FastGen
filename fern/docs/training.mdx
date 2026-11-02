@@ -29,7 +29,7 @@ torchrun --nproc_per_node=8 train.py \
 
 For models that require parameter sharding, use `trainer.fsdp=True` in place of `trainer.ddp=True`. The launcher alone does not enable either mode. Match the launcher to your available GPUs and cluster scheduler.
 
-Supported Wan networks also offer [context parallelism](/fastgen/networks#context-parallelism). Review the network's requirements before combining it with distributed training.
+See the [configuration reference](/fastgen/configuration#large-models-precision-and-lora) for sharding, precision, and LoRA settings.
 
 ## Save and resume
 
