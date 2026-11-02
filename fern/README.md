@@ -2,7 +2,7 @@
 
 Edit component READMEs for generated guides, or `docs/*.mdx` for authored pages.
 Add new README sources to [scripts/build_docs.py](scripts/build_docs.py) and
-pages to [docs/index.yml](docs/index.yml). Generated files in `docs/generated/`
+pages to [docs.yml](docs.yml). Generated files in `docs/generated/`
 are ignored by Git; rebuild them after editing a source README.
 
 ## Validate and preview

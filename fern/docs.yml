@@ -17,10 +17,73 @@ navbar-links:
   - type: github
     value: https://github.com/NVlabs/FastGen
 
-products:
-  - display-name: FastGen
-    path: ./docs/index.yml
+navigation:
+  - page: NVIDIA FastGen Overview
+    path: ./docs/overview.mdx
     slug: /
+  - page: Get started
+    path: ./docs/generated/get-started.mdx
+    slug: get-started
+  - section: Train and generate
+    skip-slug: true
+    contents:
+      - page: Training and checkpoints
+        path: ./docs/training.mdx
+        slug: training
+      - page: Inference and evaluation
+        path: ./docs/generated/inference.mdx
+        slug: inference
+      - page: ComfyUI
+        path: ./docs/generated/comfyui.mdx
+        slug: comfyui
+  - section: Methods
+    skip-slug: true
+    contents:
+      - page: Choose a method
+        path: ./docs/generated/methods.mdx
+        slug: methods
+      - page: Trajectory matching
+        path: ./docs/generated/trajectory-matching.mdx
+        slug: trajectory-matching
+      - page: Distribution matching
+        path: ./docs/generated/distribution-matching.mdx
+        slug: distribution-matching
+      - page: Fine-tuning
+        path: ./docs/generated/fine-tuning.mdx
+        slug: fine-tuning
+  - section: Reference
+    skip-slug: true
+    contents:
+      - page: Networks and pretrained models
+        path: ./docs/generated/networks.mdx
+        slug: networks
+      - page: Datasets
+        path: ./docs/generated/datasets.mdx
+        slug: datasets
+      - page: Configuration
+        path: ./docs/generated/configuration.mdx
+        slug: configuration
+      - page: Callbacks
+        path: ./docs/generated/callbacks.mdx
+        slug: callbacks
+      - page: KV cache
+        path: ./docs/generated/kv-cache.mdx
+        slug: kv-cache
+      - page: Third-party components
+        path: ./docs/generated/third-party.mdx
+        slug: third-party
+      - page: Licenses
+        path: ./docs/generated/licenses.mdx
+        slug: licenses
+  - page: Troubleshooting
+    path: ./docs/troubleshooting.mdx
+    slug: troubleshooting
+  - page: Release notes
+    path: ./docs/release-notes.mdx
+    slug: release-notes
+  - page: Resources
+    path: ./docs/generated/resources.mdx
+    slug: resources
 
 check:
   rules:

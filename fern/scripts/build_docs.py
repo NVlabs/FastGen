@@ -7,7 +7,7 @@
 The READMEs remain the source of truth. Generated files are ignored by Git and
 rebuilt before validation, preview, or publishing. No FastGen imports are needed.
 Only PAGES below are included; internal dev/ docs and vendored READMEs are not
-discovered automatically. Authored pages and navigation live in fern/docs/.
+discovered automatically. Authored pages live in fern/docs/; navigation is in fern/docs.yml.
 
 Run from any directory: python3 /path/to/fastgen/fern/scripts/build_docs.py
 Use --source-ref <public-tag-or-sha> to pin GitHub links (default: main).
