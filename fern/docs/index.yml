@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+navigation:
+  - page: NVIDIA FastGen Overview
+    path: ./overview.mdx
+    slug: /
+  - page: Get started
+    path: ./generated/get-started.mdx
+    slug: get-started
+  - section: Train and generate
+    skip-slug: true
+    contents:
+      - page: Training and checkpoints
+        path: ./training.mdx
+        slug: training
+      - page: Inference and evaluation
+        path: ./generated/inference.mdx
+        slug: inference
+      - page: ComfyUI
+        path: ./generated/comfyui.mdx
+        slug: comfyui
+  - section: Methods
+    skip-slug: true
+    contents:
+      - page: Choose a method
+        path: ./generated/methods.mdx
+        slug: methods
+      - page: Trajectory matching
+        path: ./generated/trajectory-matching.mdx
+        slug: trajectory-matching
+      - page: Distribution matching
+        path: ./generated/distribution-matching.mdx
+        slug: distribution-matching
+      - page: Fine-tuning
+        path: ./generated/fine-tuning.mdx
+        slug: fine-tuning
+  - section: Reference
+    skip-slug: true
+    contents:
+      - page: Networks and pretrained models
+        path: ./generated/networks.mdx
+        slug: networks
+      - page: Datasets
+        path: ./generated/datasets.mdx
+        slug: datasets
+      - page: Configuration
+        path: ./generated/configuration.mdx
+        slug: configuration
+      - page: Callbacks
+        path: ./generated/callbacks.mdx
+        slug: callbacks
+      - page: KV cache
+        path: ./generated/kv-cache.mdx
+        slug: kv-cache
+      - page: Third-party components
+        path: ./generated/third-party.mdx
+        slug: third-party
+      - page: Licenses
+        path: ./generated/licenses.mdx
+        slug: licenses
+  - page: Troubleshooting
+    path: ./troubleshooting.mdx
+    slug: troubleshooting
+  - page: Release notes
+    path: ./release-notes.mdx
+    slug: release-notes
+  - page: Resources
+    path: ./generated/resources.mdx
+    slug: resources

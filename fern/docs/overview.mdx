@@ -1,0 +1,30 @@
+---
+title: NVIDIA FastGen Overview
+description: Train, distill, and run diffusion models for image, video, and audio generation with PyTorch.
+---
+
+FastGen is a PyTorch library for training and distilling diffusion models into fast generative models. Use it to fine-tune a teacher, train a student that generates in fewer steps, and evaluate image, video, or video-and-audio outputs.
+
+## Start here
+
+- [Get started](/fastgen/get-started): install FastGen and run the CIFAR-10 training and inference example.
+- [Run inference](/fastgen/inference): generate images, video, or video with audio from a configured model.
+- [Prepare your dataset](/fastgen/datasets): choose a loader and supply your training data.
+- [Troubleshoot a run](/fastgen/troubleshooting): resolve common configuration, memory, and checkpoint issues.
+
+## What you can do
+
+- Distill an image or video diffusion model into a student that uses fewer generation steps.
+- Fine-tune a supported model on your data, including conditional and causal generation tasks.
+- Train large models using DDP, FSDP2, and supported context-parallel implementations.
+- Compare generated outputs with FID or use the ComfyUI integration to explore teacher and student inference.
+
+## Core concepts
+
+A [configuration](/fastgen/configuration) combines a [method](/fastgen/methods), a [network](/fastgen/networks), a [dataset](/fastgen/datasets), and training settings. Experiment configs are runnable starting points; model and data combinations have different prerequisites. Check the selected recipe before starting a large run.
+
+Benchmark tables identify results measured with FastGen v0.1.0. Use that revision and the corresponding configuration when reproducing those results.
+
+## Learn more
+
+[Resources](/fastgen/resources) collects external models, research projects, and integrations. See the public [GitHub repository](https://github.com/NVlabs/FastGen), [issue tracker](https://github.com/NVlabs/FastGen/issues), and [release history](https://github.com/NVlabs/FastGen/releases) for source code, support, and released revisions.

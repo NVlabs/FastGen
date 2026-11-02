@@ -68,6 +68,12 @@ data and works outside the checkout. Run only this check with
 
 **Note:** Keep PRs focused on a single concern and reference related issues (e.g., "Fixes #123").
 
+## Documentation
+
+Edit component READMEs for the generated guides, or `fern/docs/*.mdx` for
+authored pages. See [fern/README.md](fern/README.md) for validation and local
+previews. Documentation changes require no GPU or FastGen installation.
+
 ## Developer Certificate of Origin
 
 ```

@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# yaml-language-server: $schema=https://schema.buildwithfern.dev/docs-yml.json
+
+instances:
+  - url: nvidia-fastgen.docs.buildwithfern.com/fastgen
+    custom-domain: docs.nvidia.com/fastgen
+    multi-source: true
+
+title: NVIDIA FastGen
+global-theme: nvidia
+
+logo:
+  right-text: FastGen
+
+navbar-links:
+  - type: github
+    value: https://github.com/NVlabs/FastGen
+
+products:
+  - display-name: FastGen
+    path: ./docs/index.yml
+    slug: /
+
+check:
+  rules:
+    broken-links: error

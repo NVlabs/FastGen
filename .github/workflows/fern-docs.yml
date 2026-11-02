@@ -1,0 +1,213 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Fern Docs
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, closed]
+  push:
+    branches: [main]
+    tags: ["v*", "docs-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fern-docs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  target:
+    name: Select deployment
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.target.outputs.mode }}
+      preview-id: ${{ steps.target.outputs.preview-id }}
+    steps:
+      - id: target
+        name: Resolve the deployment from the GitHub event
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          mode=none
+          preview_id=staging
+          if [[ "$REPOSITORY" == NVlabs/FastGen ]]; then
+            if [[ "$EVENT" == pull_request && "$HEAD_REPOSITORY" == "$REPOSITORY" ]]; then
+              preview_id="fastgen-pr-$PR_NUMBER"
+              if [[ "$ACTION" == closed ]]; then
+                mode=cleanup
+              elif [[ "$DRAFT" != true ]]; then
+                mode=preview
+              fi
+            elif [[ "$EVENT" != pull_request && "$REF_TYPE" == tag ]]; then
+              if [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ || "$REF_NAME" =~ ^docs-v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?-[0-9]+$ ]]; then
+                mode=production
+              fi
+            elif [[ "$EVENT" != pull_request && "$REF_TYPE" == branch && "$REF_NAME" == "$DEFAULT_BRANCH" ]]; then
+              mode=staging
+            fi
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "preview-id=$preview_id" >> "$GITHUB_OUTPUT"
+
+  check:
+    name: Fern Check
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+      - name: Install the pinned Fern CLI
+        run: npm install -g "fern-api@$(node -p 'require("./fern/fern.config.json").version')"
+      - name: Build pages from public READMEs
+        env:
+          SOURCE_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 fern/scripts/build_docs.py --source-ref "$SOURCE_REF"
+      - name: Validate documentation
+        run: |
+          python3 -B -m unittest discover -s fern/scripts/tests
+          python3 fern/scripts/check-docs-mdx fern
+          python3 fern/scripts/check-docs-paths fern
+          fern check
+          fern docs md check
+      - name: Save validated documentation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fern-docs
+          path: fern/
+          retention-days: 7
+
+  deploy:
+    name: Deploy documentation
+    needs: [target, check]
+    if: contains(fromJSON('["preview", "staging", "production"]'), needs.target.outputs.mode)
+    runs-on: ubuntu-latest
+    environment: ${{ needs.target.outputs.mode == 'production' && 'production' || 'docs-preview' }}
+    concurrency:
+      group: fern-${{ needs.target.outputs.mode == 'production' && 'production' || needs.target.outputs.preview-id }}
+      cancel-in-progress: ${{ needs.target.outputs.mode != 'production' }}
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Check Fern credentials
+        id: credentials
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          MODE: ${{ needs.target.outputs.mode }}
+        run: |
+          if [[ -n "$FERN_TOKEN" ]]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          elif [[ "$MODE" == production ]]; then
+            echo '::error::Configure FERN_TOKEN in the production environment before publishing.'
+            exit 1
+          else
+            echo '::warning::Preview skipped: configure FERN_TOKEN for the docs-preview environment.'
+          fi
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: steps.credentials.outputs.enabled == 'true'
+        with:
+          name: fern-docs
+          path: fern/
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: steps.credentials.outputs.enabled == 'true'
+        with:
+          node-version: "22"
+      - name: Install the pinned Fern CLI
+        if: steps.credentials.outputs.enabled == 'true'
+        run: npm install -g "fern-api@$(node -p 'require("./fern/fern.config.json").version')"
+      - name: Publish the validated artifact
+        if: steps.credentials.outputs.enabled == 'true'
+        id: deploy
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          MODE: ${{ needs.target.outputs.mode }}
+          PREVIEW_ID: ${{ needs.target.outputs.preview-id }}
+        run: |
+          if [[ "$MODE" == production ]]; then
+            fern generate --docs --no-prompt 2>&1 | tee "$RUNNER_TEMP/fern-deploy.log"
+          else
+            fern generate --docs --preview --id "$PREVIEW_ID" --no-prompt 2>&1 | tee "$RUNNER_TEMP/fern-deploy.log"
+          fi
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          log = (Path(os.environ['RUNNER_TEMP']) / 'fern-deploy.log').read_text()
+          log = re.sub(r'\x1b\[[0-9;]*m', '', log)
+          urls = re.findall(r'https://[a-zA-Z0-9.-]+\.docs\.buildwithfern\.com/fastgen(?:/[^\s<>\x1b]*)?', log)
+          if not urls and os.environ['MODE'] != 'production':
+              raise SystemExit('Fern succeeded but did not return an expected preview URL.')
+          url = 'https://docs.nvidia.com/fastgen' if os.environ['MODE'] == 'production' else urls[-1].rstrip(').,')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'url={url}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f'Documentation: [{url}]({url})\n')
+          PY
+
+  preview-comment:
+    name: Comment with the preview
+    needs: [target, deploy]
+    if: needs.target.outputs.mode == 'preview' && needs.deploy.outputs.url != ''
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          PREVIEW_URL: ${{ needs.deploy.outputs.url }}
+        with:
+          script: |
+            const marker = '<!-- fastgen-fern-preview -->';
+            const body = `${marker}\n[Preview the FastGen documentation](${process.env.PREVIEW_URL})`;
+            const params = {...context.repo, issue_number: context.issue.number};
+            const comments = await github.paginate(github.rest.issues.listComments, params);
+            const previous = comments.find(comment => comment.user.type === 'Bot' && comment.body.includes(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({...context.repo, comment_id: previous.id, body});
+            } else {
+              await github.rest.issues.createComment({...params, body});
+            }
+
+  cleanup:
+    name: Delete the closed PR preview
+    needs: target
+    if: needs.target.outputs.mode == 'cleanup'
+    runs-on: ubuntu-latest
+    environment: docs-preview
+    concurrency:
+      group: fern-${{ needs.target.outputs.preview-id }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          sparse-checkout: fern
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+      - name: Install the pinned Fern CLI
+        run: npm install -g "fern-api@$(node -p 'require("./fern/fern.config.json").version')"
+      - name: Remove the matching preview
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          PREVIEW_ID: ${{ needs.target.outputs.preview-id }}
+        run: |
+          if [[ -z "$FERN_TOKEN" ]]; then
+            echo '::warning::Preview cleanup skipped: FERN_TOKEN is not configured.'
+            exit 0
+          fi
+          fern docs preview delete --id "$PREVIEW_ID"

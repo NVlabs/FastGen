@@ -1,0 +1,40 @@
+---
+title: Troubleshooting
+description: Resolve common FastGen installation, configuration, memory, and checkpoint problems.
+---
+
+## A config cannot be imported
+
+Launch from the repository root and pass a config path below that directory. Overrides require the `-` separator. Use `--dryrun` to inspect the resolved config before training:
+
+```bash
+python train.py --config=fastgen/configs/experiments/EDM/config_dmd2_fast.py --dryrun
+```
+
+See [command-line arguments](/fastgen/configuration#command-line-arguments) for override syntax.
+
+## CUDA runs out of memory
+
+Reduce the per-device `dataloader_train.batch_size`; FastGen can accumulate gradients to maintain the configured global batch size. For large models, review the recipe's precision and sharding settings and consider FSDP. Available memory and supported parallelism depend on the selected network and config.
+
+## Model or dataset files are missing
+
+Prepare the [dataset](/fastgen/datasets) and review the selected model's [checkpoint requirements](/fastgen/networks#pretrained-models). Some Hugging Face models require access approval and `HF_TOKEN`. Most non-CIFAR/ImageNet training recipes need their placeholder data paths replaced with your data.
+
+Check `DATA_ROOT_DIR`, `CKPT_ROOT_DIR`, `HF_HOME`, and local-only settings in the [configuration reference](/fastgen/configuration#environment-variables). Avoid enabling offline operation until the required files are cached.
+
+## A new run resumes an earlier experiment
+
+Resume is enabled by default. Use a different `log_config.name` for an independent run. Set `trainer.resume=False` only when you intentionally want to start fresh in an existing output directory.
+
+## Distributed workers run independently
+
+Set `trainer.ddp=True` or `trainer.fsdp=True`; `torchrun` alone does not enable distributed training. Verify the resolved configuration and startup logs. See [training](/fastgen/training#use-multiple-gpus).
+
+## A checkpoint fails to load
+
+Confirm whether it is a monolithic checkpoint or an FSDP sharded checkpoint. Keep all shards beside their metadata and make the directory accessible to every rank. Review [checkpoint storage](/fastgen/configuration#distributed-checkpoint-storage) before changing the parallelism mode of a resumed run.
+
+## Report a problem
+
+Open a [GitHub issue](https://github.com/NVlabs/FastGen/issues) with the code revision, config and overrides, hardware, and relevant error output. Remove tokens and other credentials from logs before attaching them.
