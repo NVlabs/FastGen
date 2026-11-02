@@ -73,7 +73,7 @@ jobs:
           node-version: "22"
       - name: Install the pinned Fern CLI
         run: npm install -g "fern-api@$(node -p 'require("./fern/fern.config.json").version')"
-      - name: Build pages from public READMEs
+      - name: Build pages from repository READMEs
         env:
           SOURCE_REF: ${{ github.event.pull_request.head.sha || github.sha }}
         run: python3 fern/scripts/build_docs.py --source-ref "$SOURCE_REF"
@@ -132,6 +132,7 @@ jobs:
       - name: Publish the validated artifact
         if: steps.credentials.outputs.enabled == 'true'
         id: deploy
+        shell: bash
         env:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
           MODE: ${{ needs.target.outputs.mode }}

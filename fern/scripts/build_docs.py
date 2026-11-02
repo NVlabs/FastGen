@@ -2,15 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Build Fern pages from an explicit inventory of public FastGen READMEs.
+"""Build Fern pages from an explicit inventory of FastGen READMEs.
 
 The READMEs remain the source of truth. Generated files are ignored by Git and
 rebuilt before validation, preview, or publishing. No FastGen imports are needed.
-Only PAGES below are included; internal dev/ docs and vendored READMEs are not
-discovered automatically. Authored pages live in fern/docs/; navigation is in fern/docs.yml.
+Only the files in PAGES below are included. Authored pages live in fern/docs/;
+navigation is in fern/docs.yml.
 
 Run from any directory: python3 /path/to/fastgen/fern/scripts/build_docs.py
-Use --source-ref <public-tag-or-sha> to pin GitHub links (default: main).
+Use --source-ref <tag-or-sha> to pin GitHub links (default: main).
 Output: fern/docs/generated/*.mdx. See fern/README.md for the full build workflow.
 """
 
@@ -139,7 +139,7 @@ def render(page: Page, ref: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-ref", default="main", help="Public GitHub branch, tag, or SHA used in source links")
+    parser.add_argument("--source-ref", default="main", help="GitHub branch, tag, or SHA used in source links")
     args = parser.parse_args()
     if not args.source_ref or any(ord(char) < 32 for char in args.source_ref):
         parser.error("--source-ref must be a nonempty Git ref without control characters")
@@ -154,7 +154,7 @@ def main() -> None:
         if target.is_symlink():
             raise ValueError(f"Generated page must not be a symlink: {target}")
         target.write_text(content)
-    print(f"Built {len(pages)} Fern pages from public READMEs (source ref: {args.source_ref}).")
+    print(f"Built {len(pages)} Fern pages from repository READMEs (source ref: {args.source_ref}).")
 
 
 if __name__ == "__main__":
