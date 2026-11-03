@@ -198,6 +198,7 @@ FastGen is used across NVIDIA and the community to build fast generative models.
 - **[Mode Seeking meets Mean Seeking for Fast Long Video Generation](https://primecai.github.io/mmm/)** (built upon FastGen)
 - **[StreamingEffect: Real-Time Human-Centric Video Effect Generation](https://github.com/showlab/StreamingEffect)** (built upon FastGen)
 - **[CARV: Variance Reduction for Expectations with Diffusion Teachers](https://research.nvidia.com/labs/sil/projects/CARV/)** (used FastGen for the DMD2 experiments)
+- **[Flex-Forcing: Towards a Unified Autoregressive and Bidirectional Video Diffusion Model](https://research.nvidia.com/labs/genair/flex-forcing/)** (built upon FastGen)
 
 ### FastGen Collaborations
 
