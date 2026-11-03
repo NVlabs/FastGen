@@ -11,6 +11,12 @@ Neural network architectures for FastGen. All networks inherit from `FastGenNetw
 | Video+Audio | [`LTX2`](LTX2/), [`MiniMaxH3`](MiniMaxH3/) |
 
 
+## Validate a new network
+
+1. **Reference inference:** Compare FastGen teacher generations with the original implementation across several seeds and prompts/conditions. Match weights, initial noise, sampling schedule, guidance, preprocessing, and precision.
+2. **SFT stability:** Run a short [SFT](../methods/fine_tuning/README.md#sft-supervised-fine-tuning) experiment. Check for finite losses and gradients, stable updates, and sensible generations.
+3. **Distillation initialization:** Before training, sample a student initialized from teacher weights with each intended method's few-step sampler. Expect reasonable, often blurry results; investigate pure noise or collapsed outputs before proceeding.
+
 ## Pretrained Models
 
 Pretrained teacher models can be loaded using `model.pretrained_model_path=/path/to/checkpoint.pth`. If the student initialization differs from the teacher, one can load a separate checkpoint using `model.pretrained_student_net_path=/path/to/student-checkpoint.pth`.

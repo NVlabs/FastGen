@@ -1,0 +1,44 @@
+---
+title: Training and checkpoints
+description: Configure distributed training, choose run directories, and resume FastGen jobs.
+---
+
+Start with the [CIFAR-10 example](/fastgen/get-started) before adapting a larger recipe. Run commands from your FastGen checkout, and review the selected config's dataset and pretrained-model requirements.
+
+## Configure a run
+
+Use an experiment config and supply overrides after the `-` separator:
+
+```bash
+python train.py --config=fastgen/configs/experiments/EDM/config_dmd2_fast.py - \
+    trainer.max_iter=10000 \
+    log_config.name=cifar10-experiment
+```
+
+The resolved configuration is written to the run directory. Choose a distinct `log_config.name` for independent experiments. See [configuration and environment variables](/fastgen/configuration) for output locations, credentials, and custom configs.
+
+## Use multiple GPUs
+
+Enable distributed training explicitly in the config or command-line overrides:
+
+```bash
+torchrun --nproc_per_node=8 train.py \
+    --config=fastgen/configs/experiments/EDM/config_dmd2_fast.py \
+    - trainer.ddp=True log_config.name=cifar10-ddp
+```
+
+For models that require parameter sharding, use `trainer.fsdp=True` in place of `trainer.ddp=True`. The launcher alone does not enable either mode. Match the launcher to your available GPUs and cluster scheduler.
+
+See the [configuration reference](/fastgen/configuration#large-models-precision-and-lora) for sharding, precision, and LoRA settings.
+
+## Save and resume
+
+Keep periodic checkpointing enabled for long runs. By default, `trainer.resume=True` resumes from the latest checkpoint in the same run directory; `trainer.max_iter` includes iterations already completed.
+
+Multi-node jobs need checkpoint storage visible to every rank. FSDP checkpoints contain distributed shards, so retain the full checkpoint directory when moving or resuming a run. To initialize an FSDP run from a monolithic checkpoint, use `trainer.checkpointer.pretrained_ckpt_path` and a new run directory.
+
+See [distributed checkpoint storage](/fastgen/configuration#distributed-checkpoint-storage) for the supported formats and paths. Scheduler requeueing alone does not guarantee a checkpoint was saved.
+
+## Evaluate the result
+
+Use the saved checkpoint with an [inference script](/fastgen/inference), then follow the [FID evaluation instructions](/fastgen/inference#fid-evaluation) when applicable. Compare benchmarks only with the corresponding model, data, sampling settings, and code revision.

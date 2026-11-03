@@ -139,7 +139,8 @@ Use `+key=value` for a key the config does not define yet; see [fastgen/configs/
 
 ## Documentation
 
-Detailed documentation is available in each component's README:
+See each component's README for detailed documentation and
+[Contributing to the docs](CONTRIBUTING.md#documentation) for contribution guidelines.
 
 | Component | Documentation | Description |
 |-----------|---------------|-------------|

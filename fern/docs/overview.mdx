@@ -1,0 +1,27 @@
+---
+title: NVIDIA FastGen Overview
+description: Train, distill, and evaluate diffusion models across modalities with PyTorch.
+---
+
+FastGen is a PyTorch library for training and distilling diffusion models into fast generative models. Use it to fine-tune a teacher, train a student that generates in fewer steps, and run inference and evaluation.
+
+## Start here
+
+- [Get started](/fastgen/get-started): install FastGen and run the CIFAR-10 training and inference example.
+- [Run inference](/fastgen/inference): generate outputs from a teacher or student model.
+- [Prepare your dataset](/fastgen/datasets): choose a loader and supply your training data.
+- [Troubleshoot a run](/fastgen/troubleshooting): resolve common configuration, memory, and checkpoint issues.
+
+## What you can do
+
+- Distill diffusion models across modalities such as image, video, and audio into students that use fewer generation steps.
+- Fine-tune a supported model on your data, including conditional and causal generation tasks.
+- Run inference and evaluate teacher and student models.
+
+## Core concepts
+
+A [configuration](/fastgen/configuration) combines a [method](/fastgen/methods), a [network](/fastgen/networks), a [dataset](/fastgen/datasets), and training settings. Experiment configs are runnable starting points; model and data combinations have different prerequisites. Check the selected recipe before starting a large run.
+
+## Learn more
+
+[Resources](/fastgen/resources) collects external models, research projects, and integrations. See the [GitHub repository](https://github.com/NVlabs/FastGen), [issue tracker](https://github.com/NVlabs/FastGen/issues), and [release history](https://github.com/NVlabs/FastGen/releases) for source code, support, and released revisions.

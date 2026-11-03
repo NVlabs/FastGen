@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Check published docs for paths that make Fern read files outside the docs tree.
+
+FastGen usage from the checkout root: python3 fern/scripts/check-docs-paths fern
+Adapted from NVIDIA's github-markdown-to-fern toolkit. No --allow is needed for
+FastGen: configuration, navigation, and pages all live under fern/.
+
+Fern reads local files named by a page: the src of a Code, Markdown, or Image
+component, a markdown image, and the path entries in index.yml and docs.yml. It
+accepts paths that leave docs/, such as ../../x, and absolute paths. The publish
+job runs the Fern CLI with FERN_TOKEN in its environment, so a page that reads
+/proc/self/environ can print the token on the published site.
+
+This checker reports:
+  - src attributes and markdown images that use a path segment of "..", an
+    absolute path, or a scheme other than https
+  - src attributes with a dynamic value, such as src={name}
+  - HTML-encoded file paths, reference-style images, and MDX imports/exports
+  - prefixed or deeply indented code fences, fences inside comments, and
+    unterminated fences, which cannot safely delimit examples here
+  - markdown frontmatter values that do the same
+  - YAML values with a path segment of "..", and path, src, image, logo,
+    favicon, and file entries that are absolute or use a scheme other than https
+  - YAML files and frontmatter not written as plain "key: value" lines (quoted
+    keys, escaped double-quoted values, block scalars, flow collections, anchors,
+    tags, multi-line values), because the checker cannot read those safely and
+    so rejects them; unterminated frontmatter is also rejected
+  - symbolic links under the checked directories
+
+A deliberately permitted path can be accepted with --allow. The match is exact.
+
+Literal path checks include fenced code blocks. Import/export statements and
+reference-style images inside fenced code examples are ignored. Exclude an
+example file with --exclude if needed. This is a limited path guard; deployments
+must still use trusted content.
+
+Usage: check-docs-paths [--exclude GLOB]... [--allow PATH]... DIR [DIR...]
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import html
+import os
+import re
+import sys
+from pathlib import Path
+from urllib.parse import unquote
+
+MARKDOWN_SUFFIXES = {".md", ".mdx"}
+YAML_SUFFIXES = {".yml", ".yaml"}
+
+# A src attribute: src="x", src='x', or src={expression}.
+SRC_ATTRIBUTE = re.compile(r"""\bsrc\s*=\s*(\{[^}]*\}|"[^"]*"|'[^']*')""")
+# A markdown image: ![alt](target) or ![alt](<target>).
+MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)")
+REFERENCE_IMAGE = re.compile(r"!\[[^\]]*\](?!\()")
+MDX_MODULE = re.compile(r"(?m)^[ \t]*(?:import|export)\b")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_PREFIX = re.compile(r"^[ \t]*(?:(?:>|[-+*]|[0-9]+[.)])[ \t]*)*(?:`{3,}|~{3,})")
+COMMENT = re.compile(r"/\*.*?\*/|<!--.*?-->", re.DOTALL)
+# A plain YAML line: optional list dash, a bare key, and an optional value.
+YAML_LINE = re.compile(
+    r"^\s*(?:-\s+)?(?P<key>[A-Za-z][A-Za-z0-9_.:-]*):(?:\s+(?P<value>\S.*?))?\s*$"
+)
+# A YAML value starting with one of these is a block scalar, flow collection,
+# anchor, alias, tag, directive, or reserved indicator.
+YAML_UNSUPPORTED_START = tuple(">|&*!{[%@`")
+YAML_EMPTY_COLLECTIONS = {"[]", "{}"}
+# Keys that name a file, as opposed to a slug or a title.
+FILE_KEYS = {"path", "src", "image", "logo", "favicon", "file"}
+SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def line_of(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def closing_quote(value: str) -> int:
+    """Return the index of the quote that closes the quoted scalar at value[0].
+
+    A single-quoted scalar escapes a quote by doubling it ('Operator''s Guide');
+    a double-quoted one uses a backslash. Return -1 if the quote is not closed.
+    """
+    quote = value[0]
+    index = 1
+    while index < len(value):
+        char = value[index]
+        if quote == '"' and char == "\\":
+            index += 2
+            continue
+        if char == quote:
+            if quote == "'" and value[index + 1 : index + 2] == "'":
+                index += 2
+                continue
+            return index
+        index += 1
+    return -1
+
+
+def normalize(value: str) -> str:
+    """Return the scalar a YAML or attribute value names, without quotes or comment.
+
+    A quoted value is the text inside its first pair of quotes, so a trailing
+    comment after the closing quote is ignored. A plain value loses a trailing
+    " # comment". An unterminated quote is dropped and the rest is kept.
+    Reject escapes inside double quotes: YAML can decode them into traversal,
+    absolute paths, or schemes that would bypass checks on the raw value.
+    """
+    value = value.strip()
+    if value[:1] in ("'", '"'):
+        end = closing_quote(value)
+        scalar = value[1:end] if end != -1 else value[1:]
+        if value[0] == '"' and "\\" in scalar:
+            raise ValueError("escaped double-quoted values are unsupported; write the value without escapes")
+        return scalar
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+
+
+def traversal(value: str) -> bool:
+    decoded = unquote(unquote(value))
+    return any(
+        segment.strip(" \t'\"") == ".." for segment in re.split(r"[\\/]", decoded)
+    )
+
+
+def problem(value: str, *, file_like: bool, allowed: set[str]) -> str | None:
+    """Return why a value is unsafe, or None if it is acceptable.
+
+    A "..", "%2e%2e", or backslash traversal is reported for every value. An
+    absolute path or a scheme other than https is reported only when the value
+    names a file, because slugs and titles can legitimately start with "/".
+    """
+    try:
+        value = normalize(value)
+    except ValueError as error:
+        return str(error)
+    if file_like and html.unescape(value) != value:
+        return "HTML-encoded file paths are unsupported; write a literal path"
+    if not value or value in allowed:
+        return None
+    if traversal(value):
+        return f"path {value!r} leaves the docs directory with '..'"
+    if not file_like:
+        return None
+    decoded = unquote(unquote(value))
+    if SCHEME.match(decoded):
+        if decoded.lower().startswith("https:"):
+            return None
+        return f"{value!r} uses a scheme other than https, which can read a local file"
+    if decoded.startswith(("/", "\\", "~")):
+        return f"absolute path {value!r}"
+    return None
+
+
+def check_markdown(path: str, text: str, allowed: set[str]) -> list[str]:
+    issues: list[str] = []
+    lines = text.split("\n")
+    if lines and lines[0].strip() == "---":
+        for index in range(1, len(lines)):
+            if lines[index].strip() == "---":
+                issues.extend(
+                    check_yaml(
+                        path,
+                        "\n".join(lines[1:index]),
+                        allowed,
+                        context="frontmatter",
+                        start_line=2,
+                    )
+                )
+                break
+        else:
+            issues.append(f"{path}:1: [frontmatter] unterminated frontmatter; add a closing '---'")
+    # Reject constructs that could desynchronize the limited fence scanner.
+    for match in COMMENT.finditer(text):
+        if re.search(r"`{3,}|~{3,}", match.group()):
+            issues.append(f"{path}:{line_of(text, match.start())}: [fence] code fences inside comments are unsupported")
+    # Restrict module syntax without rejecting Python/shell examples in fences.
+    unfenced = []
+    fence = ""
+    for number, line in enumerate(lines, start=1):
+        boundary = FENCE.match(line)
+        if not boundary and FENCE_PREFIX.match(line):
+            issues.append(f"{path}:{number}: [fence] prefixed or deeply indented code fences are unsupported")
+        if boundary:
+            marker, trailing = boundary.groups()
+            if not fence and (marker[0] != "`" or "`" not in trailing):
+                fence = marker
+                unfenced.append("")
+                continue
+            if fence and marker[0] == fence[0] and len(marker) >= len(fence) and not trailing.strip():
+                fence = ""
+                unfenced.append("")
+                continue
+        unfenced.append("" if fence else line)
+    if fence:
+        issues.append(f"{path}: [fence] unterminated code fence")
+    body = "\n".join(unfenced)
+    for match in MDX_MODULE.finditer(body):
+        issues.append(
+            f"{path}:{line_of(body, match.start())}: [module] MDX imports/exports are unsupported; use local page content"
+        )
+    for match in REFERENCE_IMAGE.finditer(body):
+        issues.append(
+            f"{path}:{line_of(body, match.start())}: [image] reference-style images are unsupported; use ![alt](path)"
+        )
+    for match in SRC_ATTRIBUTE.finditer(text):
+        raw = match.group(1)
+        number = line_of(text, match.start())
+        if raw.startswith("{"):
+            issues.append(
+                f"{path}:{number}: [src] dynamic src={raw} cannot be checked; use a literal path"
+            )
+            continue
+        why = problem(raw, file_like=True, allowed=allowed)
+        if why:
+            issues.append(f"{path}:{number}: [src] {why}")
+    for match in MARKDOWN_IMAGE.finditer(text):
+        why = problem(match.group(1), file_like=True, allowed=allowed)
+        if why:
+            issues.append(f"{path}:{line_of(text, match.start())}: [image] {why}")
+    return issues
+
+
+def check_yaml(
+    path: str, text: str, allowed: set[str], *, context: str = "yaml", start_line: int = 1
+) -> list[str]:
+    """Check a YAML file or frontmatter written as plain "key: value" lines.
+
+    The checker has no YAML parser, so it fails closed: a line it cannot read as
+    a plain key and value is reported, not skipped.
+    """
+    issues: list[str] = []
+    for number, line in enumerate(text.split("\n"), start=start_line):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = YAML_LINE.match(line)
+        if not match:
+            issues.append(
+                f"{path}:{number}: [{context}] unsupported YAML; write plain 'key: value' lines"
+            )
+            continue
+        key = match.group("key")
+        value = match.group("value")
+        if value is None:
+            continue
+        if (
+            value.startswith(YAML_UNSUPPORTED_START)
+            and value not in YAML_EMPTY_COLLECTIONS
+        ):
+            issues.append(
+                f"{path}:{number}: [{context}] {key}: unsupported YAML value; write a plain value"
+            )
+            continue
+        if value[:1] in ("'", '"'):
+            closing = closing_quote(value)
+            trailing = value[closing + 1 :].strip() if closing != -1 else ""
+            if closing == -1 or (trailing and not trailing.startswith("#")):
+                issues.append(
+                    f"{path}:{number}: [{context}] {key}: unexpected text around a quoted value"
+                )
+                continue
+        name = key.lower().split(":")[-1]
+        why = problem(value, file_like=name in FILE_KEYS, allowed=allowed)
+        if why:
+            issues.append(f"{path}:{number}: [{context}] {key}: {why}")
+    return issues
+
+
+def excluded(path: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("dirs", nargs="+", help="directories to check")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="fnmatch glob of a path to skip; repeatable",
+    )
+    parser.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="exact path value to accept even though it leaves the directory; repeatable",
+    )
+    args = parser.parse_args()
+    allowed = set(args.allow)
+
+    issues: list[str] = []
+    for root in args.dirs:
+        for current, directories, files in os.walk(root, followlinks=False):
+            for name in list(directories) + files:
+                full = os.path.join(current, name)
+                posix = Path(full).as_posix()
+                if os.path.islink(full) and not excluded(posix, args.exclude):
+                    issues.append(
+                        f"{posix}: [symlink] symbolic links can point outside the docs directory"
+                    )
+            directories[:] = [
+                d
+                for d in directories
+                if not os.path.islink(os.path.join(current, d))
+                and not excluded(Path(current, d).as_posix() + "/x", args.exclude)
+            ]
+            for name in files:
+                full = os.path.join(current, name)
+                posix = Path(full).as_posix()
+                suffix = Path(name).suffix.lower()
+                if os.path.islink(full) or excluded(posix, args.exclude):
+                    continue
+                if suffix not in MARKDOWN_SUFFIXES | YAML_SUFFIXES:
+                    continue
+                text = Path(full).read_text(encoding="utf-8", errors="replace")
+                if suffix in MARKDOWN_SUFFIXES:
+                    issues.extend(check_markdown(posix, text, allowed))
+                else:
+                    issues.extend(check_yaml(posix, text, allowed))
+
+    if issues:
+        print(f"Docs paths: {len(issues)} issue(s) found")
+        for issue in issues:
+            print(issue)
+        return 1
+    print("OK: no docs path leaves the docs directory")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
