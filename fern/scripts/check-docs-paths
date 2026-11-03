@@ -18,6 +18,9 @@ This checker reports:
   - src attributes and markdown images that use a path segment of "..", an
     absolute path, or a scheme other than https
   - src attributes with a dynamic value, such as src={name}
+  - HTML-encoded file paths, reference-style images, and MDX imports/exports
+  - prefixed or deeply indented code fences, fences inside comments, and
+    unterminated fences, which cannot safely delimit examples here
   - markdown frontmatter values that do the same
   - YAML values with a path segment of "..", and path, src, image, logo,
     favicon, and file entries that are absolute or use a scheme other than https
@@ -29,8 +32,10 @@ This checker reports:
 
 A deliberately permitted path can be accepted with --allow. The match is exact.
 
-It scans every line, including fenced code blocks, so an example that shows one
-of these patterns is reported too. Exclude such a file with --exclude.
+Literal path checks include fenced code blocks. Import/export statements and
+reference-style images inside fenced code examples are ignored. Exclude an
+example file with --exclude if needed. This is a limited path guard; deployments
+must still use trusted content.
 
 Usage: check-docs-paths [--exclude GLOB]... [--allow PATH]... DIR [DIR...]
 """
@@ -39,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import html
 import os
 import re
 import sys
@@ -52,6 +58,11 @@ YAML_SUFFIXES = {".yml", ".yaml"}
 SRC_ATTRIBUTE = re.compile(r"""\bsrc\s*=\s*(\{[^}]*\}|"[^"]*"|'[^']*')""")
 # A markdown image: ![alt](target) or ![alt](<target>).
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)")
+REFERENCE_IMAGE = re.compile(r"!\[[^\]]*\](?!\()")
+MDX_MODULE = re.compile(r"(?m)^[ \t]*(?:import|export)\b")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_PREFIX = re.compile(r"^[ \t]*(?:(?:>|[-+*]|[0-9]+[.)])[ \t]*)*(?:`{3,}|~{3,})")
+COMMENT = re.compile(r"/\*.*?\*/|<!--.*?-->", re.DOTALL)
 # A plain YAML line: optional list dash, a bare key, and an optional value.
 YAML_LINE = re.compile(
     r"^\s*(?:-\s+)?(?P<key>[A-Za-z][A-Za-z0-9_.:-]*):(?:\s+(?P<value>\S.*?))?\s*$"
@@ -128,6 +139,8 @@ def problem(value: str, *, file_like: bool, allowed: set[str]) -> str | None:
         value = normalize(value)
     except ValueError as error:
         return str(error)
+    if file_like and html.unescape(value) != value:
+        return "HTML-encoded file paths are unsupported; write a literal path"
     if not value or value in allowed:
         return None
     if traversal(value):
@@ -162,6 +175,39 @@ def check_markdown(path: str, text: str, allowed: set[str]) -> list[str]:
                 break
         else:
             issues.append(f"{path}:1: [frontmatter] unterminated frontmatter; add a closing '---'")
+    # Reject constructs that could desynchronize the limited fence scanner.
+    for match in COMMENT.finditer(text):
+        if re.search(r"`{3,}|~{3,}", match.group()):
+            issues.append(f"{path}:{line_of(text, match.start())}: [fence] code fences inside comments are unsupported")
+    # Restrict module syntax without rejecting Python/shell examples in fences.
+    unfenced = []
+    fence = ""
+    for number, line in enumerate(lines, start=1):
+        boundary = FENCE.match(line)
+        if not boundary and FENCE_PREFIX.match(line):
+            issues.append(f"{path}:{number}: [fence] prefixed or deeply indented code fences are unsupported")
+        if boundary:
+            marker, trailing = boundary.groups()
+            if not fence and (marker[0] != "`" or "`" not in trailing):
+                fence = marker
+                unfenced.append("")
+                continue
+            if fence and marker[0] == fence[0] and len(marker) >= len(fence) and not trailing.strip():
+                fence = ""
+                unfenced.append("")
+                continue
+        unfenced.append("" if fence else line)
+    if fence:
+        issues.append(f"{path}: [fence] unterminated code fence")
+    body = "\n".join(unfenced)
+    for match in MDX_MODULE.finditer(body):
+        issues.append(
+            f"{path}:{line_of(body, match.start())}: [module] MDX imports/exports are unsupported; use local page content"
+        )
+    for match in REFERENCE_IMAGE.finditer(body):
+        issues.append(
+            f"{path}:{line_of(body, match.start())}: [image] reference-style images are unsupported; use ![alt](path)"
+        )
     for match in SRC_ATTRIBUTE.finditer(text):
         raw = match.group(1)
         number = line_of(text, match.start())

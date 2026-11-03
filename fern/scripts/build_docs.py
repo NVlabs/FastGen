@@ -124,7 +124,7 @@ def render(page: Page, ref: str) -> str:
     if page.sections and found_sections != set(page.sections):
         raise ValueError(f"Missing sections in {page.source}: {set(page.sections) - found_sections}")
     notice = ""
-    if page.slug in ("trajectory-matching", "distribution-matching", "fine-tuning"):
+    if page.slug in ("trajectory-matching", "distribution-matching"):
         notice = (
             "> Benchmark results on this page were measured with "
             "[FastGen v0.1.0](https://github.com/NVlabs/FastGen/releases/tag/v0.1.0).\n\n"

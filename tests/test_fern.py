@@ -277,6 +277,64 @@ class DocsPathTests(unittest.TestCase):
                     result = self.check_document(template.format(target))
                     self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
 
+    def test_encoded_file_paths_are_rejected(self):
+        values = ("&#46;&#46;/private.mdx", "&period;&period;/private.mdx", "&sol;proc/self/environ")
+        for template in ('<Markdown src="{}" />', "![Example]({})", '---\nimage: "{}"\n---\n'):
+            for value in values:
+                with self.subTest(template=template, value=value):
+                    result = self.check_document(template.format(value))
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("HTML-encoded file paths", result.stdout)
+
+    def test_reference_images_and_mdx_modules_are_rejected(self):
+        cases = (
+            "![Image][ref]\n\n[ref]: ../../outside.svg\n",
+            "![ref][]\n\n[ref]: ../../outside.svg\n",
+            "![ref]\n\n[ref]: ../../outside.svg\n",
+            "import Page from '../../outside.mdx';\n\n<Page />\n",
+            "export {default} from '../../outside.mdx';\n",
+            "import\nPage from '../../outside.mdx';\n",
+        )
+        for text in cases:
+            with self.subTest(text=text):
+                result = self.check_document(text)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertTrue("[image]" in result.stdout or "[module]" in result.stdout)
+
+    def test_fenced_imports_exports_and_reference_images_are_examples(self):
+        text = (
+            "```python\nimport webdataset as wds\n```\n\n"
+            "~~~bash\nexport FASTGEN_REPO=/path/to/fastgen\n~~~\n\n"
+            "````md\n![ref]\n[ref]: ../../outside.svg\n```\nimport still_in_example\n````\n"
+        )
+        result = self.check_document(text)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.check_document(text + "\nimport Page from '../../outside.mdx';\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("[module]", result.stdout)
+
+    def test_unsupported_fences_cannot_hide_paths(self):
+        prefixes = (
+            "- ```text\n  ordinary code\n  ```\n\n",
+            "> ```text\n> ordinary code\n> ```\n\n",
+            "    ```text\n    ordinary code\n  ```\n\n",
+            "{/*\n```\n*/}\n\n",
+            "<!--\n```\n-->\n\n",
+        )
+        payloads = ("import Page from '../../outside.mdx';\n", "![ref]\n\n[ref]: ../../outside.svg\n")
+        for prefix in prefixes:
+            for payload in payloads:
+                for suffix in ("", "\n```\n"):
+                    with self.subTest(prefix=prefix, payload=payload, suffix=suffix):
+                        result = self.check_document(prefix + payload + suffix)
+                        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                        self.assertIn("[fence]", result.stdout)
+
+    def test_unterminated_fences_are_rejected(self):
+        result = self.check_document("```python\nimport example\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("unterminated code fence", result.stdout)
+
     def test_dynamic_component_paths_are_rejected(self):
         result = self.check_document("<Code src={filename} />")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
