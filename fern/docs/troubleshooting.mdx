@@ -46,10 +46,12 @@ Check inputs, cached latents/conditions, and checkpoint weights for NaN/Inf.
 | `model.precision_opt` | Optimized/EMA weights and optimizer state. |
 | `model.precision_amp`, `model.precision_amp_enc`, `model.precision_amp_infer` | Autocast for training, preprocessing, and inference, respectively. |
 
+Align `model.precision_model` with the precision used during pretraining. Some networks override component precision to match their reference implementation.
+
 - Prefer `float32` method/optimizer/EMA state while debugging; low-precision EMA updates can round away. Outside FSDP, differing input/weight dtypes need compatible AMP or network-specific handling.
 - Under FSDP, normally use `model.precision_amp=null`; try `model.precision_fsdp_reduce=float32` for unstable gradient reductions. For [FP16 training](https://docs.pytorch.org/docs/2.10/amp.html#gradient-scaling), use `model.grad_scaler_enabled=True` with FP32 optimized weights; scaling cannot fix forward-pass NaNs.
 - Lower `model.net_optimizer.lr` and increase `model.net_scheduler.warm_up_steps` (a list for the default scheduler). Check auxiliary optimizers too; full resume restores optimizer/scheduler state.
-- Enable [gradient clipping](/fastgen/callbacks#usage) per optimizer; `GradClip_CALLBACK` targets `net`. Tune `trainer.callbacks.grad_clip.grad_norm`; its `precision_grad_clip` accepts `torch.float32` in Python configs. Watch the logged non-finite count: this callback replaces NaN/Inf before clipping.
+- Enable [gradient clipping](/fastgen/callbacks#usage) per optimizer; `GradClip_CALLBACK` targets `net`. Watch the logged non-finite count: this callback replaces NaN/Inf before clipping.
 
 ## Model or dataset files are missing
 
