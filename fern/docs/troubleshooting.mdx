@@ -24,12 +24,32 @@ See [command-line arguments](/fastgen/configuration#command-line-arguments) for 
 
 Loading multiple models or preprocessors, including CPU-offloaded parameters, can exhaust host RAM. Pre-encoded inputs help avoid unnecessary preprocessors.
 
+- **Loading:** FSDP/DCP loads into existing shards; monolithic warm starts load full weights per rank before wrapping. DCP under DDP still needs full replicas.
+- **Startup:** `model.meta_init=True` reduces replicated initialization where supported, but rank 0 still constructs full models and temporarily deep-copies state during FSDP synchronization. DCP does not remove this startup peak.
+- **EMA:** Each `model.use_ema` entry adds a copy before wrapping, then FSDP shards/offloads it too. Keep only needed variants, or disable EMA with `model.use_ema=False`.
+
 Data-loader workers also buffer and prefetch data. For WebDataset loaders, try smaller shuffle buffers and fewer workers; reduce these further if needed:
 
 ```python
 config.dataloader_train.shuffle_size = 100
 config.dataloader_train.num_workers = 2
 ```
+
+## Loss or gradients become NaN
+
+Check inputs, cached latents/conditions, and checkpoint weights for NaN/Inf.
+
+| Setting | Controls |
+| --- | --- |
+| `model.precision` | Method/data arithmetic. |
+| `model.precision_model` | Network dtype and frozen weights. |
+| `model.precision_opt` | Optimized/EMA weights and optimizer state. |
+| `model.precision_amp`, `model.precision_amp_enc`, `model.precision_amp_infer` | Autocast for training, preprocessing, and inference, respectively. |
+
+- Prefer `float32` method/optimizer/EMA state while debugging; low-precision EMA updates can round away. Outside FSDP, differing input/weight dtypes need compatible AMP or network-specific handling.
+- Under FSDP, normally use `model.precision_amp=null`; try `model.precision_fsdp_reduce=float32` for unstable gradient reductions. For [FP16 training](https://docs.pytorch.org/docs/2.10/amp.html#gradient-scaling), use `model.grad_scaler_enabled=True` with FP32 optimized weights; scaling cannot fix forward-pass NaNs.
+- Lower `model.net_optimizer.lr` and increase `model.net_scheduler.warm_up_steps` (a list for the default scheduler). Check auxiliary optimizers too; full resume restores optimizer/scheduler state.
+- Enable [gradient clipping](/fastgen/callbacks#usage) per optimizer; `GradClip_CALLBACK` targets `net`. Tune `trainer.callbacks.grad_clip.grad_norm`; its `precision_grad_clip` accepts `torch.float32` in Python configs. Watch the logged non-finite count: this callback replaces NaN/Inf before clipping.
 
 ## Model or dataset files are missing
 
@@ -39,7 +59,7 @@ Check `DATA_ROOT_DIR`, `CKPT_ROOT_DIR`, `HF_HOME`, and local-only settings in th
 
 ## A new run resumes an earlier experiment
 
-Resume is enabled by default. Use a different `log_config.name` for an independent run. Set `trainer.resume=False` only when you intentionally want to start fresh in an existing output directory.
+Resume is enabled by default. Use a different `log_config.name` for an independent run. To restart in an existing directory, set `trainer.resume=False` and disable any auto-resume integration with `trainer.auto_resume=null`.
 
 ## Distributed workers run independently
 
@@ -47,7 +67,18 @@ Set `trainer.ddp=True` or `trainer.fsdp=True`; `torchrun` alone does not enable 
 
 ## A checkpoint fails to load
 
-Confirm whether it is a monolithic checkpoint or an FSDP sharded checkpoint. Keep all shards beside their metadata and make the directory accessible to every rank. Review [checkpoint storage](/fastgen/configuration#distributed-checkpoint-storage) before changing the parallelism mode of a resumed run.
+Choose the intended loading mechanism:
+
+| Load | Setting and behavior |
+| --- | --- |
+| Resume a run | `trainer.resume=True` restores the latest run checkpoint, including optimizer, scheduler, scaler, callbacks, and iteration. |
+| Auto-resume | `trainer.auto_resume`: optional integration supplying `save_path` for full resume, even with `trainer.resume=False`. |
+| FastGen warm start | `trainer.checkpointer.pretrained_ckpt_path`: mapped weights, without optimizer/scheduler state. |
+| External weights | `model.pretrained_model_path` / `model.pretrained_student_net_path`: teacher/student initialization. |
+
+Order: external weights → warm start → resume; later loads replace matching weights. Use a new run directory for warm starts. `trainer.checkpointer.pretrained_ckpt_key_map` defaults to `net` only; map EMA explicitly too. Warm-start iteration metadata still offsets EMA and consistency-training callbacks.
+
+FSDP resume requires DCP; monolithic checkpoints support FSDP warm starts only. Keep the DCP `.pth` marker and shard directories together and accessible to every rank. See [checkpoint storage](/fastgen/configuration#distributed-checkpoint-storage).
 
 ## Report a problem
 
