@@ -15,8 +15,11 @@ Trace `WDSLoader.filter_items` and `_preprocess` in
   required fields with and without their member and count accepted samples after
   preprocessing.
 - Collation requires identical nested keys across a batch before shapes are compared;
-  optional members (an absent audio track, mixed sample rates) fail it. Homogenise or
-  filter the data, then check that the model accepts the remaining mode.
+  optional members (an absent audio track) fail it, and so do variable-length members such
+  as audio at mixed native sample rates unless the loader resamples them to one target rate
+  ([`target_sample_rate`](https://github.com/NVlabs/FastGen/blob/main/fastgen/datasets/README.md#videoaudioloaderconfig)).
+  Homogenise, resample or filter the data, then check that the model accepts the remaining
+  mode.
 - Every sample carries `idx`; methods take the batch size from it even without a
   conditioning tensor. Augmentation and raw-versus-cached equivalence belong to the
   [network input contract](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-add-network/references/network-contract.md#raw-batches-become-model-inputs-once),
