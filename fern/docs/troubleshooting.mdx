@@ -12,6 +12,7 @@ python train.py --config=fastgen/configs/experiments/EDM/config_dmd2_fast.py --d
 ```
 
 See [command-line arguments](/fastgen/configuration#command-line-arguments) for override syntax.
+For an `Unknown config fields` error, check the typed config schema: `+` and `++` do not add undeclared attrs/dataclass fields.
 
 ## CUDA runs out of memory
 
@@ -19,6 +20,8 @@ See [command-line arguments](/fastgen/configuration#command-line-arguments) for 
 - Enable [FSDP](/fastgen/training#use-multiple-gpus) with `trainer.fsdp=True`, `trainer.ddp=False`, and `trainer.fsdp_cpu_offload=True`. Offloading saves GPU memory but uses more host RAM.
 - To shard and offload supported preprocessors too, append their names (e.g., `"text_encoder"`, `"vae"`) to `model.extra_fsdp_modules`, preserving existing entries. Preprocessing and decoding calls must run in the same order across ranks in each shard group.
 - Use [image](/fastgen/datasets#imagelatentloaderconfig) or [video](/fastgen/datasets#videolatentloaderconfig) latent loaders for pre-encoded latents and conditions. Set `model.enable_preprocessors=False` when all required inputs are precomputed. Sample decoding may still load a VAE.
+
+Check startup's effective global batch: accumulation uses integer rounds and data-parallel world size, so the requested target can change. For failures after several updates, measure every optimizer phase and media generation. Optimizer state allocates lazily, and FSDP accumulation can retain unsharded gradients despite smaller microbatches.
 
 ## CPU runs out of memory
 
@@ -54,6 +57,18 @@ Align `model.precision_model` with the precision used during pretraining. Some n
 - Lower `model.net_optimizer.lr` and increase `model.net_scheduler.warm_up_steps` (a list for the default scheduler). Check auxiliary optimizers too; full resume restores optimizer/scheduler state.
 - Enable [gradient clipping](/fastgen/callbacks#usage) per optimizer; `GradClip_CALLBACK` targets `net`. Watch the logged non-finite count: this callback replaces NaN/Inf before clipping.
 
+## Sharded results differ or meta initialization fails
+
+- Compare the same weights and inputs before and after preparation. Parameter storage dtype alone does not establish compute precision: pinned parameters need compatible FSDP groups, and strict components must control autocast.
+- Check every preprocessor separately; lazy construction does not inherit the network's meta context. Encode/decode must trigger the sharded owner's forward hooks.
+- Inventory non-persistent buffers and unregistered caches. A successful state-dict load cannot prove their values were restored. The root reset must cover deterministic reconstruction; registered buffers may instead be synchronized from rank zero. Preserve registrations, required precision and RNG state.
+
+See the [registered-state contract](/fastgen/networks#registered-state) and its linked implementation docstrings.
+
+## Prompt-only training omits an intended loss
+
+Backward simulation changes student-input generation; it does not remove every loss's target requirements. With VSD active, DMD2 skips GAN work when `real` is absent even if the GAN weight is nonzero. Supply targets when adversarial training is intended, and retain source media or cached conditions for image/video-conditioned tasks. See [prompt loaders](/fastgen/datasets#promptloaderconfig).
+
 ## Model or dataset files are missing
 
 Prepare the [dataset](/fastgen/datasets) and review the selected model's [checkpoint requirements](/fastgen/networks#pretrained-models). Some Hugging Face models require access approval and `HF_TOKEN`. Most non-CIFAR/ImageNet training recipes need their placeholder data paths replaced with your data.
@@ -63,10 +78,11 @@ Check `DATA_ROOT_DIR`, `CKPT_ROOT_DIR`, `HF_HOME`, and local-only settings in th
 ## A new run resumes an earlier experiment
 
 Resume is enabled by default. Use a different `log_config.name` for an independent run. To restart in an existing directory, set `trainer.resume=False` and disable any auto-resume integration with `trainer.auto_resume=null`.
+These flags do not reset W&B: it reuses `wandb_id.txt` independently of checkpoint loading. Use a distinct run directory for an independent tracker run.
 
-## Distributed workers run independently
+## Distributed startup fails or waits for peers
 
-Set `trainer.ddp=True` or `trainer.fsdp=True`; `torchrun` alone does not enable distributed training. Verify the resolved configuration and startup logs. See [training](/fastgen/training#use-multiple-gpus).
+Set `trainer.ddp=True` or `trainer.fsdp=True`; `torchrun` alone does not enable distributed training, and multi-rank training without either is rejected. Setup still joins a launcher-provided process group. Match `RANK`, `LOCAL_RANK`, and `WORLD_SIZE` to the processes actually launched; clear stale launcher/rendezvous variables only for an intentional single-process payload. Verify startup logs and see [training](/fastgen/training#use-multiple-gpus).
 
 ## A checkpoint fails to load
 
@@ -75,13 +91,17 @@ Choose the intended loading mechanism:
 | Load | Setting and behavior |
 | --- | --- |
 | Resume a run | `trainer.resume=True` restores the latest run checkpoint, including optimizer, scheduler, scaler, callbacks, and iteration. |
-| Auto-resume | `trainer.auto_resume`: optional integration supplying `save_path` for full resume, even with `trainer.resume=False`. |
+| Auto-resume | `trainer.auto_resume`: a user-provided integration may supply `save_path` for full resume, even with `trainer.resume=False`; the default is a no-op. |
 | FastGen warm start | `trainer.checkpointer.pretrained_ckpt_path`: mapped weights, without optimizer/scheduler state. |
 | External weights | `model.pretrained_model_path` / `model.pretrained_student_net_path`: teacher/student initialization. |
 
 Order: external weights → warm start → resume; later loads replace matching weights. Use a new run directory for warm starts. `trainer.checkpointer.pretrained_ckpt_key_map` defaults to `net` only; map EMA explicitly too. Warm-start iteration metadata still offsets EMA and consistency-training callbacks.
 
 FSDP resume requires DCP; monolithic checkpoints support FSDP warm starts only. Keep the DCP `.pth` marker and shard directories together and accessible to every rank. See [checkpoint storage](/fastgen/configuration#distributed-checkpoint-storage).
+
+## Inference appears to ignore a checkpoint
+
+Check the requested sampling branch and loaded keys against [checkpoint selection](/fastgen/inference#checkpoint-selection). Teacher sampling does not use `--ckpt_path`, and omitting that argument does not find the latest student checkpoint. Compare matching inputs and sampling grids before attributing differences to training.
 
 ## Report a problem
 

@@ -112,8 +112,8 @@ to `fwd_pred_type` and an optional `_condition_output` constraint, such as clean
 high precision and rounded once to `output_dtype`: `"same"`, the default, is the state dtype, and `None` keeps
 the high precision. The conversion from the native type to itself only casts, so a forward with the default
 `fwd_pred_type`, `apply_output_conditioning=False` and `output_dtype=None` returns the native prediction
-unrounded. Guidance runs every branch that way, composes and rescales the native predictions, and transforms the
-result once, so cached branch predictions stay native and unconstrained.
+unrounded. Guidance requests native, unconstrained branches in its working dtype, composes and rescales them,
+and transforms the result once, so cached branch predictions stay native and unconstrained.
 `predict_with_guidance(ctx)` is an optional network-owned guidance recipe; it may add its own terms and
 options in a `GuidanceConfig` subclass. The subclass's `validate` makes other recipes reject its configured
 terms, and they ignore its options. Conditioning through concatenated inputs or extra context tokens

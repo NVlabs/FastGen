@@ -141,8 +141,8 @@ Expected shard contents:
 
 #### PromptLoaderConfig
 
-For recipes whose student inputs come from its own trajectories (`backward_simulation`) and therefore read only
-prompts:
+For text-only conditioning when every enabled objective can train without real targets, such as suitable
+`backward_simulation` recipes.
 
 ```python
 from fastgen.configs.data import PromptLoaderConfig

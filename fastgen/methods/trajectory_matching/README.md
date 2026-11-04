@@ -1,6 +1,7 @@
 # Trajectory Matching
 
-Methods that directly match teacher denoising trajectories.
+Methods that learn consistency or flow maps along trajectories, including teacher-based distillation and
+teacher-free training variants.
 
 ## CM (Consistency Model)
 

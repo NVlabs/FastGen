@@ -20,6 +20,8 @@ Generate images and videos using pretrained or distilled models.
 | `--do_student_sampling` | Run configured student (default: `True`) |
 | `--do_teacher_sampling` | Run the teacher (default: `False`). For methods without one, such as SFT, the script builds it from `model.teacher` (or `model.net`) and `model.pretrained_model_path` |
 | `--ckpt_path` | Path ending in `.pth` for either a monolithic checkpoint or a DCP completion marker |
+| `--sample_steps` | Teacher sampling steps; does not set the distilled student's grid |
+| `model.student_grid_cfg.steps` | Student grid steps (config override); verify the selected method's effective network evaluations |
 | `--prompt_file` | File with one prompt per line, or one integer class label per line with `--classes`, resolved from the working directory |
 | `--classes N` | Class-conditional with N classes |
 | `--unconditional` | Unconditional generation |
@@ -28,6 +30,13 @@ Generate images and videos using pretrained or distilled models.
 | `--source_video_file` | Source videos for V2V |
 | `model.guidance_cfg.cfg.scale` | CFG scale (config override). See [`fastgen/utils/guidance.py`](../fastgen/utils/guidance.py) for the full `GuidanceConfig` schema (mix, rescale) |
 | `trainer.seed` | Random seed for reproducibility (config override) |
+
+#### Checkpoint selection
+
+`--ckpt_path` loads student `net` and configured EMA weights, not the teacher. Student sampling uses the first
+configured EMA when present; teacher sampling uses its constructor/pretrained configuration. To evaluate a
+fine-tuned SFT checkpoint, select student sampling. Without `--ckpt_path`, the scripts use constructor/pretrained
+weights and do not discover the latest training checkpoint. Check startup's loaded keys and selected weight source.
 
 #### Guidance
 

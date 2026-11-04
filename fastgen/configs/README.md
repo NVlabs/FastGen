@@ -85,7 +85,8 @@ python train.py --config=fastgen/configs/experiments/EDM/config_dmd2_fast.py --l
 
 Overrides use [Hydra's grammar](https://hydra.cc/docs/advanced/override_grammar/basic/): `key=value` changes a key that
 the config defines, `+key=value` adds one that it does not, `++key=value` does either, and `key=null` sets `None`.
-To replace a dict, see [`config_utils.py`](config_utils.py).
+New keys are supported in mapping-valued entries; attrs/dataclass sections still reject fields absent from their
+schema. To replace a dict, see [`config_utils.py`](config_utils.py).
 
 ## Key Config Classes
 
