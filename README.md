@@ -1,6 +1,7 @@
 <h1 align="center">NVIDIA FastGen: Fast Generation from Diffusion Models</h1>
 
 [![Documentation](https://img.shields.io/badge/Documentation-docs.nvidia.com%2Ffastgen-blue)](https://docs.nvidia.com/fastgen)
+[![Agent Skills](https://img.shields.io/badge/Agent%20Skills-skills%2F-blue)](skills/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.10-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![NVIDIA](https://img.shields.io/badge/NVIDIA-76B900?logo=nvidia&logoColor=white)](https://www.nvidia.com/)
@@ -157,6 +158,7 @@ components and their source READMEs are:
 | **[Callbacks](https://docs.nvidia.com/fastgen/callbacks)** | [fastgen/callbacks/README.md](fastgen/callbacks/README.md) | Training callbacks (EMA, logging, gradient clipping, etc.) |
 | **[Inference](https://docs.nvidia.com/fastgen/inference)** | [scripts/README.md](scripts/README.md) | Inference modes (T2I, I2I, T2V, I2V, V2V, etc.) and FID evaluation |
 | **[ComfyUI](https://docs.nvidia.com/fastgen/comfyui)** | [comfyui/README.md](comfyui/README.md) | ComfyUI custom nodes for interactive teacher/student inference |
+| **Skills** | [skills/README.md](skills/README.md) | Agent Skills for coding agents: setup, configuration, data, training, inference, validation, and extending FastGen |
 | **[Third Party](https://docs.nvidia.com/fastgen/third-party)** | [fastgen/third_party/README.md](fastgen/third_party/README.md) | Third-party dependencies (Depth Anything V2, etc.) |
 
 ## Supported Methods
