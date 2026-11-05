@@ -54,6 +54,23 @@
       ]
     },
     {
+      "id": "shared-teacher-checkpoint-provenance",
+      "prompt": "Using inference_source.md and shared_teacher_source.md, review two teacher-sampling preparations: A has a separately constructed teacher; B has SharedBaseTeacher(model.net). Both call load_checkpoint before setup_inference_modules with teacher sampling enabled. Their checkpoints contain matching net base parameters that differ from initialization, adapter weights, and configured EMA roots. The engineer claims that changing --ckpt_path cannot affect either teacher because only student roots are loaded. Write /workspace/output/teacher-provenance.md identifying the loaded roots, the network each teacher uses, and whether that claim follows from the code. Also distinguish the case where only adapter weights differ, with identical base weights and sampling settings. Cite the relevant calls or contexts and state what remains untested. This is source-based diagnosis only: do not import FastGen, download weights or run inference.",
+      "files": [
+        "files/inference_source.md",
+        "files/shared_teacher_source.md"
+      ],
+      "expected_skill": "fastgen-inference",
+      "expected_output": "A source-backed weight-provenance comparison distinguishes the separate teacher from SharedBaseTeacher over checkpoint-loaded net, including disabled adapters and the absence of numerical output evidence.",
+      "assertions": [
+        "Identifies load_checkpoint loading net and configured EMA roots, without loading a separate teacher root.",
+        "Explains that a separate teacher retains its constructor/pretrained weight source, while setup_inference_modules preserves net for SharedBaseTeacher; changing loaded net base parameters can affect the shared teacher.",
+        "Traces SharedBaseTeacher.base_net and the adapters_disabled context; does not claim teacher sampling uses the first EMA or that checkpoint adapter changes are applied in the teacher forward.",
+        "Distinguishes changed base parameters from adapter-only differences with otherwise identical base weights and settings; disabling adapters does not undo changed base weights.",
+        "Reports this as a source-based diagnosis with numerical outputs and parity untested; does not execute or fabricate inference."
+      ]
+    },
+    {
       "id": "adjacent-parity-audit",
       "prompt": "FastGen and upstream teacher/student samples have already been generated. I need to decide whether the numerical parity and four-step quality claims are supported by their manifests and held-out comparison results. Select the workflow that owns acceptance evidence, and identify the first artifact it should inspect. Do not generate additional samples in this routing-only task.",
       "files": [],

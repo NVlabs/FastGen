@@ -23,14 +23,15 @@
     },
     {
       "id": "implicit-resume-budget",
-      "prompt": "The interrupted WanT2V DMD2 experiment described in /workspace/input/resume.json must continue for 800 MORE trainer iterations, keeping its data order and full optimizer state. Prepare /workspace/output/resume-plan.json with the stopping iteration, expected additional student/auxiliary iteration counts, data offset, and resume settings. Explain what reproducibility this does and does not establish. Do not execute a job or change the dataset.",
+      "prompt": "The interrupted WanT2V DMD2 experiment described in /workspace/input/resume.json must continue for 800 MORE trainer iterations, keeping its data order and full optimizer state. Prepare /workspace/output/resume-plan.json with the stopping iteration, expected additional student/auxiliary iteration counts, data offset, validation iterations, and resume settings. Explain what reproducibility this does and does not establish. Do not execute a job or change the dataset.",
       "expected_output": "Plans a full DCP resume through iteration 1400, adding 160 student and 640 auxiliary iterations, with the deterministic sampler initially offset by 9600 samples; does not promise bitwise replay.",
       "assertions": [
         "Sets the total max_iter to 1400 rather than 800 or 4000 and counts 160 student updates and 640 auxiliary iterations in the additional 800 iterations.",
         "Retains full resume, the same run identity, and the complete DCP marker/shards rather than substituting a weights-only warm start.",
         "Derives starting sampler offset 9600 from 600 completed iterations and effective batch 16; preserves world size, workers and data stream.",
         "Distinguishes restored optimizer/scheduler/callback state from exact RNG/worker or carried-rollout replay.",
-        "Creates the requested plan without claiming a run was executed."
+        "Creates the requested plan without claiming a run was executed.",
+        "Schedules resumed validation at 750, 1000, 1250 and final iteration 1400; does not invent an initial validation at iteration 0 or the restored iteration 600."
       ],
       "expected_skill": "fastgen-train",
       "files": [

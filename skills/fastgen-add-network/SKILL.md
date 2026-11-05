@@ -38,6 +38,9 @@ use [fastgen-add-modality](https://github.com/NVlabs/FastGen/blob/main/skills/fa
 4. **Capabilities.** Trace the requested methods' forward and loss calls; add feature and
    discriminator gradients, second-time inputs, PDD, LoRA, multimodal or causal support
    as needed and check each independently. SFT support implies none of them.
+   Add and run small forward, conditioning and capability regressions following
+   `tests/test_network*.py` and `tests/test_conditioning.py` before expensive parity or
+   training runs.
 5. **Configs.** Use [fastgen-configure](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-configure/SKILL.md) for SFT and
    the requested method configs, with negative-prompt presets where the upstream guidance
    needs them and none where it does not.
@@ -47,9 +50,8 @@ use [fastgen-add-modality](https://github.com/NVlabs/FastGen/blob/main/skills/fa
    differences before training.
 7. **Train and document.** Use [fastgen-train](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-train/SKILL.md) for a
    short SFT run with media every iteration, then the requested methods; compare outputs
-   before and after and reload a checkpoint. Add and run tests following
-   `tests/test_network*.py` and `tests/test_conditioning.py`, update the README tables
-   (network list, pretrained models).
+   before and after and reload a checkpoint. Update the README tables (network list,
+   pretrained models).
 
 Report implementation and config paths and per-task parity, training and checkpoint
 results. If the loss decreases while outputs degrade, inspect input normalisation,

@@ -8,7 +8,8 @@ trace `load_checkpoint`, `setup_inference_modules` and `default_inference_output
 
 - `--ckpt_path` loads `net` and the configured EMA networks only, non-strictly: one
   matching parameter suffices. Read the reported missing and unexpected keys instead of
-  trusting the success message; teacher sampling never uses the checkpoint.
+  trusting the success message. Check the teacher's weight provenance under
+  [checkpoint selection](https://github.com/NVlabs/FastGen/blob/main/scripts/README.md#checkpoint-selection).
 - Evaluation (`load_config(..., evaluation=True)`) sets `model.inference`, skips
   training-only modules at construction, enables the preprocessors, prepares only the
   selected sampling roots after loading, builds a teacher on demand for methods trained

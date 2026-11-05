@@ -113,3 +113,44 @@ The evidence inventory is an authored review scenario. These production paths es
     logger.success(f"Loading successfully checkpoint {ckpt_iter}")
     return ckpt_iter
 ```
+
+## [fastgen/utils/checkpointer.py:405](https://github.com/NVlabs/FastGen/blob/e0a92619fc56daf4dfa081273c7729c045bf1dcc/fastgen/utils/checkpointer.py#L405)
+
+```python
+    def _load_scalar_state(
+        state: Dict[str, Any],
+        scheduler_dict: Dict[str, torch.optim.lr_scheduler.LambdaLR],
+        grad_scaler: torch.amp.GradScaler | None,
+        callbacks: CallbackDict | None,
+    ) -> int:
+        """Restore shared scalar state and return the saved iteration."""
+        if scheduler_dict:
+            logger.info("Loading the scheduler_dict...")
+            scheduler_state = state.get("scheduler") or {}
+            for k, v in scheduler_dict.items():
+                if k in scheduler_state:
+                    v.load_state_dict(scheduler_state[k])
+                else:
+                    logger.warning(f"Scheduler {k} not found in checkpoint.")
+
+        if grad_scaler is not None:
+            logger.info("Loading the gradient scaler...")
+            grad_scaler_state = state.get("grad_scaler")
+            if grad_scaler_state:
+                grad_scaler.load_state_dict(grad_scaler_state)
+            else:
+                logger.warning("Gradient scaler state is empty (likely saved from disabled scaler), skipping load.")
+
+        if callbacks is not None:
+            logger.info("Loading the callbacks...")
+            callbacks_state = state.get("callbacks")
+            if callbacks_state is not None:
+                callbacks.load_state_dict(callbacks_state)
+            else:
+                logger.warning("Callbacks not found in checkpoint.")
+
+        if "iteration" not in state:
+            logger.warning("Iteration not found in checkpoint.")
+            return 0
+        return state["iteration"]
+```

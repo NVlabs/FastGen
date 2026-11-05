@@ -10,10 +10,12 @@ metadata:
 
 # Develop FastGen
 
-Resolve the user's FastGen checkout separately from the installed skill. Read
+Resolve the user's FastGen checkout separately from the installed skill. Use the requested
+revision, or the current checkout, as the authority for linked policies and interfaces. Read
 [Design and Maintenance](https://github.com/NVlabs/FastGen/blob/main/CONTRIBUTING.md#design-and-maintenance)
 for the shared coding rules and the owning component's README and interface docstrings.
 Use the requested scope and information already provided before asking for missing inputs.
+For review-only requests, inspect and verify within scope, then report findings without editing.
 
 1. **Trace.** Follow the affected callers and consumers before editing. For changes across
    data and model boundaries, inspect loader decoding in
@@ -36,5 +38,5 @@ Use the requested scope and information already provided before asking for missi
    files at the selected revision. If a failure crosses interfaces, trace the producer
    and consumer contracts before adding another check or workaround.
 
-Report the changed behavior, affected interfaces and documentation, checks actually run
-and any unverified paths. For a review, give source-backed findings and concrete fixes.
+Report source-backed findings or changed behavior, affected interfaces and documentation,
+checks actually run and any unverified paths.

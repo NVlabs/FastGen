@@ -15,7 +15,8 @@
     "fsdp": true,
     "ddp": false,
     "grad_accum_rounds": 2,
-    "batch_size_global": 16
+    "batch_size_global": 16,
+    "validation_iter": 250
   },
   "dataloader_train": {
     "batch_size": 2,
@@ -42,5 +43,6 @@
     "project": "fastgen-example",
     "group": "wan_dmd2_resume",
     "name": "interrupted-run"
-  }
+  },
+  "validation_loader_present": true
 }

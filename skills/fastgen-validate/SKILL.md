@@ -38,8 +38,9 @@ when callback logs are the evidence.
    parameter updates and frozen modules; run generation followed by backward under the
    real distributed wrapper, since inference can leave lazy state behind. Inspect
    per-iteration media and fixed-input outputs around a short SFT run, exercise
-   auxiliary phases, save, reload and compare outputs, and verify restored optimizer,
-   scheduler and iteration when resume is claimed.
+   auxiliary phases, save, reload and compare outputs, and verify
+   [all saved training state](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-train/references/run-contract.md#resume-restores-state-not-the-exact-trajectory)
+   when resume is claimed.
 5. **Distillation quality.** Compare held-out teacher and student outputs at the target
    NFE with the actual checkpoint and sample count; use task metrics (for images the
    [FID script](https://github.com/NVlabs/FastGen/blob/main/scripts/README.md#fid-evaluation)), perceptual inspection and

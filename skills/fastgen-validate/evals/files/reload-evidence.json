@@ -15,7 +15,8 @@
     "scheduler_loaded": false,
     "callbacks_loaded": false,
     "iteration_loaded": false,
-    "new_process_iteration": 0
+    "new_process_iteration": 0,
+    "grad_scaler_loaded": false
   },
   "training": {
     "iterations": [
@@ -41,5 +42,19 @@
     "human_judgment_recorded": false,
     "task_metric_computed": false
   },
-  "method": "fastgen.methods.distribution_matching.dmd2.DMD2Model"
+  "method": "fastgen.methods.distribution_matching.dmd2.DMD2Model",
+  "resume_followup": {
+    "fixture": "A separate authored follow-up load after the weight-only check; also not executed by this evaluation.",
+    "call": "iteration = checkpointer.load(model.model_dict, optimizer_dict=model.optimizer_dict, scheduler_dict=model.scheduler_dict, path=checkpoint)",
+    "model_optimizer_scheduler_loaded": true,
+    "iteration_loaded": true,
+    "new_process_iteration": 600,
+    "checkpoint_has_callback_state": true,
+    "checkpoint_has_grad_scaler_state": true,
+    "target_has_stateful_callbacks": true,
+    "target_grad_scaler_enabled": true,
+    "callbacks_argument_supplied": false,
+    "grad_scaler_argument_supplied": false,
+    "claim": "This follow-up establishes full resume because weights, optimizer, scheduler and iteration were restored."
+  }
 }

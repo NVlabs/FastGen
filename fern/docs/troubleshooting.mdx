@@ -78,6 +78,7 @@ Check `DATA_ROOT_DIR`, `CKPT_ROOT_DIR`, `HF_HOME`, and local-only settings in th
 ## A new run resumes an earlier experiment
 
 Resume is enabled by default. Use a different `log_config.name` for an independent run. To restart in an existing directory, set `trainer.resume=False` and disable any auto-resume integration with `trainer.auto_resume=null`.
+Changing the name does not change an absolute or S3 `trainer.checkpointer.save_dir`; independent runs also need distinct checkpoint destinations.
 These flags do not reset W&B: it reuses `wandb_id.txt` independently of checkpoint loading. Use a distinct run directory for an independent tracker run.
 
 ## Distributed startup fails or waits for peers
@@ -101,7 +102,7 @@ FSDP resume requires DCP; monolithic checkpoints support FSDP warm starts only. 
 
 ## Inference appears to ignore a checkpoint
 
-Check the requested sampling branch and loaded keys against [checkpoint selection](/fastgen/inference#checkpoint-selection). Teacher sampling does not use `--ckpt_path`, and omitting that argument does not find the latest student checkpoint. Compare matching inputs and sampling grids before attributing differences to training.
+Check the requested sampling branch and loaded keys against [checkpoint selection](/fastgen/inference#checkpoint-selection), including whether the teacher shares the student's base network. Omitting `--ckpt_path` does not find the latest student checkpoint. Compare matching inputs and sampling grids before attributing differences to training.
 
 ## Report a problem
 

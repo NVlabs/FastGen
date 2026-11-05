@@ -33,10 +33,12 @@ Generate images and videos using pretrained or distilled models.
 
 #### Checkpoint selection
 
-`--ckpt_path` loads student `net` and configured EMA weights, not the teacher. Student sampling uses the first
-configured EMA when present; teacher sampling uses its constructor/pretrained configuration. To evaluate a
-fine-tuned SFT checkpoint, select student sampling. Without `--ckpt_path`, the scripts use constructor/pretrained
-weights and do not discover the latest training checkpoint. Check startup's loaded keys and selected weight source.
+`--ckpt_path` loads `net` and configured EMA weights. Student sampling uses the first configured EMA when present.
+A separate teacher keeps its constructor/pretrained weights; a
+[`SharedBaseTeacher`](../fastgen/networks/lora_utils.py) instead uses the checkpoint-loaded `net` with adapters disabled.
+To evaluate a fine-tuned SFT checkpoint, select student sampling. Without `--ckpt_path`, the scripts use
+constructor/pretrained weights and do not discover the latest training checkpoint. Check startup's loaded keys
+and selected weight source.
 
 #### Guidance
 

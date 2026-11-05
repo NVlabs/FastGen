@@ -8,10 +8,12 @@
   "trainer.resume": true,
   "observed_start_iteration": 200,
   "existing_files": [
-    "checkpoints/0000200.pth",
-    "wandb_id.txt"
+    "/workspace/outputs/shared-checkpoints/0000200.pth",
+    "/workspace/outputs/eval/experiment/same/wandb_id.txt"
   ],
   "FASTGEN_OUTPUT_ROOT": "/workspace/outputs",
   "HF_HOME": "/workspace/shared-cache",
-  "new_experiment_goal": "Start from the configured initial weights at iteration zero in a distinct tracker run."
+  "new_experiment_goal": "Start from the configured initial weights at iteration zero in a distinct tracker run.",
+  "trainer.checkpointer.save_dir": "/workspace/outputs/shared-checkpoints",
+  "trainer.checkpointer.use_s3": false
 }

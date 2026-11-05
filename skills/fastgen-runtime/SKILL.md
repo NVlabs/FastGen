@@ -39,6 +39,8 @@ failure diagnosis.
 4. **Run identity.** Independent runs need distinct `log_config.project`/`group`/`name`:
    the [run directory](https://github.com/NVlabs/FastGen/blob/main/fastgen/configs/README.md#run-directory) holds the resolved
    config, checkpoints and the W&B id, and resume is on by default.
+   Also check the checkpoint destination: [resolve_save_dir](https://github.com/NVlabs/FastGen/blob/main/fastgen/utils/scripts.py)
+   preserves absolute paths and S3 URIs, so those must be distinct for independent runs.
 5. **Launch.** Check the entry point's distributed support before building a launcher:
    training distributes only with `trainer.ddp` or `trainer.fsdp`, and the standard
    inference scripts do not shard models. Match `RANK`, `LOCAL_RANK` and `WORLD_SIZE` to

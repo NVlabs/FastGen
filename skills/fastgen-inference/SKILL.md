@@ -15,6 +15,7 @@ Apply [fastgen-runtime](https://github.com/NVlabs/FastGen/blob/main/skills/fastg
 selection, guidance and FID evaluation; the [ComfyUI nodes](https://github.com/NVlabs/FastGen/blob/main/comfyui/README.md) provide
 the interactive route. Read [weights and sampling](references/weights-and-sampling.md)
 for checkpoint roles and reproducible comparisons.
+For preparation-only requests, provide the command and pending checks without launching.
 
 1. **Resolve.** Config, teacher versus student (or both), weight source, prompts or class
    labels, conditioning media, seed, sampling settings and destination. Verify that the
@@ -36,8 +37,8 @@ for checkpoint roles and reproducible comparisons.
    conditioning and sample count, and record the loaded weight source. Local files do not
    prove tracker uploads.
 
-Report artifact paths, sampling branch and checkpoint, seed, grid, guidance and input
-settings. For memory failures inspect resident networks and offload options before
-changing the workload; for bad samples compare preprocessing and schedule against the
-reference before blaming the weights
+State whether inference was prepared or executed; report artifact paths, sampling branch
+and checkpoint, seed, grid, guidance and input settings. For memory failures inspect
+resident networks and offload options before changing the workload; for bad samples
+compare preprocessing and schedule against the reference before blaming the weights
 ([inference ignores a checkpoint](https://github.com/NVlabs/FastGen/blob/main/fern/docs/troubleshooting.mdx#inference-appears-to-ignore-a-checkpoint)).

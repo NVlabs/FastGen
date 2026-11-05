@@ -18,8 +18,8 @@ Trace `setup` in [scripts.py](https://github.com/NVlabs/FastGen/blob/main/fastge
   methods update only auxiliary networks on most iterations; check the method's phase
   schedule (`get_optimizers`) and actual parameter changes before claiming the student
   learned.
-- With a validation loader, validation runs before the first training step, every
-  `trainer.validation_iter` and after the last step, once per `trainer.global_vars_val`
+- With a validation loader, validation runs initially only when `iter_start == 0`, then
+  every `trainer.validation_iter` and after the last step, once per `trainer.global_vars_val`
   profile. It calls the method's `single_train_step` under no-grad with the iteration's
   loss phase, so the batch contract applies. Bound finite or repeating loaders with the
   `MAX_VAL_STEPS` profile key and change the student NFE with `STUDENT_STEPS`
@@ -83,7 +83,8 @@ and their order are tabulated under
   or the data stream changes its meaning, and shuffled loaders ignore it.
 - RNG is reseeded from seed, iteration and data rank; it does not restore every
   interrupted generator or worker state. Carry slots are not checkpointed, so carried
-  rollouts rebuild their phase after resume. Verify restored optimizer, scheduler and
-  callback state and subsequent progress; do not promise bitwise replay.
+  rollouts rebuild their phase after resume. Verify restored optimizer, scheduler,
+  enabled gradient scaler and callback state and subsequent progress; do not promise
+  bitwise replay.
 - W&B reuses `wandb_id.txt` independently of checkpoint loading
   ([a new run resumes an earlier experiment](https://github.com/NVlabs/FastGen/blob/main/fern/docs/troubleshooting.mdx#a-new-run-resumes-an-earlier-experiment)).

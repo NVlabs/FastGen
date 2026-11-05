@@ -21,13 +21,16 @@ the `FastGenModel` docstrings in [model.py](https://github.com/NVlabs/FastGen/bl
    and reduction, update order, required teacher or auxiliary networks and the inference
    rollout. Separate the method from the reference's architecture, dataset and
    engineering defaults, and record unresolved paper/code discrepancies.
-2. **Reuse.** Check whether a config or a narrow override of an existing method already
-   expresses it. Share mechanisms only where semantics match; do not inherit losses or
-   networks because they are defaults. Move objective math into
+2. **Reuse.** If existing options express the algorithm, hand off to
+   [fastgen-configure](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-configure/SKILL.md).
+   Otherwise choose the narrowest compatible method extension. Share mechanisms only
+   where semantics match; do not inherit losses or networks because they are defaults.
+   Move objective math into
    [common_loss.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/methods/common_loss.py) only when another caller shares it.
-3. **Implement.** Subclass `FastGenModel` in the matching category package with the
-   contract's model, optimizer, scheduler, batch and checkpoint interfaces; add a typed
-   method config under `fastgen/configs/methods/` and the export in
+3. **Implement.** Extend the selected method, creating a `FastGenModel` subclass in the
+   matching category only when needed. Follow the contract's model, optimizer, scheduler,
+   batch and checkpoint interfaces; for a new method add a typed config under
+   `fastgen/configs/methods/` and its export in
    [methods/__init__.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/methods/__init__.py). Keep model and dataset names out
    of the method; experiment configs own them.
 4. **Dependencies.** Trace the network operations and batch fields the method needs
