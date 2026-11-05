@@ -71,8 +71,10 @@ data and works outside the checkout. Run only this check with
 ## Documentation
 
 Edit component READMEs for the generated guides, or `fern/docs/*.mdx` for
-authored pages. See [fern/README.md](fern/README.md) for validation and local
-previews. Documentation changes require no GPU or FastGen installation.
+authored pages. The result is published at
+[docs.nvidia.com/fastgen](https://docs.nvidia.com/fastgen); see
+[fern/README.md](fern/README.md) for validation, local previews, and
+deployment. Documentation changes require no GPU or FastGen installation.
 
 ## Developer Certificate of Origin
 

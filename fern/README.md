@@ -5,6 +5,12 @@ Add new README sources to [scripts/build_docs.py](scripts/build_docs.py) and
 pages to [docs.yml](docs.yml). Generated files in `docs/generated/`
 are ignored by Git; rebuild them after editing a source README.
 
+The site is published at [docs.nvidia.com/fastgen](https://docs.nvidia.com/fastgen) by the
+[Fern Docs workflow](../.github/workflows/fern-docs.yml): pull requests opened from
+branches of this repository (not forks or drafts) get a preview link, pushes to `main`
+update the staging preview, and release tags (`vX.Y.Z`) or documentation tags
+(`docs-vX.Y.Z-N`) publish to production.
+
 ## Validate and preview
 
 Requires Python 3.10+ and Node.js 22+. No FastGen installation or GPU is needed.
