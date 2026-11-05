@@ -46,9 +46,9 @@ use [fastgen-add-modality](https://github.com/NVlabs/FastGen/blob/main/skills/fa
    differences before training.
 7. **Train and document.** Use [fastgen-train](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-train/SKILL.md) for a
    short SFT run with media every iteration, then the requested methods; compare outputs
-   before and after and reload a checkpoint. Add tests following `tests/test_network*.py`
-   and `tests/test_conditioning.py`, update the README tables (network list, pretrained
-   models) and run `make format` and `make lint`
+   before and after and reload a checkpoint. Add and run tests following
+   `tests/test_network*.py` and `tests/test_conditioning.py`, update the README tables
+   (network list, pretrained models) and run `make format` and `make lint`
    ([CONTRIBUTING.md](https://github.com/NVlabs/FastGen/blob/main/CONTRIBUTING.md#code-style-and-formatting)).
 
 Report implementation and config paths and per-task parity, training and checkpoint

@@ -40,12 +40,12 @@ and `FastGenModel._get_outputs` in [model.py](https://github.com/NVlabs/FastGen/
 
 - Scalar (`logging_iter`) and media (`sample_logging_iter`) cadences are independent, and
   explicit callback arguments override the trainer's interval; set both to one for a
-  per-iteration integration test. Choose a cadence that is not a multiple of the update
-  cycle, or an alternating method's auxiliary losses never appear in the charts.
-- Step-end callbacks receive the **last** accumulation microbatch, and scalar aggregation
-  averages the values reported per call and rank. A smooth chart is not proof of finite
-  losses or gradients on every microbatch and rank; instrument the hook (before gradient
-  clipping sanitises NaNs) when that claim matters.
+  per-iteration integration test. Losses accumulate on every iteration and each key is
+  averaged over the calls and ranks that reported it, so an alternating method's
+  auxiliary losses appear at any cadence; media capture only the iteration they fire on.
+- Step-end callbacks receive the **last** accumulation microbatch. A smooth chart is not
+  proof of finite losses or gradients on every microbatch and rank; instrument the hook
+  (before gradient clipping sanitises NaNs) when that claim matters.
 - The student panel shows a fresh deferred generation, normally from the first EMA; the
   detached training estimate is a separate debug-level panel. Callback prompts and noise
   change over training, so use a fixed held-out inference set for before/after judgments.

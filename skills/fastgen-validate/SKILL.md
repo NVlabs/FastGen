@@ -29,7 +29,8 @@ when callback logs are the evidence.
    Prefer independently constructed upstream components over shared prepared ones, check
    that shared weights and buffers survive preparation, and treat precision differences
    as a separate experiment. Find the first differing intermediate before loosening
-   tolerances.
+   tolerances; a loosened tolerance is a separately documented comparison that leaves
+   the failure against the manifest's criteria on record.
 3. **Media.** Generate matched seeded examples through both implementations across
    prompts and conditioning modes; present side-by-side galleries for human judgment and
    record judgments separately from metrics. Small galleries are not benchmarks.

@@ -37,5 +37,6 @@ preprocessing, precision, conditioning and the module lifecycle.
   cannot decode unsupported media.
 
 Test a complete raw sample through preprocessing, loss, sampling, serialization and
-reload, together with an existing modality to catch changed dispatch. Image and video
-scores cannot validate another modality's units, kinematics or alignment.
+reload, together with an existing modality to catch changed dispatch, and assert that
+every generated modality survives joint export and reload with its shape and units. Image
+and video scores cannot validate another modality's units, kinematics or alignment.

@@ -39,7 +39,7 @@ the `FastGenModel` docstrings in [model.py](https://github.com/NVlabs/FastGen/bl
    logging and staged initialisation.
 6. **Verify the math.** Compare objective values **and gradients** with the reference on
    fixed tensors, times and noise before any expensive run; cover boundary times,
-   disabled terms and detach boundaries. Add unit tests following the
+   disabled terms and detach boundaries. Add and run unit tests following the
    `tests/test_*model.py` pattern and use [fastgen-validate](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-validate/SKILL.md)
    for sampling parity and checkpoints.
 7. **Run and document.** Use [fastgen-train](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-train/SKILL.md) for a

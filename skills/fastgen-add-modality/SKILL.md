@@ -42,7 +42,8 @@ an already supported task.
 7. **Validate.** Use [fastgen-validate](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-validate/SKILL.md) for parity and
    reviewable comparisons, then [fastgen-train](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-train/SKILL.md) for short
    SFT and the requested method; check per-modality gradients, conditioning sensitivity,
-   serialization, checkpoint reload and that existing modes still work.
+   serialization of every generated modality, checkpoint reload and that existing modes
+   still work.
 
 Report supported input and output modes, implementation, data and config paths, native
 artifacts and evidence per tested combination. For plausible but wrong outputs check

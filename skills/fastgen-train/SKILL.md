@@ -27,17 +27,17 @@ checkpoint.
    lists the settings and their order. Resume is on by default, so independent runs need
    new run identities, and FSDP runs resume only from sharded checkpoints
    ([checkpoint storage](https://github.com/NVlabs/FastGen/blob/main/fastgen/configs/README.md#distributed-checkpoint-storage)).
-3. **Launch.** Enable exactly one of `trainer.ddp`/`trainer.fsdp` for multi-GPU runs; a
+3. **Bound and observe.** Before launching set `trainer.max_iter`,
+   `trainer.save_ckpt_iter`, `trainer.validation_iter`, `trainer.logging_iter` and the
+   W&B destination; keep the algorithmic callbacks. For a smoke test log scalars and media
+   every iteration through the [W&B callback](https://github.com/NVlabs/FastGen/blob/main/fastgen/callbacks/README.md) and run
+   long enough to cover a student update and every alternating optimizer phase.
+4. **Launch.** Enable exactly one of `trainer.ddp`/`trainer.fsdp` for multi-GPU runs; a
    launcher alone distributes nothing. Budget memory for teacher, student, auxiliary
    networks, optimizer state and preprocessors
-   ([CUDA out of memory](https://github.com/NVlabs/FastGen/blob/main/fern/docs/troubleshooting.mdx#cuda-runs-out-of-memory)) and
-   confirm wrapping and world size in the startup log.
-4. **Bound and observe.** Set `trainer.max_iter`, `trainer.save_ckpt_iter`,
-   `trainer.validation_iter`, `trainer.logging_iter` and the W&B destination; keep the
-   algorithmic callbacks. For a smoke test log scalars and media every iteration through
-   the [W&B callback](https://github.com/NVlabs/FastGen/blob/main/fastgen/callbacks/README.md) and run long enough to cover a
-   student update and every alternating optimizer phase. Confirm online uploads when
-   requested.
+   ([CUDA out of memory](https://github.com/NVlabs/FastGen/blob/main/fern/docs/troubleshooting.mdx#cuda-runs-out-of-memory)),
+   then confirm wrapping, world size and, when requested, online tracker uploads in the
+   startup log.
 5. **Monitor.** Check finite losses and gradients, parameter updates, checkpoints and
    samples with [fastgen-validate](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-validate/SKILL.md); compare fixed
    held-out inputs before and after training with
