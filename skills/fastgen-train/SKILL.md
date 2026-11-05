@@ -36,15 +36,16 @@ checkpoint.
    launcher alone distributes nothing. Budget memory for teacher, student, auxiliary
    networks, optimizer state and preprocessors
    ([CUDA out of memory](https://github.com/NVlabs/FastGen/blob/main/fern/docs/troubleshooting.mdx#cuda-runs-out-of-memory)),
-   then confirm wrapping, world size and, when requested, online tracker uploads in the
-   startup log.
-5. **Monitor.** Check finite losses and gradients, parameter updates, checkpoints and
-   samples with [fastgen-validate](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-validate/SKILL.md); compare fixed
+   then confirm the [runtime startup checks](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-runtime/SKILL.md)
+   and, when requested, online tracker uploads.
+5. **Monitor.** Check finite losses and gradients, parameter updates and samples with
+   [fastgen-validate](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-validate/SKILL.md); compare fixed
    held-out inputs before and after training with
    [fastgen-inference](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-inference/SKILL.md). Stop on non-finite updates,
-   broken conditioning or degrading samples before spending the budget. Scheduler
-   requeue alone saves nothing; rely on periodic checkpoints or on a `trainer.auto_resume`
-   integration (the default is a no-op).
+   broken conditioning or degrading samples before spending the budget.
+   Verify the run's saved checkpoint and readable media before reporting success; include
+   these artifact checks in a review-only run plan. Scheduler requeue alone saves nothing;
+   rely on periodic checkpoints or a `trainer.auto_resume` integration (default: no-op).
 
 Report run URLs, the resolved config, executed iterations and optimizer phases,
 checkpoint location, compute used and validation evidence. A submitted job is not a

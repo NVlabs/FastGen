@@ -10,7 +10,8 @@ metadata:
 
 # Add a FastGen network
 
-Apply [fastgen-runtime](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-runtime/SKILL.md). Start with the
+Apply [fastgen-develop](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-develop/SKILL.md)
+and [fastgen-runtime](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-runtime/SKILL.md). Start with the
 [network README](https://github.com/NVlabs/FastGen/blob/main/fastgen/networks/README.md) and the interface docstrings in
 [network.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/networks/network.py) and [module.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/networks/module.py),
 then inspect the closest maintained adapter for the same task. Read
@@ -48,8 +49,7 @@ use [fastgen-add-modality](https://github.com/NVlabs/FastGen/blob/main/skills/fa
    short SFT run with media every iteration, then the requested methods; compare outputs
    before and after and reload a checkpoint. Add and run tests following
    `tests/test_network*.py` and `tests/test_conditioning.py`, update the README tables
-   (network list, pretrained models) and run `make format` and `make lint`
-   ([CONTRIBUTING.md](https://github.com/NVlabs/FastGen/blob/main/CONTRIBUTING.md#code-style-and-formatting)).
+   (network list, pretrained models).
 
 Report implementation and config paths and per-task parity, training and checkpoint
 results. If the loss decreases while outputs degrade, inspect input normalisation,

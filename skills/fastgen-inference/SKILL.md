@@ -1,7 +1,7 @@
 ---
 name: fastgen-inference
 description: >-
-  Generate and inspect NVIDIA FastGen teacher or distilled-student outputs with the inference scripts or ComfyUI nodes: config, checkpoint, prompts, conditioning media, seeds and sampling settings. Use it for any sampling run, evaluation gallery or teacher/student comparison.
+  Generate and inspect NVIDIA FastGen teacher or distilled-student outputs with the inference scripts or ComfyUI nodes: config, checkpoint, prompts, conditioning media, seeds and sampling settings. Use it to prepare or execute sampling; use fastgen-validate to assess existing parity or quality evidence.
 license: Apache-2.0
 metadata:
   author: "Julius Berner <jberner@nvidia.com>"

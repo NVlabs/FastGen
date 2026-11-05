@@ -23,7 +23,7 @@ For an `Unknown config fields` error, check the typed config schema: `+` and `++
 
 Check startup's effective global batch: accumulation uses integer rounds and data-parallel world size, so the requested target can change. For failures after several updates, measure every optimizer phase and media generation. Optimizer state allocates lazily, and FSDP accumulation can retain unsharded gradients despite smaller microbatches.
 
-## CPU runs out of memory
+## Host RAM or virtual memory is exhausted
 
 Loading multiple models or preprocessors, including CPU-offloaded parameters, can exhaust host RAM. Pre-encoded inputs help avoid unnecessary preprocessors.
 

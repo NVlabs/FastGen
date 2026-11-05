@@ -39,6 +39,23 @@ make lint    # Check compliance
 
 **Note:** The `fastgen/third_party/` directory is excluded from checks.
 
+## Design and Maintenance
+
+- Write clear, modular code that is easy to use and extend. Prefer refactoring and
+  shared helpers over workarounds and duplication.
+- Put model-specific behavior in networks and preprocessors, and dataset-specific
+  behavior in loaders. Keep methods, the trainer and shared loading infrastructure
+  as model- and dataset-agnostic as possible.
+- Backward compatibility is not required unless requested. Update callers together;
+  avoid compatibility-only aliases or wrappers. Use keyword-only parameters only
+  when they improve API clarity.
+- Avoid redundant checks when existing code already reports the error clearly.
+  When it improves readability, group input checks in a separate function that raises
+  informative errors without modifying inputs or returning a value.
+- Follow existing style, except in third-party code.
+- Update relevant tests, documentation and skills when behavior, interfaces or usage
+  change. Keep READMEs, docstrings and skills concise; link instead of repeating details.
+
 ## Continuous Integration
 
 The CI pipeline runs automatically on every push to `main` and every pull request targeting `main`:
@@ -75,6 +92,19 @@ authored pages. The result is published at
 [docs.nvidia.com/fastgen](https://docs.nvidia.com/fastgen); see
 [fern/README.md](fern/README.md) for validation, local previews, and
 deployment. Documentation changes require no GPU or FastGen installation.
+
+## Contributing Skills
+
+Create each skill in `skills/<name>/SKILL.md`, with supporting contracts and pitfalls
+in its `references/` directory. Keep workflows reusable across models, configurations
+and library versions. Use absolute
+`https://github.com/NVlabs/FastGen/blob/main/...` URLs outside the skill package so
+installed copies still resolve; link bundled references relatively. Verify paths and
+heading anchors, and update the skill's [evaluation cases](skills/README.md#evaluation).
+
+For skill changes, a maintainer requests NVSkills CI by commenting `/nvskills-ci`
+on the pull request. Before merging, confirm validation and signing succeeded and
+review the generated artifacts. Rerun after further skill-content changes.
 
 ## Developer Certificate of Origin
 

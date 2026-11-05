@@ -1,7 +1,7 @@
 ---
 name: fastgen-runtime
 description: >-
-  Resolve the execution context for any NVIDIA FastGen command: checkout and interpreter, config path and override syntax, output/cache/data roots, run identity, and distributed launch variables. Use it before running or debugging train.py, the inference scripts or evaluation scripts.
+  Resolve the execution context for an NVIDIA FastGen command: checkout and interpreter, config path and override syntax, output/cache/data roots, run identity, and distributed launch variables. Use it when preparing or debugging execution; method selection belongs to fastgen-configure.
 license: Apache-2.0
 metadata:
   author: "Julius Berner <jberner@nvidia.com>"
@@ -23,9 +23,11 @@ failure diagnosis.
    storage rules; importing GPU dependencies or resolving a config may already need an
    allocation.
 2. **Config and overrides.** Run from the repository root (or put it on `PYTHONPATH`):
+   training enters through the root [train.py](https://github.com/NVlabs/FastGen/blob/main/train.py).
    `--config` is a relative `.py` path exposing `create_config()`, and the loader in
    [config_utils.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/configs/config_utils.py) rejects absolute paths and `..`.
-   Script arguments precede the single `-` that introduces Hydra overrides
+   Script arguments precede the single `-` required by `override_config_with_opts`
+   to introduce Hydra overrides
    ([command-line arguments](https://github.com/NVlabs/FastGen/blob/main/fastgen/configs/README.md#command-line-arguments)).
    `--dryrun` resolves the config and exits before the process group is initialised and
    before the global batch is rounded to accumulation steps; it tests neither.
@@ -42,6 +44,8 @@ failure diagnosis.
    inference scripts do not shard models. Match `RANK`, `LOCAL_RANK` and `WORLD_SIZE` to
    the processes launched; stale launcher variables make setup wait for peers
    ([distributed startup](https://github.com/NVlabs/FastGen/blob/main/fern/docs/troubleshooting.mdx#distributed-startup-fails-or-waits-for-peers)).
+   Verify actual world size, wrapping, accumulation and effective batch in startup logs;
+   a review-only plan should identify these checks as pending.
 
 Report the selected checkout, interpreter, config, roots and launch context. For import
 failures check the imported package path and working directory first; for access

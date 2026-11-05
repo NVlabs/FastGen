@@ -16,14 +16,16 @@ only as needed.
 Trace `FastGenModel.build_model`, `on_train_begin`, `init_preprocessors` and
 `validate_modules` in [model.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/methods/model.py).
 
-- Constructors build the registered tree; the model prepares each root exactly once,
-  before the optimizers, so attach heads and embedders before preparation and construct
-  fresh instances after a failed preparation. Never deepcopy a live sharded model to
-  make a teacher.
+- Constructors build the registered tree; preparing a root prepares **all** nested
+  `FastGenModule`s once. `_record_precision` broadcasts the root request; express local
+  precision through overrides before that preparation, not a second child preparation.
+  Attach heads and embedders first and construct fresh instances after a failed
+  preparation. Never deepcopy a live sharded model to make a teacher.
 - `preprocessors` is a **plain dict** outside the network's state dict.
   `init_preprocessors` constructs `FastGenModule` wrappers lazily and the model registers
-  them as frozen roots; encode and decode work must go through their `forward` so hooks
-  run. A network that supplies a VAE also implements the `init_vae` hook, which
+  them as independent frozen roots, not children prepared again under the backbone.
+  Encode and decode work must go through their `forward` so hooks run. A network that
+  supplies a VAE also implements the `init_vae` hook, which
   `FastGenNetwork.vae_context` checks even for an installed VAE.
 - Preparation sets `train(trainable)` and re-enables gradients on trainable roots;
   override `requires_grad_` (and the mode policy) to keep submodules frozen or in eval
@@ -71,7 +73,10 @@ Trace `prepare_batch` and `net_preprocessors` in `model.py`, then `encode_real`,
   clean-frame constraints inside the native path, because guidance composes native
   branches and transforms once and DMD2 caches them. Embedded guidance, negative-prompt
   CFG and separate unconditional backbones are different recipes to express through
-  `GuidanceConfig`.
+  `GuidanceConfig`. Parameterize tests over the cross-product of compatible return modes
+  and prediction types, checking values, conditioning and dtype in every combination.
+  Use differing model and state dtypes to expose unwanted casts when checking
+  `output_dtype=None`; forwarded-argument assertions alone miss transformation errors.
 - Keep state, model, optimizer and timestep precision separate: use
   `cast_to_model_precision`, pin reference FP32 state through
   `_fixed_precision_overrides`, give preprocessors their reference `precision_model`
@@ -88,10 +93,10 @@ Trace `prepare_batch` and `net_preprocessors` in `model.py`, then `encode_real`,
 
 ## Loss paths need more than ordinary backward
 
-- Adversarial student updates backpropagate through a frozen teacher's features to the
-  generated input; detached features leave a plausible loss without a learning signal.
-  `feature_indices` address declared extraction points with the return schema documented
-  in `FastGenNetwork.forward`, including the empty set.
+- Adversarial student updates need input gradients through frozen teacher features.
+  Freeze parameters in the regression and require finite, nonzero input gradients from
+  each supported block family. Exercise early and prediction-plus-features returns and
+  the empty `feature_indices` schema documented in `FastGenNetwork.forward`.
 - Second-time (`r`) inputs and JVP or finite-difference objectives
   ([mean_flow.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/methods/trajectory_matching/mean_flow.py)) need a derivative
   path that attention kernels, checkpointing and in-place operations can break; exercise
@@ -134,6 +139,7 @@ Trace `prepare_batch` and `net_preprocessors` in `model.py`, then `encode_real`,
 - All ranks execute sharded calls in the same order, including optional preprocessor
   branches, media callbacks and routed experts with empty local batches.
 - Reload the actual format and root set (DCP shards with their marker, adapter-only
-  state); distinguish initialisation from resume and use
+  state), and verify that inference followed by backward preserves training behavior.
+  Distinguish initialisation from resume and use
   [fastgen-validate](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-validate/SKILL.md) for the evidence. Start
   diagnosis at [sharded results differ](https://github.com/NVlabs/FastGen/blob/main/fern/docs/troubleshooting.mdx#sharded-results-differ-or-meta-initialization-fails).

@@ -10,7 +10,8 @@ metadata:
 
 # Add a FastGen modality
 
-Apply [fastgen-runtime](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-runtime/SKILL.md). Read the
+Apply [fastgen-develop](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-develop/SKILL.md)
+and [fastgen-runtime](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-runtime/SKILL.md). Read the
 [network](https://github.com/NVlabs/FastGen/blob/main/fastgen/networks/README.md) and [dataset](https://github.com/NVlabs/FastGen/blob/main/fastgen/datasets/README.md)
 READMEs, then [modality boundaries](references/modality-contract.md). Use
 [fastgen-add-network](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-add-network/SKILL.md) alone for another model of

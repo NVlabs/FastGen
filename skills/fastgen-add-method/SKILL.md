@@ -10,7 +10,8 @@ metadata:
 
 # Add a FastGen method
 
-Apply [fastgen-runtime](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-runtime/SKILL.md). Read the
+Apply [fastgen-develop](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-develop/SKILL.md)
+and [fastgen-runtime](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-runtime/SKILL.md). Read the
 [method index](https://github.com/NVlabs/FastGen/blob/main/fastgen/methods/README.md) and the nearest maintained implementation,
 the `FastGenModel` docstrings in [model.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/methods/model.py), then the
 [method contract](references/method-contract.md).
@@ -37,7 +38,7 @@ the `FastGenModel` docstrings in [model.py](https://github.com/NVlabs/FastGen/bl
 5. **Configs.** Use [fastgen-configure](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-configure/SKILL.md) for a small
    supported experiment and the target recipe, including the method's student grid,
    logging and staged initialisation.
-6. **Verify the math.** Compare objective values **and gradients** with the reference on
+6. **Verify the math.** Compare each objective term's value **and gradients** with the reference on
    fixed tensors, times and noise before any expensive run; cover boundary times,
    disabled terms and detach boundaries. Add and run unit tests following the
    `tests/test_*model.py` pattern and use [fastgen-validate](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-validate/SKILL.md)
@@ -47,8 +48,7 @@ the `FastGenModel` docstrings in [model.py](https://github.com/NVlabs/FastGen/bl
    that intended modules update, frozen targets stay fixed, validation preserves training
    state and resume restores the new state. Evaluate with
    [fastgen-inference](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-inference/SKILL.md) at the target NFE, add the
-   method to the README tables (they feed the documentation site) and run
-   `make format` and `make lint` ([CONTRIBUTING.md](https://github.com/NVlabs/FastGen/blob/main/CONTRIBUTING.md#code-style-and-formatting)).
+   method to the README tables (they feed the documentation site).
 
 Report method and config paths, the correspondence to the reference math, tests, runs
 and supported combinations. For finite but ineffective training inspect gradient paths

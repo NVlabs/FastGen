@@ -27,7 +27,11 @@ was selected.
 3. **Access.** Identify the services the task uses (W&B, Hugging Face, S3) and whether
    access already works. Configure missing credentials as described under
    [environment variables](https://github.com/NVlabs/FastGen/blob/main/fastgen/configs/README.md#environment-variables) and verify
-   without printing secrets. Gated-model acceptance is distinct from authentication;
+   without printing secrets. Check the documented precedence of the shell, import-time
+   `.env` and configured credential files before choosing which source to change.
+   [set_env_vars](https://github.com/NVlabs/FastGen/blob/main/fastgen/utils/env.py) skips file loading for a falsy
+   `credentials_dir`; use that opt-out when preserving injected secrets.
+   Gated-model acceptance is distinct from authentication;
    report the missing piece precisely.
 4. **Weights and data.** Inventory what the selected config needs. Follow
    [pretrained models](https://github.com/NVlabs/FastGen/blob/main/fastgen/networks/README.md#pretrained-models) for weights and

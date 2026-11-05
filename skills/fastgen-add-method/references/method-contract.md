@@ -47,8 +47,10 @@ Read `Trainer.train_step` in [trainer.py](https://github.com/NVlabs/FastGen/blob
   unused-parameter detection, [DDPWrapper](https://github.com/NVlabs/FastGen/blob/main/fastgen/utils/distributed/ddp.py) traverses
   every attached output graph. Reuse `_get_outputs` for sample logging: it separates the
   deferred fresh generation from the detached training estimate.
-- A frozen network may still need input gradients (adversarial features), and JVP
-  objectives need more than ordinary backward. Keep collective participation uniform
+- Freezing parameters does not justify `no_grad`: keep autograd through frozen networks
+  when a loss needs input derivatives, such as teacher features in a generator GAN loss.
+  Detached targets can use `no_grad`; verify each loss term separately.
+  JVP objectives need more than ordinary backward. Keep collective participation uniform
   across ranks when branches or masks differ; a masked loss keeps forwards that skipping
   would turn into a hang.
 
@@ -61,7 +63,9 @@ Read `Trainer.train_step` in [trainer.py](https://github.com/NVlabs/FastGen/blob
 - Use the carry machinery ([carry.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/callbacks/carry.py),
   [backward_simulation.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/methods/backward_simulation.py)) only when its
   semantics match; its state is not checkpointed.
-- Check objective values and gradients against the reference on fixed tensors, including
-  boundary times and disabled terms, before a full model; then exercise every optimizer
-  phase, real sampling and save/reload. Construction plus a decreasing aggregate loss is
-  not parity.
+- Compare loss values and parameter/input gradients with an independent tensor reference
+  at fixed times and noise, including boundary times and disabled terms. For weighting,
+  use unit, zero and mixed weights that distinguish the intended reduction denominator;
+  an all-zero loss must stay connected for backward. Cover each changed method variant
+  or explicitly leave it unsupported. Then exercise every optimizer phase, sampling and
+  save/reload; construction plus a decreasing aggregate loss is not parity.

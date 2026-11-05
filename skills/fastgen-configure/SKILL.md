@@ -44,11 +44,14 @@ does not implement, use [fastgen-add-method](https://github.com/NVlabs/FastGen/b
    student weights, prediction type, noise schedule, guidance and negative conditioning;
    check that every enabled loss has its modules and trainable parameters, routing
    missing capabilities to [fastgen-add-network](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-add-network/SKILL.md).
-   Set iterations, optimizer, effective batch, logging and checkpoint cadence to the
-   budget.
-6. **Resolve.** Run `--dryrun` and inspect the resolved values for placeholder data paths,
-   unintended weights, auxiliary networks and conflicting distributed modes. Hand
-   execution to [fastgen-train](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-train/SKILL.md); a config-only task ends
+   Set iterations, optimizer, effective batch, logging, checkpoints and
+   [validation limits](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-train/references/run-contract.md#what-an-iteration-does)
+   to the budget.
+6. **Resolve.** Consult [fastgen-runtime](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-runtime/SKILL.md) when writing
+   the command, including its override syntax. Run `--dryrun` and inspect the resolved
+   values for placeholder paths, unintended weights, auxiliary networks and conflicting
+   distributed modes. Hand execution to
+   [fastgen-train](https://github.com/NVlabs/FastGen/blob/main/skills/fastgen-train/SKILL.md); a config-only task ends
    with the reviewed config.
 
 Report the config path, departures from the nearest recipe, the method and data rationale

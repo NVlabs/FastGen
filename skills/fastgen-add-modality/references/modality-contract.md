@@ -29,7 +29,8 @@ preprocessing, precision, conditioning and the module lifecycle.
   dimensionality and on image, video and audio keys, so other arrays can be misrouted.
   Add an explicit native writer and reader with shape and unit metadata instead of
   reshaping data to fit a media writer, and never let extra outputs silently drop out of
-  joint-media export.
+  joint-media export. Caller metadata must not overwrite authoritative tensor or schema
+  fields; keep it separate or reject conflicting keys.
 - **Inference and tracking.** The image and video scripts, `MediaEntry` and the writer
   dispatch in [wandb.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/callbacks/wandb.py) are not arbitrary-modality
   registries. Extend only the needed paths, keep sample identity and conditioning, and
@@ -37,6 +38,7 @@ preprocessing, precision, conditioning and the module lifecycle.
   cannot decode unsupported media.
 
 Test a complete raw sample through preprocessing, loss, sampling, serialization and
-reload, together with an existing modality to catch changed dispatch, and assert that
-every generated modality survives joint export and reload with its shape and units. Image
-and video scores cannot validate another modality's units, kinematics or alignment.
+reload, together with an existing modality to catch changed dispatch. For lossless native
+I/O, assert exact tensor values, dtype, shape, units and identity for every sample and
+modality; numerical tolerances belong to lossy conversions. Image and video scores cannot
+validate another modality's units, kinematics or alignment.

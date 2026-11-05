@@ -1,7 +1,7 @@
 ---
 name: fastgen-dataset
 description: >-
-  Prepare, register or repair datasets for NVIDIA FastGen loaders: class-conditional ZIPs, WebDataset shards of images, prompts, latents, videos, audio or camera data, and KD pairs or trajectories; then verify decoded batches. Use it whenever training data is missing, malformed or needs a new data config.
+  Prepare, register or repair datasets for NVIDIA FastGen loaders: class-conditional ZIPs, WebDataset shards of images, prompts, latents, videos, audio or camera data, and KD pairs or trajectories; then verify decoded batches. For experiment configuration over already prepared data, use fastgen-configure.
 license: Apache-2.0
 metadata:
   author: "Julius Berner <jberner@nvidia.com>"
@@ -34,10 +34,10 @@ shard acceptance, coverage and resume accounting.
 4. **Splits and size.** Separate training from held-out evaluation inputs before deriving
    labels or trajectories. Estimate the unique examples needed from throughput, effective
    batch, updates and acceptable repetition; a tiny dataset validates plumbing only.
-5. **Register.** Copy a preset from [data.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/configs/data.py) into the
-   experiment config (or add a shared preset there), with paths supplied through the
-   config or the environment roots; keep data and preprocessing artifacts outside the
-   source tree. For KD data use the selected teacher and the documented
+5. **Register.** Import and copy a preset from [data.py](https://github.com/NVlabs/FastGen/blob/main/fastgen/configs/data.py)
+   rather than reproducing its loader fields; add a shared preset there when needed.
+   Supply paths through the config or environment roots; keep data and preprocessing
+   artifacts outside the source tree. For KD data use the selected teacher and the documented
    [KD loader format](https://github.com/NVlabs/FastGen/blob/main/fastgen/datasets/README.md#knowledge-distillation-loaders).
 6. **Verify.** Iterate the real loader and a prepared batch (`prepare_batch`) in the
    proper runtime; check keys, shapes, dtypes, ranges, captions, pairing, negative
