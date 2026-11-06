@@ -1,5 +1,7 @@
 <h1 align="center">NVIDIA FastGen: Fast Generation from Diffusion Models</h1>
 
+[![Documentation](https://img.shields.io/badge/Documentation-docs.nvidia.com%2Ffastgen-blue)](https://docs.nvidia.com/fastgen)
+[![Agent Skills](https://img.shields.io/badge/Agent%20Skills-skills%2F-blue)](skills/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.10-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![NVIDIA](https://img.shields.io/badge/NVIDIA-76B900?logo=nvidia&logoColor=white)](https://www.nvidia.com/)
@@ -139,19 +141,25 @@ Use `+key=value` for a key the config does not define yet; see [fastgen/configs/
 
 ## Documentation
 
-See each component's README for detailed documentation and
-[Contributing to the docs](CONTRIBUTING.md#documentation) for contribution guidelines.
+The documentation is published at [docs.nvidia.com/fastgen](https://docs.nvidia.com/fastgen). Its pages are
+generated from the READMEs in this repository, plus the authored
+[training and checkpoints](https://docs.nvidia.com/fastgen/training),
+[troubleshooting](https://docs.nvidia.com/fastgen/troubleshooting), and
+[release notes](https://docs.nvidia.com/fastgen/release-notes) pages. See
+[Contributing to the docs](CONTRIBUTING.md#documentation) for how to edit them. The main
+components and their source READMEs are:
 
-| Component | Documentation | Description |
-|-----------|---------------|-------------|
-| **Methods** | [fastgen/methods/README.md](fastgen/methods/README.md) | Trajectory matching, distribution matching, and fine-tuning methods |
-| **Networks** | [fastgen/networks/README.md](fastgen/networks/README.md) | Network architectures (Flux, Qwen-Image, Wan, LingBot-world, Cosmos, LTX-2, etc.) and pretrained models |
-| **Configs** | [fastgen/configs/README.md](fastgen/configs/README.md) | Configuration system, environment variables, and creating custom configs |
-| **Datasets** | [fastgen/datasets/README.md](fastgen/datasets/README.md) | Dataset preparation and WebDataset loaders (image, video, video+audio) |
-| **Callbacks** | [fastgen/callbacks/README.md](fastgen/callbacks/README.md) | Training callbacks (EMA, logging, gradient clipping, etc.) |
-| **Inference** | [scripts/README.md](scripts/README.md) | Inference modes (T2I, I2I, T2V, I2V, V2V, etc.) and FID evaluation |
-| **ComfyUI** | [comfyui/README.md](comfyui/README.md) | ComfyUI custom nodes for interactive teacher/student inference |
-| **Third Party** | [fastgen/third_party/README.md](fastgen/third_party/README.md) | Third-party dependencies (Depth Anything V2, etc.) |
+| Component | README | Description |
+|-----------|--------|-------------|
+| **[Methods](https://docs.nvidia.com/fastgen/methods)** | [fastgen/methods/README.md](fastgen/methods/README.md) | Trajectory matching, distribution matching, and fine-tuning methods |
+| **[Networks](https://docs.nvidia.com/fastgen/networks)** | [fastgen/networks/README.md](fastgen/networks/README.md) | Network architectures (Flux, Qwen-Image, Wan, LingBot-world, Cosmos, LTX-2, etc.) and pretrained models |
+| **[Configs](https://docs.nvidia.com/fastgen/configuration)** | [fastgen/configs/README.md](fastgen/configs/README.md) | Configuration system, environment variables, and creating custom configs |
+| **[Datasets](https://docs.nvidia.com/fastgen/datasets)** | [fastgen/datasets/README.md](fastgen/datasets/README.md) | Dataset preparation and WebDataset loaders (image, video, video+audio) |
+| **[Callbacks](https://docs.nvidia.com/fastgen/callbacks)** | [fastgen/callbacks/README.md](fastgen/callbacks/README.md) | Training callbacks (EMA, logging, gradient clipping, etc.) |
+| **[Inference](https://docs.nvidia.com/fastgen/inference)** | [scripts/README.md](scripts/README.md) | Inference modes (T2I, I2I, T2V, I2V, V2V, etc.) and FID evaluation |
+| **[ComfyUI](https://docs.nvidia.com/fastgen/comfyui)** | [comfyui/README.md](comfyui/README.md) | ComfyUI custom nodes for interactive teacher/student inference |
+| **Skills** | [skills/README.md](skills/README.md) | Agent Skills for coding agents: setup, configuration, data, training, inference, validation, and extending FastGen |
+| **[Third Party](https://docs.nvidia.com/fastgen/third-party)** | [fastgen/third_party/README.md](fastgen/third_party/README.md) | Third-party dependencies (Depth Anything V2, etc.) |
 
 ## Supported Methods
 
