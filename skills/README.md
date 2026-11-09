@@ -1,21 +1,16 @@
 # FastGen agent skills
 
 [Agent Skills](https://agentskills.io/specification) that teach coding agents such as Claude
-Code and Codex how to work with NVIDIA FastGen.
+Code and Codex how to work with [NVIDIA FastGen](https://docs.nvidia.com/fastgen).
 
 ## Install
 
-Use the [`skills` CLI](https://github.com/vercel-labs/skills), the same flow as for the
-[NVIDIA skills catalog](https://github.com/NVIDIA/skills):
+FastGen skills are published in the [NVIDIA skills catalog](https://github.com/NVIDIA/skills#skill-catalog).
+Follow [NVIDIA's installation guide](https://github.com/NVIDIA/skills#quickstart), or, if
+NVIDIA Skill Finder is already available in your agent, ask it to install the FastGen skills.
 
-```bash
-npx skills add NVlabs/FastGen --list                                   # browse
-npx skills add NVlabs/FastGen                                          # install interactively
-npx skills add NVlabs/FastGen --skill fastgen-train -a claude-code -y  # one skill, one agent
-```
-
-Alternatively, copy a skill directory into your agent's skills folder, such as
-`.claude/skills/`.
+Alternatively, copy a complete skill directory, including its supporting files, into
+your agent's skills folder.
 
 ## Skills
 

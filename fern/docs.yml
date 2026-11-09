@@ -24,6 +24,9 @@ navigation:
   - page: Get started
     path: ./docs/generated/get-started.mdx
     slug: get-started
+  - page: Agent skills
+    path: ./docs/generated/skills.mdx
+    slug: skills
   - section: Train and generate
     skip-slug: true
     contents:

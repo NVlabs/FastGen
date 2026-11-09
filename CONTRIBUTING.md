@@ -102,6 +102,15 @@ and library versions. Use absolute
 installed copies still resolve; link bundled references relatively. Verify paths and
 heading anchors, and update the skill's [evaluation cases](skills/README.md#evaluation).
 
+To install or refresh local changes, run from the repository root:
+
+```bash
+npx skills@latest add ./skills/fastgen-train  # one skill
+npx skills@latest add ./skills --skill '*'   # all top-level skills
+```
+
+Select the target agent when prompted; add `--global` for a global installation.
+
 For skill changes, a maintainer requests NVSkills CI by commenting `/nvskills-ci`
 on the pull request. Before merging, confirm validation and signing succeeded and
 review the generated artifacts. Rerun after further skill-content changes.

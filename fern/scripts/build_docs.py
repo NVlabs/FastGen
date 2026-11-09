@@ -35,6 +35,7 @@ class Page(NamedTuple):
 
 PAGES = (
     Page("README.md", "get-started", "Get started", ("Setup", "Quick Start")),
+    Page("skills/README.md", "skills", "Agent skills"),
     Page("README.md", "resources", "Resources", ("Adoption, Collaboration, and Usage", "Reference")),
     Page("scripts/README.md", "inference", "Inference and evaluation"),
     Page("comfyui/README.md", "comfyui", "ComfyUI"),
