@@ -100,7 +100,7 @@ in its `references/` directory. Keep workflows reusable across models, configura
 and library versions. Use absolute
 `https://github.com/NVlabs/FastGen/blob/main/...` URLs outside the skill package so
 installed copies still resolve; link bundled references relatively. Verify paths and
-heading anchors, and update the skill's [evaluation cases](skills/README.md#evaluation).
+heading anchors, and update the skill's [evaluation cases](#evaluation).
 
 To install or refresh local changes, run from the repository root:
 
@@ -114,6 +114,34 @@ Select the target agent when prompted; add `--global` for a global installation.
 For skill changes, a maintainer requests NVSkills CI by commenting `/nvskills-ci`
 on the pull request. Before merging, confirm validation and signing succeeded and
 review the generated artifacts. Rerun after further skill-content changes.
+
+### Evaluation
+
+Each skill's `evals/` exercises FastGen code or workflows: source patches with regression
+tests, experiment configs, loader artifacts, launch commands and source-backed diagnosis.
+Fixtures identify the released source revision; deliberately broken candidates and
+authored observations are labeled. Adjacent FastGen requests test routing away from the
+target skill and do not count as positive workflow coverage.
+
+The default tasks need no weights, credentials or GPUs. They execute available artifact
+checks and require genuine FastGen imports in proposed component tests. A source-only
+trial must report those tests as unrun until executed in a complete environment; neither
+syntax checks nor evaluator scores establish model parity, trainability or quality.
+
+With [SkillEvaluator](https://docs.nvidia.com/skills/skillevaluator/installation) installed,
+check a taskset before running it (repeat for each skill):
+
+```bash
+skillevaluator tier3 validate skills/fastgen-inference --strict
+skillevaluator tier3 evaluate skills/fastgen-inference --agents codex --env-mode docker
+```
+
+The workspace config includes companion skills; the baseline omits only the target skill.
+Each case selects its own fixtures.
+These configs target CI's SkillEvaluator 1.6.7, which resolves included paths relative
+to the skill directory. Recheck that rule when upgrading the evaluator.
+Review both comparison arms and the produced artifacts. Keep generated reports outside
+the repository with `--results-dir`, and retain model-scale validation as separate evidence.
 
 ## Developer Certificate of Origin
 

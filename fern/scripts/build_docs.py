@@ -50,6 +50,7 @@ PAGES = (
     Page("fastgen/networks/kv_cache/README.md", "kv-cache", "KV cache"),
     Page("fastgen/third_party/README.md", "third-party", "Third-party components"),
     Page("licenses/README.md", "licenses", "Licenses"),
+    Page("CONTRIBUTING.md", "contributing", "Contributing"),
 )
 PAGE_ROUTES = {page.source: f"{SITE}/{page.slug}" for page in PAGES if page.source != "README.md"}
 PAGE_ROUTES["README.md"] = SITE

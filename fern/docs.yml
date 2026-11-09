@@ -87,6 +87,9 @@ navigation:
   - page: Resources
     path: ./docs/generated/resources.mdx
     slug: resources
+  - page: Contributing
+    path: ./docs/generated/contributing.mdx
+    slug: contributing
 
 check:
   rules:
