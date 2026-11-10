@@ -117,31 +117,18 @@ review the generated artifacts. Rerun after further skill-content changes.
 
 ### Evaluation
 
-Each skill's `evals/` exercises FastGen code or workflows: source patches with regression
-tests, experiment configs, loader artifacts, launch commands and source-backed diagnosis.
-Fixtures identify the released source revision; deliberately broken candidates and
-authored observations are labeled. Adjacent FastGen requests test routing away from the
-target skill and do not count as positive workflow coverage.
-
-The default tasks need no weights, credentials or GPUs. They execute available artifact
-checks and require genuine FastGen imports in proposed component tests. A source-only
-trial must report those tests as unrun until executed in a complete environment; neither
-syntax checks nor evaluator scores establish model parity, trainability or quality.
-
-With [SkillEvaluator](https://docs.nvidia.com/skills/skillevaluator/installation) installed,
-check a taskset before running it (repeat for each skill):
+Keep FastGen-specific tasks in each skill's `evals/`, covering workflows and cases where
+it should not trigger. Tie fixtures to a released source revision. Validate and run each
+taskset with [SkillEvaluator](https://docs.nvidia.com/skills/skillevaluator/installation):
 
 ```bash
 skillevaluator tier3 validate skills/fastgen-inference --strict
 skillevaluator tier3 evaluate skills/fastgen-inference --agents codex --env-mode docker
 ```
 
-The workspace config includes companion skills; the baseline omits only the target skill.
-Each case selects its own fixtures.
-These configs target CI's SkillEvaluator 1.6.7, which resolves included paths relative
-to the skill directory. Recheck that rule when upgrading the evaluator.
-Review both comparison arms and the produced artifacts. Keep generated reports outside
-the repository with `--results-dir`, and retain model-scale validation as separate evidence.
+Review results with and without the skill and inspect the generated artifacts. Report
+unrun checks and save reports outside the repository with `--results-dir`. These GPU-free
+evaluations do not replace model-scale correctness and quality tests.
 
 ## Developer Certificate of Origin
 
