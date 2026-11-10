@@ -100,11 +100,35 @@ in its `references/` directory. Keep workflows reusable across models, configura
 and library versions. Use absolute
 `https://github.com/NVlabs/FastGen/blob/main/...` URLs outside the skill package so
 installed copies still resolve; link bundled references relatively. Verify paths and
-heading anchors, and update the skill's [evaluation cases](skills/README.md#evaluation).
+heading anchors, and update the skill's [evaluation cases](#evaluation).
+
+To install or refresh local changes, run from the repository root:
+
+```bash
+npx skills@latest add ./skills/fastgen-train  # one skill
+npx skills@latest add ./skills --skill '*'   # all top-level skills
+```
+
+Select the target agent when prompted; add `--global` for a global installation.
 
 For skill changes, a maintainer requests NVSkills CI by commenting `/nvskills-ci`
 on the pull request. Before merging, confirm validation and signing succeeded and
 review the generated artifacts. Rerun after further skill-content changes.
+
+### Evaluation
+
+Keep FastGen-specific tasks in each skill's `evals/`, covering workflows and cases where
+it should not trigger. Tie fixtures to a released source revision. Validate and run each
+taskset with [SkillEvaluator](https://docs.nvidia.com/skills/skillevaluator/installation):
+
+```bash
+skillevaluator tier3 validate skills/fastgen-inference --strict
+skillevaluator tier3 evaluate skills/fastgen-inference --agents codex --env-mode docker
+```
+
+Review results with and without the skill and inspect the generated artifacts. Report
+unrun checks and save reports outside the repository with `--results-dir`. These GPU-free
+evaluations do not replace model-scale correctness and quality tests.
 
 ## Developer Certificate of Origin
 

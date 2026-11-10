@@ -158,7 +158,7 @@ components and their source READMEs are:
 | **[Callbacks](https://docs.nvidia.com/fastgen/callbacks)** | [fastgen/callbacks/README.md](fastgen/callbacks/README.md) | Training callbacks (EMA, logging, gradient clipping, etc.) |
 | **[Inference](https://docs.nvidia.com/fastgen/inference)** | [scripts/README.md](scripts/README.md) | Inference modes (T2I, I2I, T2V, I2V, V2V, etc.) and FID evaluation |
 | **[ComfyUI](https://docs.nvidia.com/fastgen/comfyui)** | [comfyui/README.md](comfyui/README.md) | ComfyUI custom nodes for interactive teacher/student inference |
-| **Skills** | [skills/README.md](skills/README.md) | Agent Skills for coding agents: setup, configuration, data, training, inference, validation, and extending FastGen |
+| **[Skills](https://docs.nvidia.com/fastgen/skills)** | [skills/README.md](skills/README.md) | Agent Skills for coding agents: setup, configuration, data, training, inference, validation, and extending FastGen |
 | **[Third Party](https://docs.nvidia.com/fastgen/third-party)** | [fastgen/third_party/README.md](fastgen/third_party/README.md) | Third-party dependencies (Depth Anything V2, etc.) |
 
 ## Supported Methods
