@@ -17,7 +17,7 @@ Pure adversarial training without score matching.
 
 **Configs:** [`WanT2V/config_ladd.py`](../../configs/experiments/WanT2V/config_ladd.py), [`EDM/config_ladd_cifar10.py`](../../configs/experiments/EDM/config_ladd_cifar10.py) (class-conditional CIFAR-10)
 
-**Reported CIFAR-10 results:** [Issue #52](https://github.com/NVlabs/FastGen/issues/52) reports one-step LADD trained with FastGen v0.2.0 (`deb93e6`), the EDM CIFAR-10 teacher and student initialization, four discriminator updates per student update, a global batch of 512 on two H100 GPUs, and R1 off. FID-50k is measured from `ema_9999`. The linked CIFAR-10 config encodes the best reported run's settings (seed 1000).
+**Reported CIFAR-10 results:** One-step LADD was trained with FastGen v0.2.0 (`deb93e6`), the EDM CIFAR-10 teacher and student initialization, four discriminator updates per student update, a global batch of 512 on two H100 GPUs, and R1 off. FID-50k is measured from `ema_9999`. The linked CIFAR-10 config encodes the best reported run's settings (seed 1000).
 
 | Discriminator Adam β1 | Discriminator input noise law | Seed | Best FID-50k (iteration) | FID-50k at 100k |
 |-----------------------|-------------------------------|------|--------------------------|-----------------|

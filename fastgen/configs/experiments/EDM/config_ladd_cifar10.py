@@ -3,8 +3,7 @@
 
 """One-step LADD on class-conditional CIFAR-10 (best FID-50k: 2.08 at 50k iterations).
 
-This encodes the seed-1000 settings reported in https://github.com/NVlabs/FastGen/issues/52.
-It builds on FastGen's LADD defaults with the EDM CIFAR-10 setup, discriminator
+This config builds on FastGen's LADD defaults with the EDM CIFAR-10 setup, discriminator
 Adam beta1 = 0, and the existing polynomial distribution for noising inputs.
 """
 
@@ -27,7 +26,7 @@ def create_config():
     )
     config.trainer.callbacks.update(EMA_CONST_CALLBACKS)
 
-    # The two changes measured against the LADD defaults in issue #52.
+    # Tune the discriminator optimizer and its input noise sampling.
     config.model.discriminator_optimizer.betas = [0.0, 0.999]
     config.model.sample_t_cfg.time_dist_type = "polynomial"
 
