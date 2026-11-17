@@ -26,8 +26,6 @@ Pure adversarial training without score matching.
 | 0.0 | Polynomial (ρ = 7) | 0 | 2.11 (55k) | 2.39 |
 | 0.0 | Polynomial (ρ = 7) | 1000 | 2.08 (50k) | 2.56 |
 
-FastGen already implements the polynomial noise law and uses it for DMD2. This LADD config selects the same law for noising the discriminator's real and fake inputs. The reported 2.08 is the 50k checkpoint of a 100k run; select that checkpoint when evaluating the best run. See the issue for checkpoint curves and a same-seed rerun.
-
 ---
 
 ## DMD2 (Distribution Matching Distillation v2)
