@@ -15,7 +15,18 @@ Pure adversarial training without score matching.
 - `student_grid_cfg`: Scheduler-owned student grid policy and default inference NFE
 - `student_generation`: `"x0"` (default) or `"step"`, as for DMD2; step generations train the GAN on the forward transition from the next grid time
 
-**Configs:** [`WanT2V/config_ladd.py`](../../configs/experiments/WanT2V/config_ladd.py)
+**Configs:** [`WanT2V/config_ladd.py`](../../configs/experiments/WanT2V/config_ladd.py), [`EDM/config_ladd_cifar10.py`](../../configs/experiments/EDM/config_ladd_cifar10.py) (class-conditional CIFAR-10)
+
+**Reported CIFAR-10 results:** [Issue #52](https://github.com/NVlabs/FastGen/issues/52) reports one-step LADD trained with FastGen v0.2.0 (`deb93e6`), the EDM CIFAR-10 teacher and student initialization, four discriminator updates per student update, a global batch of 512 on two H100 GPUs, and R1 off. FID-50k is measured from `ema_9999`. The linked CIFAR-10 config encodes the best reported run's settings (seed 1000).
+
+| Discriminator Adam β1 | Discriminator input noise law | Seed | Best FID-50k (iteration) | FID-50k at 100k |
+|-----------------------|-------------------------------|------|--------------------------|-----------------|
+| 0.9 (LADD default) | Uniform (LADD default) | Not stated | 4.55 (100k) | 4.55 |
+| 0.0 | Uniform | Not stated | 3.39 (85k) | 3.42 |
+| 0.0 | Polynomial (ρ = 7) | 0 | 2.11 (55k) | 2.39 |
+| 0.0 | Polynomial (ρ = 7) | 1000 | 2.08 (50k) | 2.56 |
+
+FastGen already implements the polynomial noise law and uses it for DMD2. This LADD config selects the same law for noising the discriminator's real and fake inputs. The reported 2.08 is the 50k checkpoint of a 100k run; select that checkpoint when evaluating the best run. See the issue for checkpoint curves and a same-seed rerun.
 
 ---
 
