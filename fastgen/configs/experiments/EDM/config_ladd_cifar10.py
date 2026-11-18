@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 leffff
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """One-step LADD on class-conditional CIFAR-10 (best FID-50k: 2.08 at 50k iterations).
