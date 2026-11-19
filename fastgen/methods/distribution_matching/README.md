@@ -15,7 +15,13 @@ Pure adversarial training without score matching.
 - `student_grid_cfg`: Scheduler-owned student grid policy and default inference NFE
 - `student_generation`: `"x0"` (default) or `"step"`, as for DMD2; step generations train the GAN on the forward transition from the next grid time
 
-**Configs:** [`WanT2V/config_ladd.py`](../../configs/experiments/WanT2V/config_ladd.py)
+**Configs:** [`WanT2V/config_ladd.py`](../../configs/experiments/WanT2V/config_ladd.py), [`EDM/config_ladd_cifar10.py`](../../configs/experiments/EDM/config_ladd_cifar10.py)
+
+**Expected results:**
+
+| Config | Dataset | Conditional | Steps | FID |
+|--------|---------|------|-------|---------------|
+| [`EDM/config_ladd_cifar10.py`](../../configs/experiments/EDM/config_ladd_cifar10.py) ([v0.2.0](https://github.com/NVlabs/FastGen/releases/tag/v0.2.0)) | CIFAR-10 | Yes | 1 | 2.08 |
 
 ---
 
