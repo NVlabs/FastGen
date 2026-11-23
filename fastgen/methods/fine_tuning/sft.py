@@ -10,8 +10,8 @@ import torch
 from fastgen.methods import FastGenModel
 from fastgen.methods.common_loss import flow_matching_loss
 from fastgen.networks.network_causal import CausalContext
-from fastgen.utils.tensor import expand_like
 from fastgen.utils import basic_utils
+from fastgen.utils.tensor import expand_like
 from fastgen.utils.tree_utils import (
     TensorOrDict,
     assert_same,
@@ -150,10 +150,11 @@ class SFTModel(FastGenModel):
     ) -> TensorOrDict:
         sample_kwargs = dict(kwargs)
         assert hasattr(net, "sample"), "net must have the sample() method"
-        with basic_utils.inference_mode(
+        with basic_utils.eval_context(
             net,
             precision_amp=self.precision_amp_infer,
             device_type=get_device(noise).type,
+            inference_mode=self.config.inference,
         ):
             x = net.sample(
                 noise,

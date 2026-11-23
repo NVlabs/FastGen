@@ -236,7 +236,7 @@ def main(args, config: BaseConfig):
                 cropping_params,
                 source_frame_indices,
             )
-        data = model.prepare_batch(data, inference_mode=True, materialize_real=False)
+        data = model.prepare_batch(data, materialize_real=False)
         # Student sampling
         if has_student_sampling:
             use_extrapolation = args.num_segments != 1 or args.overlap_frames != 0

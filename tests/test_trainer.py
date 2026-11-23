@@ -91,6 +91,7 @@ def test_validation_carry_advances_while_loading_and_preprocessing_every_step():
             return {"condition": torch.tensor([prompt_idx], dtype=torch.float32)}
 
     class ValidationModel:
+        config = SimpleNamespace(inference=False)
         device = torch.device("cpu")
         precision = torch.float32
         precision_amp_enc = None

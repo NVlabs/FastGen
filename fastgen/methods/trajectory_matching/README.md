@@ -14,6 +14,8 @@ Enforces consistency: `f(x_t, t) = f(x_r, r) = x_0` for points on the same traje
 - `sample_t_cfg`: Config of the distribution for sampling `t`
 - Requires [`CTScheduleCallback`](../../callbacks/ct_schedule.py), which controls the curriculum for the distance between `t` and `r`
 
+Tensor and multimodal dict inputs are supported; modality losses are summed.
+
 **Configs:** [`EDM/config_cm_cifar10.py`](../../configs/experiments/EDM/config_cm_cifar10.py), [`EDM/config_cm_cifar10_fast.py`](../../configs/experiments/EDM/config_cm_cifar10_fast.py), [`EDM/config_cm_in64.py`](../../configs/experiments/EDM/config_cm_in64.py), [`EDM2/config_cm_s.py`](../../configs/experiments/EDM2/config_cm_s.py), [`EDM2/config_cm_xl.py`](../../configs/experiments/EDM2/config_cm_xl.py)
 
 **Expected results:**
@@ -63,6 +65,8 @@ Two-stage training: frozen Stage-1 CM for `t < transition_t`, trainable student 
   `trainer.checkpointer.pretrained_ckpt_path`, with
   `trainer.checkpointer.pretrained_ckpt_key_map` selecting which Stage-1
   checkpoint keys initialize the teacher, student, and EMA models
+
+Tensor and multimodal dict inputs are supported; modality losses are summed.
 
 **Configs:** [`EDM/config_tcm_cifar10.py`](../../configs/experiments/EDM/config_tcm_cifar10.py), [`EDM2/config_tcm_s.py`](../../configs/experiments/EDM2/config_tcm_s.py), [`EDM2/config_tcm_xl.py`](../../configs/experiments/EDM2/config_tcm_xl.py)
 
@@ -134,6 +138,7 @@ Learns from pre-computed teacher denoising trajectories.
 **Data Requirements:**
 - Single-step: `{"real": clean, "noise": noise, "condition": cond}`
 - Multi-step: `{"real": clean, "path": [B, steps, C, H, W], "condition": cond}`, one state per base-grid interval
+- Multimodal: `real`, `noise`, and `path` may be dicts such as `{"video": ..., "audio": ...}`; all modalities share the student timestep and their losses are summed
 
 **Key Parameters:**
 - `student_grid_cfg.steps`: Number of student steps, taken from evenly spaced base-grid indices or `grid_kwargs.indices`

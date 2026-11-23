@@ -51,9 +51,9 @@ ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;10.0;12.0f+PTX"
 # Upgrade pip
 RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip setuptools wheel
 # numpy<2.0.0: required for the preinstalled numba and thinc
-# Pin the PEFT/TorchAO pair tested with diffusers 0.40 and torch 2.10.
+# Pin the PEFT/TorchAO pair tested with diffusers 0.42.1 and torch 2.10.
 RUN pip install --no-cache-dir --root-user-action=ignore wandb[media] \
-    diffusers==0.40.0 \
+    diffusers==0.42.1 \
     transformers==5.15.0 \
     peft==0.20.0 \
     torchao==0.16.0 \

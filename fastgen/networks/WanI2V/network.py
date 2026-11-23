@@ -547,7 +547,8 @@ class WanI2V(Wan):
                 None means using the original net_pred_type.
             skip_layers: Apply skip-layer guidance by skipping layers of the unconditional network during forward pass.
             unpatchify_features: If true, the features are unpatchified to [B, C', T, H, W] (C' = hidden size / patch
-                volume); otherwise they stay packed as [B, N_tokens, D].
+                volume), or kept on the token grid [B, D, T', H', W'] with ``token_grid_features``; otherwise they
+                stay packed as [B, N_tokens, D].
             apply_output_conditioning: Pin frame zero after the conversion.
             output_dtype: ``"same"`` rounds the prediction to the state dtype; ``None`` keeps it in high precision.
         Returns:

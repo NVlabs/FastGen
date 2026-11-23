@@ -1156,6 +1156,7 @@ def _pdd_model_harness(
     model.net = net
     model.config = SimpleNamespace(
         student_sample_type="ode",
+        inference=False,
         backward_simulation=None,
         guidance_cfg=guidance_cfg,
         loss_config=SimpleNamespace(

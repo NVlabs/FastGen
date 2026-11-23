@@ -185,7 +185,7 @@ def main(config: BaseConfig):
             else:
                 data = {}
 
-            data = model.prepare_batch(data, inference_mode=True, materialize_real=False)
+            data = model.prepare_batch(data, materialize_real=False)
 
             # Pick noise.
             noise = torch.randn([batch_size, *model.input_shape], **ctx)
@@ -198,8 +198,11 @@ def main(config: BaseConfig):
             )
 
             if vae is not None:
-                with basic_utils.inference_mode(
-                    vae, precision_amp=model.precision_amp_enc, device_type=model.device.type
+                with basic_utils.eval_context(
+                    vae,
+                    precision_amp=model.precision_amp_enc,
+                    device_type=model.device.type,
+                    inference_mode=True,
                 ):
                     images = vae.decode(images)
 

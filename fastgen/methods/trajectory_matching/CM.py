@@ -10,7 +10,7 @@ import torch
 from fastgen.methods import FastGenModel
 import fastgen.utils.logging_utils as logger
 from fastgen.utils.tensor import expand_like, to_high_precision
-from fastgen.utils.tree_utils import assert_same
+from fastgen.utils.tree_utils import TensorOrDict, assert_same, get_batch_size, index, per_modality, randn_like, to_dict
 from fastgen.utils.guidance import GuidanceConfig, predict_with_guidance
 
 if TYPE_CHECKING:
@@ -32,6 +32,14 @@ def t_to_r_sigmoid(t, ratio, min_r=1e-6):
     r = t - t * (1 - ratio) * (1 + 8 * torch.sigmoid(-t))
     r = torch.clamp(r, min=min_r)
     return r
+
+
+def consistency_target(D_yr: torch.Tensor, x0: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    """The prediction ``D_yr`` at ``r`` after ``torch.nan_to_num``, or the clean data ``x0`` where ``r`` is zero."""
+    r_is_noisy = expand_like(r > 0, x0)  # Expand mask to match tensor dimensions
+    if not D_yr.isfinite().all():
+        logger.warning("Predicted output contains non-finite values. Adjusting them using torch.nan_to_num.")
+    return r_is_noisy * torch.nan_to_num(D_yr) + (~r_is_noisy) * x0
 
 
 @torch.no_grad()
@@ -94,23 +102,23 @@ class CMModel(FastGenModel):
     def _compute_cm_loss(
         self,
         net: FastGenNetwork,
-        real_data: torch.Tensor,
+        real_data: TensorOrDict,
         t: torch.Tensor,
         condition: Optional[Any] = None,
         neg_condition: Optional[Any] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[TensorOrDict, TensorOrDict, TensorOrDict]:
         """
         Compute the consistency model loss
         Args:
             net (torch.nn.Module): The consistency model network
-            real_data (torch.Tensor): The real data
+            real_data (TensorOrDict): The real data, a tensor or a dict of tensors per modality
             t (torch.Tensor): The time step for student net
             condition (Any): The condition to generate
             neg_condition (Any): The negative condition to generate (default: None)
         Return:
-            cm_loss (torch.Tensor): The consistency model loss
-            loss_unweighted (torch.Tensor): The unweighted cm loss
-            D_yt (torch.Tensor): The denoised output of the student net
+            cm_loss (TensorOrDict): The per-sample consistency model loss, per modality for dict data
+            loss_unweighted (TensorOrDict): The unweighted cm loss, per modality for dict data
+            D_yt (TensorOrDict): The denoised output of the student net
         """
         # sample r from a pre-defined mapping function
         min_r = max(net.noise_scheduler.min_t, self.sample_t_cfg.min_r)
@@ -126,7 +134,7 @@ class CMModel(FastGenModel):
             t = torch.where(needs_shift, r + net.noise_scheduler.clamp_min, t)
 
         # Shared noise direction
-        eps = torch.randn_like(real_data)
+        eps = randn_like(real_data)
         y_t = net.noise_scheduler.forward_process(real_data, eps, t)
         if self.loss_config.use_cd:
             if self.teacher is None:
@@ -164,11 +172,7 @@ class CMModel(FastGenModel):
         with torch.no_grad():
             D_yr_candidate = net(y_r, r, condition=condition, fwd_pred_type="x0")
 
-        r_is_noisy = r > 0
-        r_is_noisy = expand_like(r_is_noisy, real_data)  # Expand mask to match tensor dimensions
-        if not D_yr_candidate.isfinite().all():
-            logger.warning("Predicted output contains non-finite values. Adjusting them using torch.nan_to_num.")
-        D_yr = r_is_noisy * torch.nan_to_num(D_yr_candidate) + (~r_is_noisy) * real_data
+        D_yr = per_modality(consistency_target, D_yr_candidate, real_data, r)
         assert_same(
             shape=True,
             dtype=self.precision,
@@ -178,10 +182,9 @@ class CMModel(FastGenModel):
             D_yr=D_yr,
         )
 
-        cm_loss, loss_unweighted = self._pred_to_loss(
-            noise_scheduler=net.noise_scheduler, D_yt=D_yt, D_yr=D_yr, t=t, r=r
-        )
-        return cm_loss, loss_unweighted, D_yt
+        # Each modality's loss on its own schedule; a unimodal schedule is its own ``schedules``.
+        losses = per_modality(self._pred_to_loss, net.noise_scheduler.schedules, D_yt=D_yt, D_yr=D_yr, t=t, r=r)
+        return index(losses, 0), index(losses, 1), D_yt
 
     def _pred_to_loss(
         self,
@@ -258,17 +261,17 @@ class CMModel(FastGenModel):
         neg_condition = data.get("neg_condition")
 
         t = self.net.noise_scheduler.sample_t(
-            real_data.shape[0], **self.sample_t_cfg.sample_t_kwargs(), device=self.device
+            get_batch_size(real_data), **self.sample_t_cfg.sample_t_kwargs(), device=self.device
         )
         cm_loss, loss_unweighted, D_yt = self._compute_cm_loss(
             net=self.net, real_data=real_data, t=t, condition=condition, neg_condition=neg_condition
         )
 
-        loss = cm_loss.mean()
+        cm_loss_map = to_dict(per_modality(torch.mean, cm_loss), suffix="cm_loss")
         loss_map = {
-            "total_loss": loss,
-            "cm_loss": loss,
-            "unweighted_cm_loss": loss_unweighted.mean(),
+            "total_loss": sum(cm_loss_map.values()),
+            **cm_loss_map,
+            **to_dict(per_modality(torch.mean, loss_unweighted), suffix="unweighted_cm_loss"),
         }
         outputs = self._get_outputs(D_yt, condition=condition, neg_condition=neg_condition)
 

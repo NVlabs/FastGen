@@ -63,6 +63,18 @@ FEATURE_IMPLEMENTATIONS = (
         collects_features=False,
     ),
     FeatureImplementation("ltx2", "fastgen/networks/LTX2/network.py", ("classify_forward",)),
+    FeatureImplementation(
+        "kandinsky6-core",
+        "fastgen/networks/Kandinsky6/network.py",
+        ("classify_forward",),
+        packages_features=False,
+    ),
+    FeatureImplementation(
+        "kandinsky6-wrapper",
+        "fastgen/networks/Kandinsky6/network.py",
+        ("Kandinsky6", "forward"),
+        collects_features=False,
+    ),
     FeatureImplementation("minimax-h3", "fastgen/networks/MiniMaxH3/network.py", ("classify_forward",)),
     FeatureImplementation(
         "wan-blocks",
@@ -164,6 +176,9 @@ NETWORK_CONTRACTS = (
         "Cosmos3", "fastgen.networks.cosmos3.network", "Cosmos3", frozenset(), ("cosmos3-core", "cosmos3-wrapper")
     ),
     NetworkContract("LTX2", "fastgen.networks.LTX2.network", "LTX2", SLG, ("ltx2",)),
+    NetworkContract(
+        "Kandinsky6", "fastgen.networks.Kandinsky6.network", "Kandinsky6", R, ("kandinsky6-core", "kandinsky6-wrapper")
+    ),
     NetworkContract("MiniMaxH3", "fastgen.networks.MiniMaxH3.network", "MiniMaxH3", SLG, ("minimax-h3",)),
     NetworkContract("Wan", "fastgen.networks.Wan.network", "Wan", R_SLG, ("wan-blocks", "wan")),
     NetworkContract(
@@ -450,6 +465,7 @@ def _feature_contract_stub(case: NetworkContract):
         transformer_blocks=[None] * 4,
         single_transformer_blocks=[None] * 3,
         layers=[None] * 4,
+        visual_transformer_blocks=[None] * 4,
         r_embedder=None,
     )
     # EDM indices address resolution stages, not every residual/auxiliary encoder block.
@@ -601,6 +617,7 @@ ODE_ONLY_SAMPLERS = (
     ("fastgen.networks.Flux.network", "Flux"),
     ("fastgen.networks.Flux2.network", "Flux2"),
     ("fastgen.networks.QwenImage.network", "QwenImage"),
+    ("fastgen.networks.Kandinsky6.network", "Kandinsky6"),
     ("fastgen.networks.LTX2.network", "LTX2"),
     ("fastgen.networks.MiniMaxH3.network", "MiniMaxH3"),
     ("fastgen.networks.cosmos_predict2.network", "CosmosPredict2"),

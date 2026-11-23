@@ -20,7 +20,7 @@ from fastgen.methods.common_loss import (
 )
 from fastgen.callbacks.carry import CARRY_OUTPUT_KEY, CARRY_OVERLAY_KEYS, CarryCallback
 from fastgen.callbacks.wandb import extract_prompt
-from fastgen.networks.discriminators import CompositeDiscriminator, Discriminator_VideoDiT, Discriminator_Audio2D
+from fastgen.networks.discriminators import CompositeDiscriminator, Discriminator_VideoDiT, Discriminator_AudioDiT
 from fastgen.configs.config import SampleTConfig
 from fastgen.configs.methods.config_dmd2 import ModelConfig
 from fastgen.configs.methods.config_sft import ModelConfig as SFTModelConfig
@@ -1848,7 +1848,7 @@ def _build_multimodal_model_data(precision_model=None):
                 disc_type="dit_simple_conv3d",
                 inner_dim=128,
             ),
-            "audio": L(Discriminator_Audio2D)(
+            "audio": L(Discriminator_AudioDiT)(
                 inner_dim=128,
                 hidden_channels=64,
             ),

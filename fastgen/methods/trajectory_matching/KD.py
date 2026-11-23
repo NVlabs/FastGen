@@ -11,6 +11,7 @@ from fastgen.methods.causal_sampling import CausalStudentSamplingMixin
 from fastgen.methods.common_loss import mse_loss
 from fastgen.networks.network_causal import CausalContext
 from fastgen.utils.tensor import expand_like
+from fastgen.utils.tree_utils import TensorOrDict, get_batch_size, per_modality, to_dict
 
 
 class KDModel(FastGenModel):
@@ -42,7 +43,7 @@ class KDModel(FastGenModel):
 
     def single_train_step(
         self, data: Dict[str, Any], iteration: int
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor | Callable]]:
+    ) -> tuple[dict[str, torch.Tensor], dict[str, TensorOrDict | Callable]]:
         """
         Single training step for knowledge distillation model.
 
@@ -50,19 +51,23 @@ class KDModel(FastGenModel):
         `path` timesteps. The path contains one non-clean state per base-grid interval, while `real`
         contains the clean endpoint. Please check `path_timesteps` in the paired dataset's index.json.
 
+        `real`, `noise` and `path` are tensors, or per-modality dicts such as
+        ``{"video": [B, S, ...], "audio": [B, S, ...]}`` for a path. All modalities share the
+        student timestep, and their losses are reported as ``<modality>_recon_loss``.
+
         Args:
             data (Dict[str, Any]): Data dict for the current iteration.
             iteration (int): Current training iteration
 
         Returns:
             loss_map (dict[str, torch.Tensor]): Dictionary containing the loss values
-            outputs (dict[str, torch.Tensor]): Dictionary containing the network output
+            outputs (dict[str, TensorOrDict | Callable]): Dictionary containing the network output
 
         """
         denoised_data = data["real"]
         condition = data.get("condition")
         neg_condition = data.get("neg_condition")
-        batch_size = denoised_data.shape[0]
+        batch_size = get_batch_size(denoised_data)
 
         noise_scheduler = self.net.noise_scheduler
         student_steps = noise_scheduler.default_student_steps
@@ -72,13 +77,18 @@ class KDModel(FastGenModel):
             required = "Noise or path" if student_steps == 1 else "Path"
             raise ValueError(f"{required} must be provided for KDModel")
 
-        base_indices = None if use_noise else self._kd_path_indices(denoise_path.shape[1], student_steps)
+        # Every modality's path must hold one state per interval of the shared base grid.
+        base_indices = (
+            None
+            if use_noise
+            else per_modality(lambda path: self._kd_path_indices(path.shape[1], student_steps), denoise_path)
+        )
         if student_steps == 1:
             t_student = noise_scheduler.student_grid(device=self.device)[0].expand(batch_size)
             if use_noise:
                 input_student = noise_scheduler.latents(noise=data["noise"], t_init=t_student)
             else:
-                input_student = denoise_path[:, base_indices[0], ...]
+                input_student = per_modality(lambda path, indices: path[:, indices[0], ...], denoise_path, base_indices)
         else:
             t_student, student_step_indices = noise_scheduler.sample_student_timesteps(
                 batch_size,
@@ -86,11 +96,14 @@ class KDModel(FastGenModel):
                 return_indices=True,
                 device=self.device,
             )
-            path_indices = base_indices[student_step_indices]
-            path_indices = expand_like(path_indices, denoise_path).expand(
-                -1, -1, *denoise_path.shape[2:]
-            )  # [batch_size, 1, ...]
-            input_student = torch.gather(denoise_path, 1, path_indices).squeeze(1)
+
+            def gather_path_state(path: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+                path_indices = expand_like(indices[student_step_indices], path).expand(
+                    -1, -1, *path.shape[2:]
+                )  # [batch_size, 1, ...]
+                return torch.gather(path, 1, path_indices).squeeze(1)
+
+            input_student = per_modality(gather_path_state, denoise_path, base_indices)
 
         gen_data = self.net(
             input_student,
@@ -99,14 +112,12 @@ class KDModel(FastGenModel):
             fwd_pred_type="x0",
         )
 
-        # Compute the l2 loss between the generated data and the denoised data
-        loss = 0.5 * mse_loss(gen_data, denoised_data)
+        # Compute the l2 loss between the generated data and the denoised data per modality
+        loss = per_modality(lambda gen, real: 0.5 * mse_loss(gen, real), gen_data, denoised_data)
 
         # Build output dictionaries
-        loss_map = {
-            "total_loss": loss,
-            "recon_loss": loss,
-        }
+        loss_map = to_dict(loss, suffix="recon_loss")
+        loss_map["total_loss"] = sum(loss_map.values())
         outputs = self._get_outputs(gen_data, condition=condition, neg_condition=neg_condition)
 
         # Compute rewards

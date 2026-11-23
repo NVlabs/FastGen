@@ -6,6 +6,7 @@
 The PDD arithmetic assertions use ``torch.equal`` where operation order is part of the supported behavior.
 MiniMax-H3 additionally exercises the PDD core with raw projections that are
 already native sigma-velocity heads and therefore bypass output conversion.
+Kandinsky 6 runs the wrapper end to end on a tiny real transformer.
 """
 
 import copy
@@ -1280,6 +1281,7 @@ def test_rf_pdd_sampler_uses_summed_block_weight(multimodal):
     model.config = SimpleNamespace(
         guidance_cfg=None,
         student_sample_type="ode",
+        inference=False,
         loss_config=SimpleNamespace(block_size_max=net.pdd_steps),
     )
     model.precision = torch.float32
@@ -2795,6 +2797,142 @@ def test_h3_pdd_rejects_non_flow_prediction_types():
         _H3LikePDD(pdd_steps=4, student_grid_cfg=_native_grid(4), net_pred_type="x0")
 
 
+_K6_PDD_STEPS = 8
+
+
+def _tiny_kandinsky6_pdd(tmp_path, audio, image):
+    """A tiny ``Kandinsky6PDD`` and the ``Kandinsky6`` teacher whose checkpoint it widens."""
+    from fastgen.networks.Kandinsky6.network_pdd import Kandinsky6PDD
+    from tests.test_network import _tiny_kandinsky6_network
+
+    teacher = _tiny_kandinsky6_network(tmp_path, audio=audio, image=image)
+    net = Kandinsky6PDD(
+        model_id_or_local_path=str(tmp_path),
+        modalities=teacher.modalities,
+        image_conditioned=image,
+        gradient_checkpointing=False,
+        student_grid_cfg=_native_grid(_K6_PDD_STEPS, steps=4, shift=5.0),
+        pdd_steps=_K6_PDD_STEPS,
+    )
+    net.prepare_module("cpu", precision_model=torch.float32, precision_opt=torch.float32, trainable=True)
+    return net, teacher
+
+
+@pytest.mark.parametrize("image", [False, True], ids=["t2v", "i2v"])
+@pytest.mark.parametrize("audio", [True, False], ids=["joint", "video-only"])
+def test_kandinsky6_pdd_widens_enabled_heads_to_reproduce_the_teacher(tmp_path, audio, image):
+    from fastgen.networks.Kandinsky6.network import Kandinsky6
+    from tests.test_network import _kandinsky6_inputs
+
+    net, teacher = _tiny_kandinsky6_pdd(tmp_path, audio, image)
+    teacher_heads = {
+        "video": teacher.transformer.out_layer.out_layer,
+        "audio": teacher.transformer.audio_out_layer.out_layer,
+    }
+
+    # Only enabled modalities widen; the unwarped RF teacher projections are repeated without a fold.
+    assert isinstance(net, Kandinsky6)
+    assert set(net.pdd_linear) == ({"video", "audio"} if audio else {"video"})
+    if not audio:
+        assert type(net.transformer.audio_out_layer.out_layer) is torch.nn.Linear
+    for key, linear in net.pdd_linear.items():
+        assert type(linear) is PDDLinear and linear.channel_layout == "channel_major"
+        assert linear._teacher_scale is None
+        assert torch.equal(linear.weight, teacher_heads[key].weight.repeat(_K6_PDD_STEPS, 1))
+        assert torch.equal(linear.bias, teacher_heads[key].bias.repeat(_K6_PDD_STEPS))
+
+    # Every initial head, and so every fused block, is the teacher's flow at the start node.
+    state, condition = _kandinsky6_inputs(audio=audio, image=image, batch_size=2)
+    base_grid = net.pdd_base_grid()
+
+    def assert_heads(heads, flow):
+        assert heads.shape == (2, _K6_PDD_STEPS, *flow.shape[1:])
+        torch.testing.assert_close(heads, flow[:, None].expand_as(heads))
+
+    with torch.no_grad():
+        for step_index in (0, torch.tensor([3, 6])):
+            flow = teacher(state, base_grid[step_index].expand(2), condition)
+            per_modality(assert_heads, net(state, step_index=step_index, condition=condition), flow)
+            fused = net(state, step_index=step_index, condition=condition, fused=True, next_step_index=step_index + 2)
+            per_modality(torch.testing.assert_close, fused, flow)
+
+
+@pytest.mark.parametrize("audio", [True, False], ids=["joint", "video-only"])
+def test_kandinsky6_pdd_head_rows_unpack_to_whole_prediction_heads(tmp_path, audio):
+    from tests.test_network import _kandinsky6_inputs
+
+    net, _ = _tiny_kandinsky6_pdd(tmp_path, audio, image=False)
+    state, condition = _kandinsky6_inputs(audio=audio, batch_size=2)
+    head = 5
+    with torch.no_grad():
+        before = net(state, step_index=head, condition=condition)
+        for linear in net.pdd_linear.values():
+            rows = linear.out_features // _K6_PDD_STEPS
+            linear.weight[head * rows : (head + 1) * rows] *= 2
+            linear.bias[head * rows : (head + 1) * rows] *= 2
+        after = net(state, step_index=head, condition=condition)
+        fused = net(state, step_index=head, condition=condition, fused=True, next_step_index=head + 1)
+
+    # A channel-major head's rows cover every video patch position and audio token of exactly that head,
+    # and fusing its single interval selects the same rows.
+    def assert_only_head_doubled(old, new, block):
+        others = [index for index in range(_K6_PDD_STEPS) if index != head]
+        assert torch.equal(new[:, others], old[:, others])
+        assert torch.equal(new[:, head], 2 * old[:, head])
+        torch.testing.assert_close(block, new[:, head])
+
+    per_modality(assert_only_head_doubled, before, after, fused)
+
+
+@pytest.mark.parametrize("image", [False, True], ids=["t2v", "i2v"])
+@pytest.mark.parametrize("audio", [True, False], ids=["joint", "video-only"])
+def test_kandinsky6_pdd_training_step_updates_every_widened_head(tmp_path, audio, image):
+    from tests.test_network import _kandinsky6_inputs
+
+    net, teacher = _tiny_kandinsky6_pdd(tmp_path, audio, image)
+    state, condition = _kandinsky6_inputs(audio=audio, image=image, batch_size=2)
+    model = object.__new__(PDDModel)
+    torch.nn.Module.__init__(model)
+    model.config = PDDModelConfig()
+    model.config.loss_config.block_size_min = 2
+    model.config.loss_config.block_size_max = 4
+    model.config.guidance_cfg = teacher.default_guidance_cfg()
+    model.net, model.teacher = net, teacher
+    model.device = torch.device("cpu")
+    model.precision = model.precision_decoding = torch.float32
+    model.precision_amp_infer = None
+    model.use_ema = []
+    text = condition["text"] if image else condition
+    negative_text = (torch.zeros_like(text[0]), torch.zeros_like(text[1]), text[2])
+    data = {
+        "idx": [0, 1],
+        "real": per_modality(torch.Tensor.detach, state),
+        "condition": condition,
+        "neg_condition": {**condition, "text": negative_text} if image else negative_text,
+    }
+
+    loss_map, outputs = model.single_train_step(data, iteration=1)
+
+    names = ["video_pdd_loss", "audio_pdd_loss"] if audio else ["pdd_loss"]
+    assert set(loss_map) == {*names, "total_loss"}
+    assert all(torch.isfinite(loss_map[name]) and loss_map[name] > 0 for name in names)
+    torch.testing.assert_close(loss_map["total_loss"], sum(loss_map[name] for name in names))
+    loss_map["total_loss"].backward()
+    for linear in net.pdd_linear.values():
+        for parameter in (linear.weight, linear.bias):
+            assert parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            assert parameter.grad.abs().sum() > 0
+    # The teacher stays trainable, so no gradient reaching it proves its targets are built without autograd.
+    assert all(parameter.requires_grad and parameter.grad is None for parameter in teacher.parameters())
+
+    # Fused few-step student sampling returns finite states of the real data's structure.
+    def assert_sample(sample, real):
+        assert sample.shape == real.shape and torch.isfinite(sample).all()
+
+    with torch.no_grad():
+        per_modality(assert_sample, outputs["gen_rand"](), data["real"])
+
+
 def test_make_pdd_sets_an_explicit_defining_module():
     wrapped = make_pdd(
         _ToyPredictionBase,
@@ -3309,6 +3447,7 @@ def test_pdd_generator_uses_instance_precision(monkeypatch):
     model.config = SimpleNamespace(
         guidance_cfg=None,
         student_sample_type="ode",
+        inference=False,
         loss_config=SimpleNamespace(block_size_max=net.pdd_steps),
     )
     model.precision = torch.bfloat16
@@ -3402,6 +3541,7 @@ def test_one_step_generation_matches_integer_fused_mean_sigma_velocity_advance()
     model.config = SimpleNamespace(
         guidance_cfg=None,
         student_sample_type="ode",
+        inference=False,
         loss_config=SimpleNamespace(block_size_max=net.pdd_steps),
     )
     model.precision = torch.float32

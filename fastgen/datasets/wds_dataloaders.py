@@ -107,6 +107,7 @@ def transform_video(
 #       ``json.dumps`` exactly like the model-card examples).
 #   - "neg_prompt_ltx2": Full negative prompt from the LTX-2 pipeline defaults.
 #   - "neg_prompt_ltx2_short": Short negative prompt from LTX-2 training configs.
+#   - "neg_prompt_kandinsky6": Negative prompt from the Kandinsky 6 Pro pipeline.
 #   - "empty_string": Empty string, useful for unconditional generation or
 #       as a default fallback for missing text conditions.
 
@@ -125,6 +126,7 @@ PRESET_CONSTANTS: Dict[str, str] = {
     "neg_prompt_cosmos3": _load_negative_prompt("negative_prompt_cosmos3.txt"),
     "neg_prompt_ltx2": _load_negative_prompt("negative_prompt_ltx.txt"),
     "neg_prompt_ltx2_short": _load_negative_prompt("negative_prompt_ltx_short.txt"),
+    "neg_prompt_kandinsky6": _load_negative_prompt("negative_prompt_kandinsky6.txt"),
     "empty_string": "",
 }
 

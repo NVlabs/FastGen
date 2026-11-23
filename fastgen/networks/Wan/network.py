@@ -858,6 +858,7 @@ class Wan(LoRAMixin, FastGenNetwork):
         keep_enc_original_prec: bool = True,
         keep_original_prec: bool = True,
         fp32_residual: bool = True,
+        token_grid_features: bool = False,
         **schedule_kwargs,
     ):
         """Wan2.1/2.2 model constructor.
@@ -910,6 +911,11 @@ class Wan(LoRAMixin, FastGenNetwork):
                 Wan. When disabled, every block rounds its output to the model dtype, which removes the FP32
                 checkpoint-boundary activations (about 2 bytes per token per hidden unit per block; 11 GiB
                 per GPU for the 14B 480p recipe). Defaults to True.
+            token_grid_features (bool, optional): Return discriminator features on the token grid with all
+                hidden channels, ``[B, D, T/p_t, H/p_h, W/p_w]``, instead of splitting each token's channels into
+                its patch positions, ``[B, D/(p_t*p_h*p_w), T, H, W]``. A token's channels hold no patch layout;
+                the split is kept as the default for the released discriminator configs, whose ``inner_dim``
+                is ``D // 4``. Defaults to False.
             **schedule_kwargs: Noise-schedule keyword arguments, forwarded to the FastGenNetwork constructor.
         """
         self.transformer_subfolder = transformer_subfolder
@@ -925,6 +931,7 @@ class Wan(LoRAMixin, FastGenNetwork):
             torch.backends.cuda.enable_math_sdp(True)
 
         self._use_fsdp_checkpoint = use_fsdp_checkpoint
+        self.token_grid_features = token_grid_features
 
         inner_dim = self._initialize_network(model_id_or_local_path, load_pretrained)
         self.model_id_or_local_path = model_id_or_local_path
@@ -1294,11 +1301,15 @@ class Wan(LoRAMixin, FastGenNetwork):
         )
 
     def _unpatchify_features(self, x_t: torch.Tensor, features: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Unpack token features ``[B, N, D]`` for the discriminator; see ``token_grid_features``."""
         B, _, T, H, W = x_t.shape
         p_t, p_h, p_w = self.transformer.config.patch_size
         post_patch_num_frames = T // p_t
         post_patch_height = H // p_h
         post_patch_width = W // p_w
+        if self.token_grid_features:
+            grid = (post_patch_num_frames, post_patch_height, post_patch_width)
+            return [feat.reshape(B, *grid, feat.shape[-1]).permute(0, 4, 1, 2, 3) for feat in features]
         feats = []
         for feat in features:
             feat = feat.reshape(
@@ -1453,7 +1464,8 @@ class Wan(LoRAMixin, FastGenNetwork):
                 None means using the original net_pred_type.
             skip_layers: Apply skip-layer guidance by skipping layers of the unconditional network during forward pass.
             unpatchify_features: If true, the features are unpatchified to [B, C', T, H, W] (C' = hidden size / patch
-                volume); otherwise they stay packed as [B, N_tokens, D].
+                volume), or kept on the token grid [B, D, T', H', W'] with ``token_grid_features``; otherwise they
+                stay packed as [B, N_tokens, D].
             apply_output_conditioning: Apply the output constraint after the conversion.
             output_dtype: ``"same"`` rounds the prediction to the state dtype; ``None`` keeps it in high precision.
         Returns:

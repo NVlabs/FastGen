@@ -409,6 +409,10 @@ def test_anyflow_configs_sample_on_a_native_shifted_student_grid(module_name):
         ("fastgen/configs/experiments/Flux2/config_dmd2_image_edit_klein_base_9b.py", 9.9),
         ("fastgen/configs/experiments/Flux2/config_dmd2_klein_base_4b.py", 9.9),
         ("fastgen/configs/experiments/Flux2/config_dmd2_klein_base_9b.py", 9.9),
+        ("fastgen/configs/experiments/Kandinsky6/config_dmd2_i2va.py", 5.0),
+        ("fastgen/configs/experiments/Kandinsky6/config_dmd2_i2va_lite.py", 5.0),
+        ("fastgen/configs/experiments/Kandinsky6/config_dmd2_t2va.py", 5.0),
+        ("fastgen/configs/experiments/Kandinsky6/config_dmd2_t2va_lite.py", 5.0),
         ("fastgen/configs/experiments/LTX2/config_dmd2.py", 5),
         ("fastgen/configs/experiments/LTX2/config_dmd2_ltx23.py", 5),
         ("fastgen/configs/experiments/MiniMaxH3/config_dmd2.py", 12),
@@ -453,6 +457,33 @@ def test_cosmos3_dmd2_uses_the_reference_student_grid_and_bounded_loss_times():
     assert (config.model.sample_t_cfg.min_t, config.model.sample_t_cfg.max_t) == (0.001, 0.999)
     schedule = get_noise_schedule("rf", student_grid_cfg=config.model.student_grid_cfg, **schedule_kwargs)
     assert schedule.student_grid().tolist() == pytest.approx([1.0, 15 / 16, 5 / 6, 5 / 8, 0.0])
+
+
+@pytest.mark.parametrize("recipe", ["sft_t2va", "sft_i2va", "dmd2_t2va", "dmd2_i2va"])
+def test_kandinsky6_lite_recipes_mirror_pro_on_the_lite_checkpoint(recipe):
+    """Lite shares Pro's native canvas and sampler, so only the checkpoint and the GAN head widths differ."""
+    pro = build_config(f"fastgen/configs/experiments/Kandinsky6/config_{recipe}.py")
+    lite = build_config(f"fastgen/configs/experiments/Kandinsky6/config_{recipe}_lite.py")
+
+    assert lite.model.net.model_id_or_local_path == "kandinskylab/Kandinsky-6.0-Lite-5s-Diffusers"
+    assert lite.model.net.revision not in (None, pro.model.net.revision)
+    for field in ("_target_", "modalities", "image_conditioned", "fps", "scheduler_scale"):
+        assert lite.model.net[field] == pro.model.net[field], field
+    for field in ("input_shape", "guidance_cfg", "sample_t_cfg", "student_grid_cfg", "student_sample_type"):
+        assert getattr(lite.model, field) == getattr(pro.model, field), field
+    assert lite.dataloader_train == pro.dataloader_train
+    assert lite.log_config.group != pro.log_config.group
+
+    if getattr(pro.model, "discriminator", None) is None:
+        assert getattr(lite.model, "discriminator", None) is None
+        return
+    heads = lite.model.discriminator.modality_discs
+    # The released Lite transformer: 1792-wide video and 896-wide audio tokens in 32 fused blocks.
+    assert (heads.video.inner_dim, heads.audio.inner_dim) == (1792, 896)
+    assert heads.video.num_blocks == heads.audio.num_blocks == 32
+    assert heads.video.disc_type == pro.model.discriminator.modality_discs.video.disc_type
+    assert list(lite.model.discriminator.feature_indices) == [16, 24, 31]
+    assert all(list(head.feature_indices) == [16, 24, 31] for head in heads.values())
 
 
 def test_cosmos3_sft_uses_native_state_precision_and_bf16_compute():
@@ -1168,6 +1199,7 @@ def test_ema_weights_are_not_stored_in_16_bit(config_file):
 NEGATIVE_PROMPT_PRESETS = {
     "Cosmos3": "neg_prompt_cosmos3",
     "CosmosPredict2": "neg_prompt_cosmos",
+    "Kandinsky6": "neg_prompt_kandinsky6",
     "LTX2": "neg_prompt_ltx2",
     "LTX2I2V": "neg_prompt_ltx2",
     "WanI2V": "neg_prompt_wan",

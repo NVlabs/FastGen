@@ -7,6 +7,8 @@ import torch
 
 from fastgen.configs.config_utils import override_config_with_opts
 from fastgen.configs.discriminator import (
+    Discriminator_CogVideoX2B_Config,
+    Discriminator_CogVideoX5B_Config,
     Discriminator_EDM_CIFAR10_Config,
     Discriminator_EDM_ImageNet64_Config,
     Discriminator_SD15_Res512_Config,
@@ -16,7 +18,7 @@ from fastgen.networks import discriminators as disc_mod
 from fastgen.networks.discriminators import (
     CompositeDiscriminator,
     Discriminator,
-    Discriminator_Audio2D,
+    Discriminator_AudioDiT,
     Discriminator_EDM,
     Discriminator_ImageDiT,
     Discriminator_SD15,
@@ -127,11 +129,55 @@ def test_video_dit_default_is_middle_block(captured_warnings):
     assert captured_warnings == []
 
 
-def test_audio2d_default_is_middle_block(captured_warnings):
-    d = Discriminator_Audio2D(feature_indices=None, inner_dim=8, hidden_channels=16, num_blocks=48)
+def test_video_dit_hidden_channels_size_the_simple_head():
+    def build(**kwargs):
+        return Discriminator_VideoDiT(feature_indices={0}, num_blocks=1, inner_dim=16, **kwargs)
+
+    assert build(disc_type="dit_simple_conv3d").cls_pred_heads[0][0].out_channels == 8  # inner_dim // 2
+    narrow = build(disc_type="dit_simple_conv3d", hidden_channels=4)
+    assert narrow.cls_pred_heads[0][0].out_channels == 4
+    assert narrow([torch.randn(2, 16, 4, 8, 8)]).shape == (2, 1)
+    with pytest.raises(ValueError, match="hidden_channels sizes only the dit_simple_conv3d head"):
+        build(disc_type="multiscale_down_mlp_efficient", hidden_channels=4)
+
+
+@pytest.mark.parametrize(
+    ("config", "inner_dim", "hidden_channels"),
+    [(Discriminator_CogVideoX2B_Config, 1920, 240), (Discriminator_CogVideoX5B_Config, 3072, 384)],
+)
+def test_cogvideox_discriminators_read_the_token_grid_at_the_former_head_width(config, inner_dim, hidden_channels):
+    with torch.device("meta"):
+        discriminator = instantiate(config)
+    first = discriminator.cls_pred_heads[0][0]
+    # All token channels in, the former patch-split head's hidden width out.
+    assert (first.in_channels, first.out_channels) == (inner_dim, hidden_channels)
+
+
+def test_audio_dit_default_is_middle_block(captured_warnings):
+    d = Discriminator_AudioDiT(feature_indices=None, inner_dim=8, hidden_channels=16, num_blocks=48)
     assert d.feature_indices == {24}
     assert len(d.heads) == 1
     assert captured_warnings == []
+
+
+def test_audio_dit_convolves_time_and_averages_sequences():
+    torch.manual_seed(0)
+    discriminator = Discriminator_AudioDiT(feature_indices={0, 1}, inner_dim=4, hidden_channels=4, num_blocks=2)
+    discriminator = discriminator.double()
+    discriminator._record_precision(precision_model=torch.float64)
+    rows = torch.randn(2, 4, 3, 10, dtype=torch.float64)  # [B, C, rows, L], e.g. MiniMax-H3's stereo rows
+
+    logits = discriminator([rows, rows[:, :, 0]])
+
+    assert logits.shape == (2, 2)
+    # Rows between the channels and time are separate sequences; their logits are averaged per sample.
+    per_row = torch.stack([discriminator([rows[:, :, row], rows[:, :, row]])[:, 0] for row in range(3)], dim=1)
+    torch.testing.assert_close(logits[:, 0], per_row.mean(dim=1))
+    torch.testing.assert_close(logits[:, 1], discriminator([rows[:, :, 0], rows[:, :, 0]])[:, 1])
+    convolutions = [layer for layer in discriminator.heads[0] if isinstance(layer, (torch.nn.Conv1d, torch.nn.Conv2d))]
+    assert len(convolutions) == 3 and all(isinstance(layer, torch.nn.Conv1d) for layer in convolutions)
+    with pytest.raises(ValueError, match=r"\[B, C, \.\.\., L\]"):
+        discriminator([torch.randn(2, 4, dtype=torch.float64), rows])
 
 
 def test_subclass_filters_and_warns_via_helper(captured_warnings):
@@ -352,7 +398,7 @@ def _tiny_video_cfg(feature_indices=None):
 
 
 def _tiny_audio_cfg(feature_indices=None):
-    return L(Discriminator_Audio2D)(
+    return L(Discriminator_AudioDiT)(
         num_blocks=2,
         inner_dim=8,
         hidden_channels=16,
@@ -421,10 +467,10 @@ def test_composite_override_warns_and_propagates(captured_warnings):
 
 
 def test_discriminator_casts_features_to_model_dtype_and_returns_native_logits():
-    discriminator = Discriminator_Audio2D(feature_indices={0}, inner_dim=2, hidden_channels=4, num_blocks=1).double()
+    discriminator = Discriminator_AudioDiT(feature_indices={0}, inner_dim=2, hidden_channels=4, num_blocks=1).double()
     discriminator._record_precision(precision_model=torch.float64)
 
-    features = torch.randn(2, 2, 16, 8, dtype=torch.float32, requires_grad=True)
+    features = torch.randn(2, 2, 16, dtype=torch.float32, requires_grad=True)
     logits = discriminator([features])
 
     assert logits.dtype == torch.float64
@@ -434,11 +480,11 @@ def test_discriminator_casts_features_to_model_dtype_and_returns_native_logits()
 
 
 def test_discriminator_returns_native_autocast_logits():
-    discriminator = Discriminator_Audio2D(feature_indices={0}, inner_dim=2, hidden_channels=4, num_blocks=1)
+    discriminator = Discriminator_AudioDiT(feature_indices={0}, inner_dim=2, hidden_channels=4, num_blocks=1)
     discriminator._record_precision(precision_model=torch.float32)
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        logits = discriminator([torch.randn(2, 2, 16, 8)])
+        logits = discriminator([torch.randn(2, 2, 16)])
 
     assert logits.dtype == torch.bfloat16
 
@@ -454,8 +500,8 @@ def test_every_discriminator_returns_native_logits_and_preserves_input_gradients
             (2, 4, 2, 8, 8),
         ),
         (
-            Discriminator_Audio2D(feature_indices={0}, num_blocks=1, inner_dim=4, hidden_channels=4),
-            (2, 4, 16, 8),
+            Discriminator_AudioDiT(feature_indices={0}, num_blocks=1, inner_dim=4, hidden_channels=4),
+            (2, 4, 16),
         ),
     ]
 
@@ -475,7 +521,7 @@ def test_composite_discriminator_returns_native_logits_and_preserves_nested_grad
     discriminator = CompositeDiscriminator(
         modality_discs={
             "image": L(Discriminator_ImageDiT)(feature_indices={0}, num_blocks=1, inner_dim=4),
-            "audio": L(Discriminator_Audio2D)(feature_indices={0}, inner_dim=4, hidden_channels=4, num_blocks=1),
+            "audio": L(Discriminator_AudioDiT)(feature_indices={0}, inner_dim=4, hidden_channels=4, num_blocks=1),
         }
     ).double()
     for module in discriminator.modules():
@@ -483,7 +529,7 @@ def test_composite_discriminator_returns_native_logits_and_preserves_nested_grad
             module._record_precision(precision_model=torch.float64)
 
     image = torch.randn(2, 4, 8, 8, dtype=torch.float32, requires_grad=True)
-    audio = torch.randn(2, 4, 16, 8, dtype=torch.float32, requires_grad=True)
+    audio = torch.randn(2, 4, 16, dtype=torch.float32, requires_grad=True)
     logits = discriminator([{"image": image, "audio": audio}])
 
     assert logits.shape == (2, 2) and logits.dtype == torch.float64

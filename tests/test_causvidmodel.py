@@ -4,6 +4,7 @@
 import copy
 import gc
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -398,6 +399,7 @@ def test_causvid_extrapolation_uses_shared_chunk_primitives():
 
     model = object.__new__(RecordingCausVid)
     torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(inference=False)
     model.precision_amp_infer = None
     model.denoise_calls = []
     model.store_calls = []
@@ -476,6 +478,7 @@ def test_causvid_extrapolation_segments_use_the_training_chunk_layout():
 
     model = object.__new__(RecordingCausVid)
     torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(inference=False)
     model.net = _preprocessor_host(IdentityVAE())
     model.use_ema = []
     model.precision_amp_infer = None
@@ -550,6 +553,7 @@ def test_causvid_extrapolation_uses_vae_from_preprocessor_host_and_encoder_amp(m
     preprocessor_host = _preprocessor_host(vae)
     model = object.__new__(RecordingCausVid)
     torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(inference=True)
     model.net = preprocessor_host
     model.use_ema = []
     model.precision_amp_infer = torch.float16
@@ -558,13 +562,13 @@ def test_causvid_extrapolation_uses_vae_from_preprocessor_host_and_encoder_amp(m
     inference_contexts = []
 
     @contextmanager
-    def record_inference_mode(*modules, precision_amp, device_type):
-        inference_contexts.append((modules, precision_amp, device_type))
+    def record_eval_context(*modules, precision_amp, device_type, inference_mode=False):
+        inference_contexts.append((modules, precision_amp, device_type, inference_mode))
         yield
 
     monkeypatch.setattr(
-        "fastgen.methods.distribution_matching.causvid.basic_utils.inference_mode",
-        record_inference_mode,
+        "fastgen.methods.distribution_matching.causvid.basic_utils.eval_context",
+        record_eval_context,
     )
 
     sampled_net = SampledNet()
@@ -579,8 +583,8 @@ def test_causvid_extrapolation_uses_vae_from_preprocessor_host_and_encoder_amp(m
     assert vae.decode_calls == 1
     assert vae.encode_calls == 1
     assert inference_contexts == [
-        ((sampled_net,), model.precision_amp_infer, "cpu"),
-        ((vae,), model.precision_amp_enc, "cpu"),
+        ((sampled_net,), model.precision_amp_infer, "cpu", True),
+        ((vae,), model.precision_amp_enc, "cpu", True),
     ]
 
 
@@ -642,6 +646,7 @@ def test_causvid_extrapolation_bridges_the_overlap_at_the_vae_temporal_compressi
     vae = TemporalVAE()
     model = object.__new__(RecordingCausVid)
     torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(inference=False)
     model.net = _preprocessor_host(vae)
     model.use_ema = []
     model.precision_amp_infer = None

@@ -267,3 +267,38 @@ def test_save_audio_video_owns_x264_option_resolution(monkeypatch, tmp_path):
         "preset": "veryslow",
         "tune": "film",
     }
+
+
+def test_save_media_decodes_vae_in_no_grad_eval_context(monkeypatch, tmp_path):
+    observed = {}
+
+    class _FakeVAE(torch.nn.Module):
+        def decode(self, latents):
+            observed.update(
+                training=self.training,
+                grad_enabled=torch.is_grad_enabled(),
+                inference_mode=torch.is_inference_mode_enabled(),
+                autocast_enabled=torch.is_autocast_enabled("cpu"),
+                is_inference=latents.clone().is_inference(),
+            )
+            return torch.zeros(1, 3, 4, 4)
+
+    vae = _FakeVAE()
+    vae.train()
+    monkeypatch.setattr(media_utils, "save_image", lambda *_args, **_kwargs: None)
+
+    media_utils.save_media(
+        torch.zeros(1, 4, 2, 2, requires_grad=True),
+        str(tmp_path / "decoded.png"),
+        vae=vae,
+        precision_amp=torch.bfloat16,
+    )
+
+    assert vae.training
+    assert observed == {
+        "training": False,
+        "grad_enabled": False,
+        "inference_mode": False,
+        "autocast_enabled": True,
+        "is_inference": False,
+    }

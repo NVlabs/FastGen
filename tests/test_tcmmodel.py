@@ -12,6 +12,9 @@ from fastgen.configs.config_utils import override_config_with_opts
 from fastgen.methods import TCMModel
 import fastgen.methods.trajectory_matching.TCM as TCM_module
 from fastgen.methods.trajectory_matching.TCM import TCMPrecond
+from fastgen.utils.tensor import expand_like
+from fastgen.utils.tree_utils import per_modality, randn_like
+from tests.test_cmmodel import _assert_trains_both_heads, _joint_kandinsky6_config, _joint_kandinsky6_data
 from tests.utils import RunIf, check_grad_zero, run_distributed_test
 from fastgen.configs.instantiate import instantiate
 
@@ -34,17 +37,14 @@ class MockNetwork(torch.nn.Module):
         self.linear = torch.nn.Linear(1, 1)
 
     def forward(self, x_t, t, condition=None, fwd_pred_type="x0", **kwargs):
-        # Return tensor with same shape as input but with modified values
+        # Return a tensor (or a dict of them) with the shape of the input but with modified values
         # to distinguish between teacher and student outputs
         if self.training:
             # simulate randomness, e.g., from dropout layers
-            scale = torch.randn_like(x_t)
-            x_t = x_t * scale
+            x_t = per_modality(torch.mul, x_t, randn_like(x_t))
 
-        if hasattr(self, "_is_teacher"):
-            return x_t * 0.5  # Teacher returns scaled input
-        else:
-            return x_t * 2.0  # Student returns different scaled input
+        # Teacher and student return differently scaled inputs
+        return per_modality(torch.mul, x_t, 0.5 if hasattr(self, "_is_teacher") else 2.0)
 
 
 @pytest.fixture
@@ -154,6 +154,43 @@ def test_single_train_step_empty_loss_subset_is_finite(get_model_data, boundary_
     assert loss_map[empty_subset_loss].item() == 0.0
     assert not loss_map[empty_subset_loss].requires_grad
     loss_map["total_loss"].backward()
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_single_train_step_splits_each_modality_loss_at_the_boundary(get_model_data, monkeypatch, multimodal):
+    """Each modality's per-sample loss splits into the mean over regular samples and the mean over the boundary
+    samples at transition_t, which the total weights by w_boundary; a plain tensor keeps its unprefixed loss keys."""
+    model, _ = get_model_data
+    model.config.boundary_prob = 0.5
+    per_sample = torch.tensor([1.0, 2.0, 4.0, 8.0], dtype=torch.float64, device=model.device)
+    losses = {"video": per_sample, "audio": 3 * per_sample} if multimodal else per_sample
+    sampled = {}
+
+    def compute_cm_loss(net, real_data, t, condition=None, neg_condition=None):
+        sampled["t"] = t
+        return losses, per_modality(lambda loss: loss / 10, losses), real_data
+
+    monkeypatch.setattr(model, "_compute_cm_loss", compute_cm_loss)
+    torch.manual_seed(0)
+    loss_map, _ = model.single_train_step({"real": torch.randn(4, 3, 2, 2, device=model.device)}, 0)
+
+    boundary = sampled["t"] == model.config.transition_t
+    assert boundary.sum() == 2
+    prefixed = {"video_": losses["video"], "audio_": losses["audio"]} if multimodal else {"": losses}
+    names = ("cm_loss", "loss_boundary", "unweighted_cm_loss")
+    assert set(loss_map) == {prefix + name for prefix in prefixed for name in names} | {"total_loss"}
+    total = 0
+    for prefix, loss in prefixed.items():
+        cm_loss, loss_boundary = loss[~boundary].mean(), loss[boundary].mean()
+        torch.testing.assert_close(loss_map[prefix + "cm_loss"], cm_loss, rtol=0, atol=0)
+        torch.testing.assert_close(loss_map[prefix + "loss_boundary"], loss_boundary, rtol=0, atol=0)
+        torch.testing.assert_close(
+            loss_map[prefix + "unweighted_cm_loss"], (loss / 10)[~boundary].mean(), rtol=0, atol=0
+        )
+        total = total + cm_loss + model.config.w_boundary * loss_boundary
+    # The unimodal total is bit-for-bit the former cm_loss + w_boundary * loss_boundary.
+    exact = {} if multimodal else dict(rtol=0, atol=0)
+    torch.testing.assert_close(loss_map["total_loss"], total, **exact)
 
 
 @pytest.mark.parametrize("is_boundary", [False, True])
@@ -288,6 +325,59 @@ def test_tcm_precond_forward_mixed_stages(get_tcm_precond_setup):
             pred_no_grad = tcm_precond(x_t, t_test, condition=condition)
 
         assert torch.allclose(pred_grad, pred_no_grad, atol=1e-6)
+
+
+def test_tcm_precond_blends_each_modality(get_tcm_precond_setup):
+    """A ``{"video", "audio"}`` state takes each modality's second-stage samples from the student."""
+    tcm_precond, x_t, t, condition = get_tcm_precond_setup
+    tcm_precond.eval()
+    state = {"video": x_t, "audio": torch.randn(x_t.shape[0], 6, 5, device=x_t.device)}
+
+    with torch.no_grad():
+        output = tcm_precond(state, t, condition=condition)
+
+    # t = [1.0, 1.5, 2.5, 3.0] with transition_t = 2.0: teacher (x 0.5), then student (x 2.0)
+    scale = torch.tensor([0.5, 0.5, 2.0, 2.0], device=x_t.device)
+    assert set(output) == set(state)
+    for key, value in state.items():
+        torch.testing.assert_close(output[key], value * expand_like(scale, value))
+
+
+@pytest.mark.parametrize("use_cd", [False, True])
+def test_joint_kandinsky6_step_has_losses_per_modality(tmp_path, use_cd):
+    """TCM on a ``{"video", "audio"}`` state reports consistency and boundary losses per modality, trains both
+    output heads and leaves the frozen stage-1 model without gradients."""
+    config = importlib.import_module("fastgen.configs.methods.config_tcm").create_config()
+    instance = _joint_kandinsky6_config(config.model, tmp_path)
+    instance.loss_config.use_cd = use_cd
+    instance.transition_t = 0.3  # in the network's rectified-flow time
+    instance.sample_t_cfg.min_t = instance.transition_t
+    instance.sample_t_cfg.max_t = 1.0
+    instance.boundary_prob = 0.5
+    model = TCMModel(instance)
+    model.on_train_begin()
+    model.ratio = 0.9
+    second_stage = []
+    model.net_tcm.register_forward_pre_hook(lambda module, args: second_stage.append(args[1] >= module.transition_t))
+
+    torch.manual_seed(0)
+    loss_map, outputs = model.single_train_step(_joint_kandinsky6_data(), 0)
+
+    # The student pass is second stage; the target pass blends the stage-1 model's outputs with the student's.
+    student_pass, target_pass = second_stage
+    assert student_pass.all() and target_pass.any() and not target_pass.all()
+    modalities, names = ("video", "audio"), ("cm_loss", "loss_boundary", "unweighted_cm_loss")
+    assert set(loss_map) == {f"{modality}_{name}" for modality in modalities for name in names} | {"total_loss"}
+    assert all(torch.isfinite(value) and value > 0 for value in loss_map.values())
+    total = sum(
+        loss_map[f"{modality}_cm_loss"] + instance.w_boundary * loss_map[f"{modality}_loss_boundary"]
+        for modality in modalities
+    )
+    torch.testing.assert_close(loss_map["total_loss"], total)
+    assert set(outputs["gen_rand_train"]) == set(modalities)
+    loss_map["total_loss"].backward()
+    _assert_trains_both_heads(model.net)
+    assert all(parameter.grad is None for parameter in model.cm_teacher.parameters())
 
 
 def _tiny_edm2_tcm():

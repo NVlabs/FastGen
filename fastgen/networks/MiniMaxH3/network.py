@@ -1020,26 +1020,23 @@ class MiniMaxH3(FastGenNetwork):
         latent_width: int,
         num_audio_latents: int,
     ) -> List[Dict[str, torch.Tensor]]:
-        """Split packed feature rows ``[B, N, inner_dim]`` into per-modality grids.
+        """Split packed feature rows ``[B, N, inner_dim]`` into per-modality token grids.
 
-        Restores each modality the way ``forward`` restores the output heads: video to
-        ``[B, inner_dim // prod(patch_size), F, H, W]``, audio to ``[B, inner_dim, 2, L]``.
-        Conditioning video rows are dropped -- they are inputs, not generated content.
+        Each row keeps its ``inner_dim`` channels, which hold no patch layout: video rows go onto their
+        frame-major, row-major token grid ``[B, inner_dim, F / p_t, H / p_h, W / p_w]`` and audio rows onto
+        ``[B, inner_dim, 2, L]``. Conditioning video rows are dropped -- they are inputs, not generated content.
         """
+        patch_t, patch_h, patch_w = self.patch_size
         unpatchified: List[Dict[str, torch.Tensor]] = []
         for feat in features:
             video_rows = feat.index_select(1, layout.video_indices)[:, layout.num_condition_video_rows :]
-            # Read the channel count off the tensor, as the output path does, so a widened inner
-            # dimension flows through unchanged.
-            channels = video_rows.shape[-1] // math.prod(self.patch_size)
-            video = unpatchify_video_tokens(
-                video_rows.flatten(0, 1),
-                num_latent_frames,
-                latent_height,
-                latent_width,
-                channels,
-                self.patch_size,
-            )
+            video = video_rows.reshape(
+                video_rows.shape[0],
+                num_latent_frames // patch_t,
+                latent_height // patch_h,
+                latent_width // patch_w,
+                video_rows.shape[-1],
+            ).permute(0, 4, 1, 2, 3)
             audio = _unpack_audio_latents(feat.index_select(1, layout.audio_indices), num_audio_latents)
             unpatchified.append({"video": video, "audio": audio})
         return unpatchified
@@ -1351,7 +1348,7 @@ class MiniMaxH3(FastGenNetwork):
                 are required: MiniMax-H3 runs both output heads over one sequence.
             t: Shared timestep ``[B]`` in FastGen's convention (``0`` clean).
             condition: See the class docstring.
-            unpatchify_features: Return features as ``{"video": [B, C, F, H, W],
+            unpatchify_features: Return features on their token grids, ``{"video": [B, C, F, H / 2, W / 2],
                 "audio": [B, C, 2, L]}`` per layer, which ``CompositeDiscriminator`` consumes.
                 ``False`` returns the raw packed rows ``[B, N, inner_dim]``.
             skip_layers: Transformer layer indices to skip entirely (SLG).

@@ -8,6 +8,7 @@ import pytest
 from fastgen.methods import CausalKDModel, FastGenModel, KDModel
 from fastgen.configs.config import BaseModelConfig as ModelConfig
 from fastgen.configs.config_utils import override_config_with_opts
+from fastgen.methods.common_loss import mse_loss
 from fastgen.networks.kv_cache.base import _build_block_token_ranges
 from fastgen.networks.noise_schedule import StudentGridConfig
 from tests.utils import RunIf
@@ -205,6 +206,119 @@ def test_multistep_kd_rejects_a_path_with_the_wrong_source_resolution(get_model_
         match="path_steps=5, student_base_steps=6",
     ):
         model.single_train_step(data, iteration=0)
+
+
+@pytest.mark.parametrize("wrong_modality", ["video", "audio"])
+def test_multistep_kd_rejects_a_joint_path_with_one_modality_at_the_wrong_resolution(get_model_data, wrong_modality):
+    model, data = get_model_data
+    sampling = StudentGridConfig(steps=4, grid_kwargs={"base_steps": 6})
+    model.config.student_grid_cfg = sampling
+    model.net.noise_scheduler.student_grid_cfg = sampling
+    real = {"video": data["real"], "audio": torch.randn(1, 6, 5).to(model.device, model.precision)}
+    # Each modality's path is checked on its own, so one extra state in either modality is rejected.
+    path = {
+        name: torch.randn(1, 7 if name == wrong_modality else 6, *value.shape[1:]).to(model.device, model.precision)
+        for name, value in real.items()
+    }
+
+    with pytest.raises(ValueError, match="path_steps=7, student_base_steps=6"):
+        model.single_train_step({"real": real, "path": path, "condition": data["condition"]}, iteration=0)
+
+
+@pytest.mark.parametrize(("source", "steps", "base_steps"), [("noise", 1, None), ("path", 1, 3), ("path", 4, 6)])
+def test_tensor_kd_loss_is_half_the_mse_of_its_student_prediction(
+    get_model_data, monkeypatch, source, steps, base_steps
+):
+    model, data = get_model_data
+    sampling = StudentGridConfig(steps=steps, grid_kwargs={} if base_steps is None else {"base_steps": base_steps})
+    model.config.student_grid_cfg = sampling
+    model.net.noise_scheduler.student_grid_cfg = sampling
+    if source == "path":
+        data = {key: value for key, value in data.items() if key != "noise"}
+        data["path"] = torch.randn(1, base_steps, *data["real"].shape[1:]).to(model.device, model.precision)
+    forward, captured = model.net.forward, {}
+
+    def record(*args, **kwargs):
+        captured["gen_data"] = forward(*args, **kwargs)
+        return captured["gen_data"]
+
+    monkeypatch.setattr(model.net, "forward", record)
+    loss_map, _ = model.single_train_step(data, iteration=0)
+
+    # A tensor state keeps its unprefixed loss names, both holding the single-modality loss.
+    assert set(loss_map) == {"total_loss", "recon_loss"}
+    expected = 0.5 * mse_loss(captured["gen_data"], data["real"])
+    torch.testing.assert_close(loss_map["recon_loss"], expected, rtol=0, atol=0)
+    torch.testing.assert_close(loss_map["total_loss"], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("image", [False, True])
+@pytest.mark.parametrize(("source", "steps"), [("noise", 1), ("path", 1), ("path", 4)])
+def test_kd_trains_a_joint_kandinsky6_state(tmp_path, monkeypatch, image, source, steps):
+    from tests.test_network import _kandinsky6_inputs, _tiny_kandinsky6_network
+
+    base_steps = 6
+    net = _tiny_kandinsky6_network(tmp_path, image=image)
+    scheduler = net.noise_scheduler
+    grid_kwargs = {"shift": 5.0} if source == "noise" else {"shift": 5.0, "base_steps": base_steps}
+    scheduler.student_grid_cfg = StudentGridConfig(steps=steps, grid_type="native", grid_kwargs=grid_kwargs)
+    state, condition = _kandinsky6_inputs(image=image, batch_size=2)
+    model = object.__new__(KDModel)
+    torch.nn.Module.__init__(model)
+    model.net = net
+    model.device = torch.device("cpu")
+    model.precision = torch.float32
+    model.use_ema = []
+
+    generator = torch.Generator().manual_seed(615)
+    real = {name: value.detach() for name, value in state.items()}
+    data = {"real": real, "condition": condition}
+    if source == "noise":
+        data["noise"] = {name: torch.randn(value.shape, generator=generator) for name, value in real.items()}
+    else:
+        # A joint path stacks one state per base-grid interval on dim 1 of every modality.
+        data["path"] = {
+            name: torch.randn(value.shape[0], base_steps, *value.shape[1:], generator=generator)
+            for name, value in real.items()
+        }
+    forward, captured = net.forward, {}
+
+    def record(input_student, t_student, **kwargs):
+        captured.update(input_student=input_student, t_student=t_student)
+        captured["gen_data"] = forward(input_student, t_student, **kwargs)
+        return captured["gen_data"]
+
+    monkeypatch.setattr(net, "forward", record)
+    loss_map, outputs = model.single_train_step(data, iteration=0)
+
+    # The student sees each modality's path state at the base-grid node of its shared timestep.
+    t_student = captured["t_student"]
+    grid = scheduler.student_grid(device=model.device).tolist()
+    if source == "noise":
+        expected_input = scheduler.latents(noise=data["noise"], t_init=t_student)
+    else:
+        base_indices = scheduler.student_grid_indices(steps).tolist()
+        path_indices = [base_indices[grid.index(t)] for t in t_student.tolist()]
+        expected_input = {
+            name: torch.stack([path[sample, index] for sample, index in enumerate(path_indices)])
+            for name, path in data["path"].items()
+        }
+    torch.testing.assert_close(captured["input_student"], expected_input, rtol=0, atol=0)
+
+    assert set(loss_map) == {"video_recon_loss", "audio_recon_loss", "total_loss"}
+    for name in ("video", "audio"):
+        expected = 0.5 * mse_loss(captured["gen_data"][name], real[name])
+        torch.testing.assert_close(loss_map[f"{name}_recon_loss"], expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        loss_map["total_loss"], loss_map["video_recon_loss"] + loss_map["audio_recon_loss"], rtol=0, atol=0
+    )
+    assert all(torch.isfinite(value) for value in loss_map.values())
+    loss_map["total_loss"].backward()
+    for head_name in ("out_layer", "audio_out_layer"):
+        head = getattr(net.transformer, head_name).out_layer
+        assert head.weight.grad is not None and head.weight.grad.abs().sum() > 0
+        assert torch.isfinite(head.weight.grad).all()
+    assert outputs["gen_rand_train"].keys() == real.keys()
 
 
 def test_causal_kd_forwards_inhomogeneous_student_grid():
