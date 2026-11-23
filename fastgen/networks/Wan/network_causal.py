@@ -918,7 +918,8 @@ class CausalWan(CausalFastGenNetwork, Wan):
                 including an empty list for an empty set. None returns only the model output.
             return_logvar: If true, the forward pass also returns the logvar, shape [B, 1].
             unpatchify_features: If true, the features are unpatchified to [B, C', T, H, W] (C' = hidden size / patch
-                volume); otherwise they stay packed as [B, N_tokens, D].
+                volume), or kept on the token grid [B, D, T', H', W'] with ``token_grid_features``; otherwise they
+                stay packed as [B, N_tokens, D].
             fwd_pred_type: Update the network prediction type, must be in ['x0', 'eps', 'v', 'flow'].
                 None means using the original net_pred_type.
             skip_layers: Apply skip-layer guidance by skipping layers of the unconditional network during forward pass.

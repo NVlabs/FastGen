@@ -126,10 +126,11 @@ class FastGenDecodeVideo:
 
         # ---- single VAE decode (the expensive step — done once, reused below) ----
         if vae is not None:
-            with basic_utils.inference_mode(
+            with basic_utils.eval_context(
                 vae,
                 precision_amp=model.precision_amp_enc,
                 device_type=get_device(latent).type,
+                inference_mode=True,
             ):
                 decoded = vae.decode(latent)
         else:

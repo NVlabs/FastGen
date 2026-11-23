@@ -14,7 +14,7 @@ import imageio.v3 as iio
 from PIL import Image
 
 from fastgen.datasets.video_resampling import validate_frame_rate
-from fastgen.utils.basic_utils import inference_mode, cuda_timer
+from fastgen.utils.basic_utils import eval_context, cuda_timer
 from fastgen.utils.tensor import pixels_to_uint8, waveform_to_pcm16
 from fastgen.utils.tree_utils import TensorOrDict, get_batch_size, get_device, get_shape
 import fastgen.utils.logging_utils as logger
@@ -194,7 +194,7 @@ def save_media(
     logger.debug(f"🔍 Media tensor input shape: {get_shape(output)}")
 
     if vae is not None:
-        with inference_mode(vae, precision_amp=precision_amp, device_type=get_device(output).type):
+        with eval_context(vae, precision_amp=precision_amp, device_type=get_device(output).type):
             with cuda_timer("VAE decode time"):
                 output = vae.decode(output)
             logger.debug(f"🔍 Media tensor output shape after VAE decode: {get_shape(output)}")

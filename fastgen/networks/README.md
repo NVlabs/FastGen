@@ -8,7 +8,7 @@ Neural network architectures for FastGen. All networks inherit from `FastGenNetw
 |------|----------|
 | Image | [`EDM`](EDM/), [`EDM2`](EDM2/), [`DiT`](DiT/), [`SD15`](SD15/), [`SDXL`](SDXL/), [`Flux`](Flux/), [`Flux2`](Flux2/), [`QwenImage`](QwenImage/) |
 | Video | [`Wan`](Wan/), [`WanI2V`](WanI2V/), [`WanMoE`](Wan/wan_moe.py), [`LingBotWorld`](WanI2V/wan_moe.py), [`VaceWan`](VaceWan/), [`CogVideoX`](CogVideoX/), [`Cosmos-Predict2`](cosmos_predict2/), [`Cosmos3`](cosmos3/) |
-| Video+Audio | [`LTX2`](LTX2/), [`MiniMaxH3`](MiniMaxH3/) |
+| Video+Audio | [`LTX2`](LTX2/), [`MiniMaxH3`](MiniMaxH3/), [`Kandinsky6`](Kandinsky6/) |
 
 
 ## Validate a new network
@@ -43,6 +43,7 @@ The following networks load pretrained weights automatically from HuggingFace Hu
 | `Cosmos3` | [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano) |
 | `LTX2` | [`Lightricks/LTX-2`](https://huggingface.co/Lightricks/LTX-2), [`diffusers/LTX-2.3-Diffusers`](https://huggingface.co/diffusers/LTX-2.3-Diffusers), [`Lightricks/LTX-2.5-Diffusers`](https://huggingface.co/Lightricks/LTX-2.5-Diffusers) |
 | `MiniMaxH3` | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) |
+| `Kandinsky6` | [`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers) |
 
 Set `HF_HOME` for cache location, `LOCAL_FILES_ONLY=true` for offline use.
 
@@ -144,7 +145,7 @@ when the schedule is built.
 | `edm` | EDM sigma-based (t = σ) | EDM, EDM2 |
 | `sd` / `sdxl` | Stable Diffusion alphas | SD15, SDXL |
 | `ddpm` | Linear betas | DiT |
-| `rf` | Rectified Flow (α=1-t, σ=t) | Flux, QwenImage, WAN, Cosmos, LTX-2, MiniMax-H3 (video), DiT (from scratch, SiT, REPA) |
+| `rf` | Rectified Flow (α=1-t, σ=t) | Flux, QwenImage, WAN, Cosmos, Kandinsky6, LTX-2, MiniMax-H3 (video), DiT (from scratch, SiT, REPA) |
 | `shifted_rf` | Rectified Flow under an exponential time shift (α=1-σ, σ=`time_shift(t, shift)`) | MiniMax-H3 (audio) |
 | `cogvideox` | CogVideoX schedule | CogVideoX |
 | `trig` | Trigonometric (α=cos, σ=sin) | sCM |

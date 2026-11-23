@@ -189,7 +189,7 @@ def vae_decode_context(
 
     Yields ``None`` immediately when the net is already pixel-space, so the
     caller doesn't have to branch (the pixel-space path skips the
-    ``inference_mode`` wrap). Optionally offloads registered components not
+    evaluation context). Optionally offloads registered components not
     needed for decoding to CPU (frees GPU memory at the cost of two H↔D
     copies).
     """
@@ -231,9 +231,10 @@ def vae_decode_context(
         # Acquire after offloading to avoid overlapping a temporary VAE's peak
         # allocation with the generator components being moved away.
         with net.vae_context() as vae:
-            with basic_utils.inference_mode(
+            with basic_utils.eval_context(
                 precision_amp=model.precision_amp_enc,
                 device_type=device.type,
+                inference_mode=model.config.inference,
             ):
                 yield vae
     finally:
@@ -820,10 +821,8 @@ class WandbCallback(Callback):
         list covering every item written — kind, rank, batch_idx, path,
         and the matching prompt from ``data_batch``.
 
-        Must be called inside ``vae_decode_context(model)`` — the VAE (when
-        the model has one) is read from ``model.net_preprocessors.preprocessors`` and the active
-        ``inference_mode`` autocast wraps the per-kind ``save_media``
-        decode calls.
+        Must run inside ``vae_decode_context(model)``, which supplies the VAE from
+        ``model.net_preprocessors.preprocessors`` and evaluation autocast for decoding.
         """
         entries: List[MediaEntry] = []
         if n_per_rank <= 0:

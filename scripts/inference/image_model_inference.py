@@ -163,7 +163,7 @@ def main(args, config: BaseConfig):
         has_image = input_image_paths is not None
         if has_image:
             data["condition_image_raw"] = load_source_image_for_net(input_image_paths[i], net, config.model.input_shape)
-        data = model.prepare_batch(data, inference_mode=True, materialize_real=False)
+        data = model.prepare_batch(data, materialize_real=False)
 
         # Student sampling
         if has_student_sampling:

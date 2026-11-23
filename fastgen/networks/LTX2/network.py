@@ -1878,13 +1878,13 @@ class LTX2(FastGenNetwork):
     # ------------------------------------------------------------------
 
     def _unpatchify_features(self, video_latents: Optional[torch.Tensor], features: list) -> list:
-        """Unpack token features: video to ``[B, C, F, H, W]`` and audio to ``[B, C, L, M]``.
+        """Unpack token features: video to ``[B, C, F, H, W]`` and audio to ``[B, C, L]``.
 
-        Plain tensors are video features, or audio features when ``video_latents`` is ``None``.
+        Plain tensors are video features, or audio features when ``video_latents`` is ``None``. Each audio token
+        is one time step whose channels mix all mel bins, so audio features keep only the time axis.
         """
-        latent_mel_bins = self.audio_latent_mel_bins
         if video_latents is None:
-            return [_unpack_audio_latents(feat, latent_mel_bins) for feat in features]
+            return [feat.transpose(1, 2) for feat in features]
 
         _, _, latent_f, latent_h, latent_w = video_latents.shape
         ps = self.transformer_spatial_patch_size
@@ -1894,8 +1894,7 @@ class LTX2(FastGenNetwork):
         for feat in features:
             if not isinstance(feat, torch.Tensor):
                 v = _unpack_latents(feat["video"], latent_f, latent_h, latent_w, ps, pt)
-                a = _unpack_audio_latents(feat["audio"], latent_mel_bins)
-                unpacked.append({"video": v, "audio": a})
+                unpacked.append({"video": v, "audio": feat["audio"].transpose(1, 2)})
             else:
                 unpacked.append(_unpack_latents(feat, latent_f, latent_h, latent_w, ps, pt))
         return unpacked
@@ -2201,7 +2200,7 @@ class LTX2(FastGenNetwork):
         Returns:
             The prediction, a dict for dict ``x_t``; ``[prediction, features]`` with ``feature_indices``;
             ``(above, logvar [B, 1])`` with ``return_logvar``; only the features with ``return_features_early``.
-            ``unpatchify_features`` unpacks the features to the latent layouts.
+            ``unpatchify_features`` restores video features to ``[B, C, F, H, W]`` and audio to ``[B, C, L]``.
         """
         num_blocks = len(self.transformer.transformer_blocks)
         self._validate_forward_kwargs(

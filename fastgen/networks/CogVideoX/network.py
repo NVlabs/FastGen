@@ -425,15 +425,13 @@ class CogVideoX(FastGenNetwork):
         return freqs_cos, freqs_sin
 
     def _unpatchify_features(self, x_t: torch.Tensor, features: List[torch.Tensor]) -> List[torch.Tensor]:
-        B, T, C, H, W = x_t.shape
+        """Restore token features ``[B, T * H/p * W/p, D]`` to their token grid ``[B, D, T, H/p, W/p]``.
+
+        A token's ``D`` channels hold no patch layout, so they all stay channels.
+        """
+        _, T, _, H, W = x_t.shape
         p = self.transformer.config.patch_size
-        feats = []
-        for feat in features:
-            feat = feat.reshape(feat.shape[0], T, H // p, W // p, -1, p, p)
-            # (B, D, T, H, W)
-            feat = rearrange(feat, "B T Hp Wp D p1 p2 -> B D T (Hp p1) (Wp p2)")
-            feats.append(feat)
-        return feats
+        return [feat.reshape(feat.shape[0], T, H // p, W // p, -1).permute(0, 4, 1, 2, 3) for feat in features]
 
     def _get_variables(self, alpha_prod_t, alpha_prod_t_prev, alpha_prod_t_back=None):
         lamb = ((alpha_prod_t / (1 - alpha_prod_t)) ** 0.5).log()
@@ -673,7 +671,7 @@ class CogVideoX(FastGenNetwork):
             out[0] = self.transform_output(
                 out[0], x_t, t, condition, fwd_pred_type, output_dtype, apply_output_conditioning
             )
-            out[1] = self._unpatchify_features(x_t_model, out[1])  # already in B, C, T, H, W
+            out[1] = self._unpatchify_features(x_t_model, out[1])  # token grid [B, D, T, H/p, W/p]
 
         if return_logvar:
             return out, logvar.to(dtype=x_t.dtype)

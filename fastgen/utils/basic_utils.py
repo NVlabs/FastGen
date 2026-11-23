@@ -134,26 +134,36 @@ def train_mode(*modules: torch.nn.Module, mode: bool = True):
 
 
 @contextmanager
-def inference_mode(*modules: torch.nn.Module, precision_amp: torch.dtype | None = None, device_type: str = "cuda"):
+def eval_context(
+    *modules: torch.nn.Module,
+    precision_amp: torch.dtype | None = None,
+    device_type: str = "cuda",
+    inference_mode: bool = False,
+):
     """
-    Wraps torch.inference_mode() and temporarily sets the provided modules to .eval() mode.
+    Temporarily sets the provided modules to ``.eval()`` mode, disables gradients, and sets autocast.
 
-    The context always sets the autocast state: with precision_amp it autocasts to that
-    dtype, and with precision_amp=None it explicitly *disables* autocast, so an enclosing
+    Uses training-safe ``torch.no_grad()`` by default so persistent module state (such as
+    FSDP all-gather buffers) remains reusable by later autograd or in-place forwards, and
+    strict ``torch.inference_mode()`` when ``inference_mode=True``.
+
+    The context always sets the autocast state: with ``precision_amp`` it autocasts to that
+    dtype, and with ``precision_amp=None`` it explicitly *disables* autocast, so an enclosing
     autocast region does not carry over into this context.
 
     Args:
         *modules: Modules to set temporarily to eval mode.
         precision_amp: Dtype to autocast to. If None, autocast is disabled in the context.
         device_type: Device type to use for autocast.
+        inference_mode: Use strict ``torch.inference_mode()`` instead of ``torch.no_grad()``.
 
     Returns:
         Generator that yields the context manager.
 
     Upon exit, it restores the original .training state of each module and its descendants.
     """
-    # Set eval mode, enter strict inference mode (disables gradients, etc.) and set the autocast state
-    with train_mode(*modules, mode=False), torch.inference_mode(), torch.autocast(
+    grad_context = torch.inference_mode if inference_mode else torch.no_grad
+    with train_mode(*modules, mode=False), grad_context(), torch.autocast(
         dtype=precision_amp, device_type=device_type, enabled=precision_amp is not None
     ):
         yield

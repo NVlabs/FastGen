@@ -79,6 +79,7 @@ from comfyui.nodes_sampling import (  # noqa: E402
 from fastgen.methods.model import FastGenModel  # noqa: E402
 from fastgen.networks.network import FastGenNetwork  # noqa: E402
 from fastgen.utils import media_utils  # noqa: E402
+from fastgen.utils.basic_utils import attr_override  # noqa: E402
 from scripts.inference import inference_utils  # noqa: E402
 
 
@@ -215,6 +216,7 @@ def _make_bundle(input_shape):
     """Minimal model bundle for tests that stub the preprocessing call."""
     net = SimpleNamespace(preprocessors={}, fps=16)
     model = SimpleNamespace(
+        config=SimpleNamespace(inference=True),
         input_shape=input_shape,
         precision=torch.float32,
         precision_amp_enc=None,
@@ -331,6 +333,7 @@ def _parity_bundle(input_shape, required_fields=(), tuple_text=False, passthroug
     )
     net.fps = fps
     model = SimpleNamespace(
+        config=SimpleNamespace(inference=True),
         device=torch.device("cpu"),
         precision=torch.float32,
         precision_amp_enc=None,
@@ -421,9 +424,10 @@ def test_comfyui_text_conditioning_matches_training(sampler):
         (sampled,) = FastGenStudentSample().sample(bundle, conditioning, "noise")
         sample_call = bundle["model"].generator_calls[0]
 
-    training = bundle["model"].prepare_batch(
-        {"condition_raw": [prompt], "neg_condition_raw": [neg_prompt]},
-    )
+    with attr_override(bundle["model"], "config.inference", False):
+        training = bundle["model"].prepare_batch(
+            {"condition_raw": [prompt], "neg_condition_raw": [neg_prompt]},
+        )
     _assert_condition_tree_equal(sample_call["condition"], training["condition"])
     _assert_condition_tree_equal(sample_call["neg_condition"], training["neg_condition"])
     assert "fps" not in sample_call
@@ -598,7 +602,8 @@ def test_comfyui_task_conditioning_matches_training(task, monkeypatch):
             depth_latent=depth_input,
         )
 
-    training = bundle["model"].prepare_batch(training_data)
+    with attr_override(bundle["model"], "config.inference", False):
+        training = bundle["model"].prepare_batch(training_data)
     _assert_condition_tree_equal(comfy_conditioning["condition"], training["condition"])
     _assert_condition_tree_equal(comfy_conditioning["neg_condition"], training["neg_condition"])
     if task == "image-editing":
@@ -610,12 +615,17 @@ def test_comfyui_task_conditioning_matches_training(task, monkeypatch):
 def test_decode_uses_encoder_amp(monkeypatch):
     recorded = {}
 
-    def fake_inference_mode(module, precision_amp, device_type):
-        recorded.update(module=module, precision_amp=precision_amp, device_type=device_type)
+    def fake_eval_context(module, precision_amp, device_type, inference_mode=False):
+        recorded.update(
+            module=module,
+            precision_amp=precision_amp,
+            device_type=device_type,
+            inference_mode=inference_mode,
+        )
         return nullcontext()
 
     vae = SimpleNamespace(decode=lambda latent: latent)
-    monkeypatch.setattr(nodes_decode.basic_utils, "inference_mode", fake_inference_mode)
+    monkeypatch.setattr(nodes_decode.basic_utils, "eval_context", fake_eval_context)
     monkeypatch.setattr(nodes_decode, "save_media", lambda *args, **kwargs: None)
     model = SimpleNamespace(precision_amp_enc=torch.bfloat16, precision_amp_infer=torch.float16)
     bundle = {"model": model, "vae": vae, "net": SimpleNamespace(fps=16), "fps": 16.0}
@@ -623,7 +633,12 @@ def test_decode_uses_encoder_amp(monkeypatch):
     result = FastGenDecodeVideo().decode(bundle, {"latent": torch.zeros(1, 3, 2, 2)})
 
     assert result["result"][0].shape == (1, 2, 2, 3)
-    assert recorded == {"module": vae, "precision_amp": torch.bfloat16, "device_type": "cpu"}
+    assert recorded == {
+        "module": vae,
+        "precision_amp": torch.bfloat16,
+        "device_type": "cpu",
+        "inference_mode": True,
+    }
 
 
 def test_decode_treats_single_temporal_frame_as_video(monkeypatch):
@@ -671,7 +686,7 @@ def test_decode_saves_gif_only_without_audio(with_audio, monkeypatch):
 
 def test_decode_returns_audio_at_the_saved_sample_rate(monkeypatch):
     saved = {}
-    monkeypatch.setattr(nodes_decode.basic_utils, "inference_mode", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(nodes_decode.basic_utils, "eval_context", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(nodes_decode, "save_media", lambda output, path, **kwargs: saved.update(kwargs))
     vae = SimpleNamespace(decode=lambda latent: latent, vocoder_sample_rate=48000)
     bundle = {"model": SimpleNamespace(precision_amp_enc=None), "vae": vae, "net": SimpleNamespace(fps=16)}
@@ -695,7 +710,7 @@ def test_decode_declares_the_frontend_audio_player():
 
 @pytest.mark.parametrize("shape, channels", [((1, 16), 1), ((1, 2, 16), 2)], ids=["mono", "stereo"])
 def test_decode_saves_audio_only_output_as_wav(shape, channels, monkeypatch, tmp_path):
-    monkeypatch.setattr(nodes_decode.basic_utils, "inference_mode", lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(nodes_decode.basic_utils, "eval_context", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
         nodes_decode.folder_paths, "get_save_image_path", lambda prefix, out: (str(tmp_path), "audio", 1, "", prefix)
     )
@@ -719,8 +734,8 @@ def capture_build(monkeypatch):
     """Stub model preprocessing and capture its assembled raw data dict."""
     captured = {}
 
-    def fake_preprocess(model, data, inference_mode=False, materialize_real=True):
-        assert inference_mode
+    def fake_preprocess(model, data, materialize_real=True):
+        assert model.config.inference
         assert not materialize_real
         captured["data"] = dict(data)
         return {**data, "condition": "cond_out", "neg_condition": "neg_out"}

@@ -265,7 +265,7 @@ class FastGenPreprocess:
                 source_frame_indices,
             )
 
-        processed = model.prepare_batch(data, inference_mode=True, materialize_real=False)
+        processed = model.prepare_batch(data, materialize_real=False)
         conditioning = {
             "condition": processed["condition"],
             "neg_condition": processed.get("neg_condition"),

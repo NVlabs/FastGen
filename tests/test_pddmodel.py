@@ -1280,6 +1280,7 @@ def test_rf_pdd_sampler_uses_summed_block_weight(multimodal):
     model.config = SimpleNamespace(
         guidance_cfg=None,
         student_sample_type="ode",
+        inference=False,
         loss_config=SimpleNamespace(block_size_max=net.pdd_steps),
     )
     model.precision = torch.float32
@@ -3309,6 +3310,7 @@ def test_pdd_generator_uses_instance_precision(monkeypatch):
     model.config = SimpleNamespace(
         guidance_cfg=None,
         student_sample_type="ode",
+        inference=False,
         loss_config=SimpleNamespace(block_size_max=net.pdd_steps),
     )
     model.precision = torch.bfloat16
@@ -3402,6 +3404,7 @@ def test_one_step_generation_matches_integer_fused_mean_sigma_velocity_advance()
     model.config = SimpleNamespace(
         guidance_cfg=None,
         student_sample_type="ode",
+        inference=False,
         loss_config=SimpleNamespace(block_size_max=net.pdd_steps),
     )
     model.precision = torch.float32

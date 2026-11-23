@@ -15,6 +15,7 @@ from fastgen.networks.Flux2.network import Flux2
 from fastgen.networks.QwenImage.network import QwenImage
 from fastgen.networks.CogVideoX.network import CogVideoX
 from fastgen.networks.LTX2.network import LTX2
+from fastgen.networks.Kandinsky6.network import Kandinsky6
 from fastgen.networks.MiniMaxH3.network import MiniMaxH3
 from fastgen.networks.Wan.network import Wan
 from fastgen.networks.Wan.network_causal import CausalWan
@@ -284,6 +285,18 @@ MiniMaxH3_Config: DictConfig = L(MiniMaxH3)(
     # Spatial tiling of the video VAE is on in the release, and the published frames are the
     # blended-tile ones, so turning it off changes the output.
     enable_vae_tiling=True,
+)
+
+# ------ Kandinsky 6 ------
+
+# The non-distilled Pro checkpoint supports video-only and joint audio/video tasks.
+Kandinsky6Config: DictConfig = L(Kandinsky6)(
+    model_id_or_local_path="kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers",
+    revision="7be18aed6fbd64653c0c4872fddfe4a3e3e109f5",
+    modalities=("video", "audio"),
+    image_conditioned=False,
+    fps=24.0,
+    scheduler_scale=5.0,
 )
 
 LTX2I2VConfig: DictConfig = L(LTX2)(

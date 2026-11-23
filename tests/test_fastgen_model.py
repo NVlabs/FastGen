@@ -21,7 +21,7 @@ import torch
 
 from fastgen.configs.config import BaseModelConfig
 from fastgen.methods.model import FastGenModel
-from fastgen.networks.discriminators import Discriminator_Audio2D
+from fastgen.networks.discriminators import Discriminator_AudioDiT
 from fastgen.networks.lora_utils import LoRAMixin
 from fastgen.networks.network import FastGenNetwork, FastGenModule
 from tests.utils import RunIf, run_distributed_test
@@ -234,6 +234,46 @@ def test_cuda_autocast_supports_full_precision_targets(dtype):
     assert not caught
 
 
+@pytest.mark.parametrize("entrypoint", ["generator_fn", "sample"])
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("precision_amp", [None, torch.bfloat16])
+def test_model_sampling_entrypoints_match_run_lifecycle_and_restore_state(entrypoint, inference, precision_amp):
+    class _LifecycleSampler(_TinyNetwork):
+        def __init__(self):
+            super().__init__()
+            self.drop = torch.nn.Dropout()
+            self.drop.eval()
+
+        def _check(self, x):
+            assert not torch.is_grad_enabled() and not any(module.training for module in self.modules())
+            assert torch.is_inference_mode_enabled() is inference
+            assert torch.is_autocast_enabled("cpu") is (precision_amp is not None)
+            output = self.proj(x)
+            assert not output.requires_grad and output.is_inference() is inference
+            assert output.dtype == (precision_amp or torch.float32)
+            raise RuntimeError("preview failure")
+
+        def forward(self, x_t, t, **kwargs):
+            del t, kwargs
+            return self._check(x_t)
+
+        def sample(self, noise, guidance_cfg=None):
+            assert guidance_cfg is None
+            return self._check(noise)
+
+    model = _uninitialized_model()
+    model.precision_amp_infer = precision_amp
+    model.config = BaseModelConfig(inference=inference, guidance_cfg=None)
+    network = _LifecycleSampler()
+    call = getattr(model, entrypoint)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        with pytest.raises(RuntimeError, match="preview failure"):
+            call(network, torch.ones(1, 2, requires_grad=True))
+        assert torch.is_autocast_enabled("cpu") and torch.is_grad_enabled()
+    assert network.training and network.proj.training and not network.drop.training
+    assert not torch.is_inference_mode_enabled() and not torch.is_autocast_enabled("cpu")
+
+
 def test_model_sample_owns_inference_amp_and_does_not_forward_it():
     class _Sampler(_TinyNetwork):
         def sample(self, noise, guidance_cfg=None):
@@ -243,7 +283,7 @@ def test_model_sample_owns_inference_amp_and_does_not_forward_it():
 
     model = _uninitialized_model()
     model.precision_amp_infer = torch.bfloat16
-    model.config = SimpleNamespace(guidance_cfg=None)
+    model.config = SimpleNamespace(guidance_cfg=None, inference=False)
     network = _Sampler()
 
     result = model.sample(network, torch.ones(1, 2))
@@ -261,7 +301,7 @@ def test_model_sample_does_not_accept_amp_kwargs(name):
 
     model = _uninitialized_model()
     model.precision_amp_infer = None
-    model.config = SimpleNamespace(guidance_cfg=None)
+    model.config = SimpleNamespace(guidance_cfg=None, inference=False)
 
     with pytest.raises(TypeError, match=name):
         model.sample(_Sampler(), torch.ones(1, 2), **{name: torch.bfloat16})
@@ -400,7 +440,7 @@ def test_model_prepare_module_sets_network_and_discriminator_model_precision():
     model.precision_model = torch.float64
     model.precision_opt = torch.float32
     model.net = _TinyNetwork()
-    model.discriminator = Discriminator_Audio2D(feature_indices={0}, inner_dim=2, hidden_channels=4, num_blocks=1)
+    model.discriminator = Discriminator_AudioDiT(feature_indices={0}, inner_dim=2, hidden_channels=4, num_blocks=1)
     model.discriminator.requires_grad_(False)
 
     model.prepare_module(model.net, name="net")

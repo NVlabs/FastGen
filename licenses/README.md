@@ -10,3 +10,4 @@ FastGen itself is licensed under the [Apache License 2.0](../LICENSE).
 4. [Detectron2](detectron2/LICENSE) ([github.com/facebookresearch/detectron2](https://github.com/facebookresearch/detectron2)): [Apache License 2.0](https://github.com/facebookresearch/detectron2/blob/fd27788985af0f4ca800bca563acdb700bb890e2/LICENSE)
 5. [Torchaudio](torchaudio/LICENSE) ([github.com/pytorch/audio](https://github.com/pytorch/audio/tree/release/2.10)): [BSD 2-Clause License](https://github.com/pytorch/audio/blob/release/2.10/LICENSE)
 6. [Cosmos 3](OpenMDW/LICENSE) ([github.com/NVIDIA/cosmos](https://github.com/NVIDIA/cosmos)): [OpenMDW-1.1](https://github.com/NVIDIA/cosmos/blob/284be180c0aea34327eddbb20d9bdf277fa5ab80/LICENSE)
+7. [Kandinsky 6](Kandinsky6/LICENSE) ([github.com/kandinskylab/kandinsky-6](https://github.com/kandinskylab/kandinsky-6)): [MIT License](https://github.com/kandinskylab/kandinsky-6/blob/7ceeefad7fb625011f7db602c43893a989f19c15/LICENSE)

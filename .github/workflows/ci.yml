@@ -20,7 +20,7 @@ jobs:
     runs-on: [FG_Runner]
     
     container:
-      image: ghcr.io/juliusberner/fastgen:0.0.6
+      image: ghcr.io/juliusberner/fastgen:0.0.7
       options: --entrypoint "" --gpus all --shm-size=8g
       credentials:
         username: ${{ github.actor }}
@@ -54,7 +54,7 @@ jobs:
     runs-on: [FG_Runner]
     
     container:
-      image: ghcr.io/juliusberner/fastgen:0.0.6
+      image: ghcr.io/juliusberner/fastgen:0.0.7
       options: --entrypoint "" --gpus all --shm-size=8g
       credentials:
         username: ${{ github.actor }}
@@ -82,7 +82,7 @@ jobs:
     runs-on: [FG_Runner] 
     
     container:
-      image: ghcr.io/juliusberner/fastgen:0.0.6
+      image: ghcr.io/juliusberner/fastgen:0.0.7
       options: --entrypoint "" --gpus all --shm-size=8g
       credentials:
         username: ${{ github.actor }}

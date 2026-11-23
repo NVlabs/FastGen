@@ -776,7 +776,12 @@ def _fsdp_live_ema_impl(rank: int, world_size: int) -> dict:
     # an auxiliary training iteration may forward the student without ever running its
     # backward hook, leaving both roots materialized before the callback phase.
     sample = torch.ones(2, 8, device=model.device, dtype=torch.float32)
-    with basic_utils.inference_mode(model.ema, precision_amp=None, device_type=model.device.type):
+    with basic_utils.eval_context(
+        model.ema,
+        precision_amp=None,
+        device_type=model.device.type,
+        inference_mode=True,
+    ):
         model.ema(sample)
     with torch.no_grad():
         model.net(sample)
@@ -1442,13 +1447,9 @@ def test_vae_decode_context_offloads_registered_components(monkeypatch):
         device=torch.device("cuda:0"),
         net_preprocessors=host,
         precision_amp_enc=None,
+        config=SimpleNamespace(inference=False),
     )
     monkeypatch.setattr(wandb_callback_module.torch.cuda, "memory_allocated", lambda _device: 0)
-    monkeypatch.setattr(
-        wandb_callback_module.basic_utils,
-        "inference_mode",
-        lambda **_kwargs: contextlib.nullcontext(),
-    )
 
     with vae_decode_context(model, offload_modules=True) as yielded:
         assert yielded is vae
@@ -1482,7 +1483,12 @@ def test_vae_decode_context_prepares_each_vae_once_across_logging_calls(persiste
     if persistent:
         host.init_vae()
         host.preprocessors["vae"].prepare_module(device="cpu", precision_model=torch.float32)
-    model = SimpleNamespace(net_preprocessors=host, device=torch.device("cpu"), precision_amp_enc=None)
+    model = SimpleNamespace(
+        net_preprocessors=host,
+        device=torch.device("cpu"),
+        precision_amp_enc=None,
+        config=SimpleNamespace(inference=False),
+    )
     borrowed = []
     for _ in range(2):
         with vae_decode_context(model) as vae:
@@ -1514,6 +1520,7 @@ def test_vae_decode_context_cleans_up_partial_vae_initialization():
         module_dict={},
         device=torch.device("cpu"),
         precision_amp_enc=None,
+        config=SimpleNamespace(inference=False),
     )
 
     with pytest.raises(RuntimeError, match="VAE initialization failed"):
@@ -1903,6 +1910,7 @@ def _wandb_fsdp_max_ranks_impl(rank: int, world_size: int, media_path: str) -> d
 
     host = _WandbFSDPVAEHost(vae)
     model = SimpleNamespace(
+        config=SimpleNamespace(inference=False),
         net=host,
         net_preprocessors=host,
         module_dict={"vae": vae},

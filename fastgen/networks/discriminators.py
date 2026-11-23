@@ -309,6 +309,7 @@ def _build_dit_simple_conv3d_discriminator_head(
     kernel_size=(2, 4, 4),
     stride=(2, 2, 2),
     padding=(0, 1, 1),
+    hidden_channels: Optional[int] = None,
 ) -> nn.Sequential:
     """
     Builds a simple 2-layer Conv3D discriminator head
@@ -321,11 +322,12 @@ def _build_dit_simple_conv3d_discriminator_head(
         kernel_size: Kernel size for the first conv3d layer.
         stride: Stride for the first conv3d layer.
         padding: Padding for the first conv3d layer.
+        hidden_channels: Output channels of the first conv3d layer. Defaults to ``inner_dim // 2``.
 
     Returns:
         Sequential module representing the discriminator head.
     """
-    hidden_channels = inner_dim // 2
+    hidden_channels = inner_dim // 2 if hidden_channels is None else hidden_channels
 
     return nn.Sequential(
         nn.Conv3d(
@@ -865,6 +867,7 @@ class Discriminator_VideoDiT(Discriminator):
         num_blocks: int = 30,
         disc_type: str = "conv3d_down_mlp_efficient",
         inner_dim: int = 384,
+        hidden_channels: Optional[int] = None,
     ):
         """
         Initialize the unified video diffusion discriminator.
@@ -878,7 +881,9 @@ class Discriminator_VideoDiT(Discriminator):
                       Defaults to the efficient 3D conv; the shipped configs use dit_simple_conv3d or a
                       multi-scale head.
             inner_dim: Input channel dimension of the features.
-                      Common values: 480 (CogVideoX-2B), 384 (Wan2.1 1.3B)
+                      Common values: 1920 (CogVideoX-2B), 384 (Wan2.1 1.3B)
+            hidden_channels: Hidden width of the ``dit_simple_conv3d`` head, ``inner_dim // 2`` by default;
+                      other heads size themselves.
         """
         super().__init__(feature_indices=feature_indices)
 
@@ -897,6 +902,9 @@ class Discriminator_VideoDiT(Discriminator):
             raise ValueError(f"Unknown disc_type '{disc_type}'. Available: {available}")
 
         config = self.ARCHITECTURES[disc_type]
+        if hidden_channels is not None and config["type"] != "dit_simple_conv3d":
+            raise ValueError(f"hidden_channels sizes only the dit_simple_conv3d head, not '{disc_type}'")
+        self.hidden_channels = hidden_channels
 
         # Build discriminator heads
         self.cls_pred_heads = nn.ModuleList()
@@ -914,6 +922,7 @@ class Discriminator_VideoDiT(Discriminator):
                 kernel_size=config["kernel_size"],
                 stride=config["stride"],
                 padding=config["padding"],
+                hidden_channels=self.hidden_channels,
             )
         elif arch_type == "conv3d":
             return _build_dit_conv3d_discriminator_head(
@@ -978,17 +987,18 @@ class Discriminator_VideoDiT(Discriminator):
         return logits
 
 
-class Discriminator_Audio2D(Discriminator):
-    """Per-feature 2D-conv discriminator for audio spectrogram features.
+class Discriminator_AudioDiT(Discriminator):
+    """Per-feature temporal-conv discriminator for DiT audio token features.
 
-    Audio features ``[B, C, L, M]`` (L=time, M=mel bins) are processed by
-    independent conv heads (one per feature index) and concatenated.
+    Features are ``[B, C, L]``: the ``inner_dim`` token channels over the audio time axis ``L``. Token channels
+    have no spatial order, so each head convolves over time only. Axes between ``C`` and ``L`` (MiniMax-H3's
+    stereo token rows, ``[B, C, 2, L]``) hold separate sequences; their logits are averaged per sample.
     """
 
     def __init__(
         self,
         feature_indices: Optional[Collection[int]] = None,
-        inner_dim: int = 128,
+        inner_dim: int = 2048,
         hidden_channels: int = 256,
         num_blocks: int = 48,
     ):
@@ -1003,16 +1013,16 @@ class Discriminator_Audio2D(Discriminator):
         self.heads = nn.ModuleList()
         for _ in range(num_features):
             head = nn.Sequential(
-                nn.Conv2d(inner_dim, h, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1)),
+                nn.Conv1d(inner_dim, h, kernel_size=3, stride=2, padding=1),
                 nn.GroupNorm(num_groups=_get_optimal_groups(h), num_channels=h),
                 nn.LeakyReLU(0.2),
-                nn.Conv2d(h, h * 2, kernel_size=(3, 3), stride=(2, 1), padding=(1, 1)),
+                nn.Conv1d(h, h * 2, kernel_size=3, stride=2, padding=1),
                 nn.GroupNorm(num_groups=_get_optimal_groups(h * 2), num_channels=h * 2),
                 nn.LeakyReLU(0.2),
-                nn.Conv2d(h * 2, h * 2, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)),
+                nn.Conv1d(h * 2, h * 2, kernel_size=3, stride=2, padding=1),
                 nn.GroupNorm(num_groups=_get_optimal_groups(h * 2), num_channels=h * 2),
                 nn.LeakyReLU(0.2),
-                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.AdaptiveAvgPool1d(1),
                 nn.Flatten(),
                 nn.Linear(h * 2, 1),
             )
@@ -1022,8 +1032,13 @@ class Discriminator_Audio2D(Discriminator):
         if len(feats) == 0:
             raise ValueError("Empty feature list")
         feats = to(feats, dtype=self.precision_model)
-        logits = torch.cat([head(feat) for head, feat in zip(self.heads, feats, strict=True)], dim=1)
-        return logits
+        logits = []
+        for head, feat in zip(self.heads, feats, strict=True):
+            if feat.ndim < 3:
+                raise ValueError(f"Audio features must be [B, C, ..., L], got shape {tuple(feat.shape)}")
+            sequences = feat.movedim(1, -2).flatten(0, -3)  # [B * sequences, C, L]
+            logits.append(head(sequences).view(feat.shape[0], -1).mean(dim=1, keepdim=True))
+        return torch.cat(logits, dim=1)
 
 
 class CompositeDiscriminator(Discriminator):

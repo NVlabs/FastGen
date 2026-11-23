@@ -138,7 +138,6 @@ class FastGenModel(torch.nn.Module):
         self,
         data: dict[str, Any],
         augment_pipe: Callable | None = None,
-        inference_mode: bool = False,
         materialize_real: bool = True,
     ) -> dict[str, Any]:
         """Turn one dataloader batch into method state and network conditioning.
@@ -146,13 +145,12 @@ class FastGenModel(torch.nn.Module):
         The model owns placement, method-state precision, execution scopes, and
         preprocessor lifecycle. Its active preprocessor network owns the
         representation-specific ``real_raw`` encoding and complete conditioning
-        builder.
+        builder. Uses strict ``torch.inference_mode`` when ``self.config.inference``
+        is enabled and training-safe ``torch.no_grad`` otherwise.
 
         Args:
             data: Per-batch input mapping. The mapping is not mutated.
             augment_pipe: Optional data-domain augmenter, run before encoder autocast.
-            inference_mode: Use strict ``torch.inference_mode`` instead of
-                training-safe ``torch.no_grad``.
             materialize_real: Encode a missing ``real`` from ``real_raw``. Condition
                 building always runs and may still consume ``real_raw``.
 
@@ -160,41 +158,46 @@ class FastGenModel(torch.nn.Module):
             A new mapping with fields in ``state_fields`` cast to ``precision`` and
             network-owned conditioning updates; ``real_raw`` is removed.
         """
-        mode = torch.inference_mode if inference_mode else torch.no_grad
         net = self.net_preprocessors
 
-        with mode():
-            data = to(data, device=self.device)
-            if augment_pipe is not None:
+        if augment_pipe is not None:
+            # Data-domain augmentation runs with autocast disabled.
+            with basic_utils.eval_context(
+                device_type=self.device.type,
+                inference_mode=self.config.inference,
+            ):
+                data = to(data, device=self.device)
                 data = augment_pipe(data)
 
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=self.precision_amp_enc,
-                enabled=self.precision_amp_enc is not None,
-            ):
-                if materialize_real and data.get("real") is None and data.get("real_raw") is not None:
-                    data["real"] = net.encode_real(data["real_raw"])
+        with basic_utils.eval_context(
+            precision_amp=self.precision_amp_enc,
+            device_type=self.device.type,
+            inference_mode=self.config.inference,
+        ):
+            if augment_pipe is None:
+                data = to(data, device=self.device)
+            if materialize_real and data.get("real") is None and data.get("real_raw") is not None:
+                data["real"] = net.encode_real(data["real_raw"])
 
-                data = {
-                    key: to(value, dtype=self.precision) if key in self.state_fields else value
-                    for key, value in data.items()
-                }
-                data.update(
-                    net.build_conditioning(
-                        data,
-                        input_shape=self.input_shape,
-                        precision=self.precision,
-                    )
+            data = {
+                key: to(value, dtype=self.precision) if key in self.state_fields else value
+                for key, value in data.items()
+            }
+            data.update(
+                net.build_conditioning(
+                    data,
+                    input_shape=self.input_shape,
+                    precision=self.precision,
                 )
-                data.pop("real_raw", None)
-
-            # The builder runs after state placement/casting, so state it returns must already match both.
-            assert_same(
-                dtype=self.precision,
-                device=self.device,
-                **{key: data[key] for key in self.state_fields & data.keys()},
             )
+            data.pop("real_raw", None)
+
+        # The builder runs after state placement/casting, so state it returns must already match both.
+        assert_same(
+            dtype=self.precision,
+            device=self.device,
+            **{key: data[key] for key in self.state_fields & data.keys()},
+        )
 
         # Keep generic FSDP roots materialized across every VAE/text call in this
         # phase, then release them before the main network phase.
@@ -754,7 +757,12 @@ class FastGenModel(torch.nn.Module):
             Generated sample from the distilled single-step or multistep student.
         """
         device = get_device(noise)
-        with basic_utils.inference_mode(net, precision_amp=self.precision_amp_infer, device_type=device.type):
+        with basic_utils.eval_context(
+            net,
+            precision_amp=self.precision_amp_infer,
+            device_type=device.type,
+            inference_mode=self.config.inference,
+        ):
             student_grid = net.noise_scheduler.student_grid(device=device)
 
             # Initialize the state at the first student-grid node.
@@ -782,10 +790,11 @@ class FastGenModel(torch.nn.Module):
     ) -> TensorOrDict:
         """Run a network-owned sampler under model-owned inference autocast."""
         assert hasattr(net, "sample")
-        with basic_utils.inference_mode(
+        with basic_utils.eval_context(
             net,
             precision_amp=self.precision_amp_infer,
             device_type=get_device(noise).type,
+            inference_mode=self.config.inference,
         ):
             # Teacher sampling uses the network's own default integration policy.
             # SFTModel.generator_fn passes its student_sample_type explicitly.

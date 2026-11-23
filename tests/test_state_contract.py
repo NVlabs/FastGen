@@ -896,9 +896,9 @@ def test_vae_offload_validates_all_components_before_either_move(monkeypatch, du
         module_dict={"first": first, "second": second},
         device=torch.device("cpu"),
         precision_amp_enc=None,
+        config=SimpleNamespace(inference=False),
     )
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args: 0)
-    monkeypatch.setattr(callbacks.basic_utils, "inference_mode", lambda **kwargs: contextlib.nullcontext())
     if not during_decode:
         second.register_buffer("alias", second.cache)
     with pytest.raises(AssertionError, match="multiple distinct buffer slots"):

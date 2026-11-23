@@ -286,7 +286,7 @@ Expected shard contents:
 | `datatags` | Dataset paths prefixed with `WDS:`. Supports S3 (`WDS:s3://bucket/path`); S3 shard discovery requires `s5cmd` on `PATH`. |
 | `key_map` | Maps output keys to file extensions in shards. |
 | `files_map` | Maps output keys to file paths for constants (loaded once). A relative path resolves against the parent of the first datatag's directory, or against that directory itself if the tag ends in `/`. |
-| `presets_map` | Maps output keys to preset names: `neg_prompt_wan`, `neg_prompt_lingbot_world`, `neg_prompt_cosmos`, `neg_prompt_cosmos3`, `neg_prompt_ltx2`, `neg_prompt_ltx2_short`, `empty_string`. |
+| `presets_map` | Maps output keys to preset names: `neg_prompt_wan`, `neg_prompt_lingbot_world`, `neg_prompt_cosmos`, `neg_prompt_cosmos3`, `neg_prompt_ltx2`, `neg_prompt_ltx2_short`, `neg_prompt_kandinsky6`, `empty_string`. |
 | `presets_filter` | Filters applied before decoding, e.g. `{"score": {"threshold": 5.5, "score_key": "aesthetic_score"}, "empty_keys": {"keys": ["txt"]}}` drops items with an empty `txt` or a JSON `aesthetic_score` below 5.5 (items without a score are kept; invalid ones are dropped with a warning). |
 | `sequence_length` | Number of output frames for raw video loaders. With `target_fps` set on `decoder_type="segment"`, the sampled segment spans `sequence_length / target_fps` seconds. |
 | `target_fps` | Optional target FPS for `VideoWDSLoader` / `AudioVideoWDSLoader`; segment and full decoders resample source videos by timestamp before transforms. For `AudioVideoWDSLoader`, the audio slice is sized against `target_fps` (not the source FPS), keeping A/V aligned at the resampled rate. Set it to the network's frame rate (`config.model.net.fps`) unless the shards are already at that rate. |

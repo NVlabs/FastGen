@@ -1012,6 +1012,7 @@ class _InferenceModel:
     prepare_batch = FastGenModel.prepare_batch
 
     def __init__(self, net, input_shape):
+        self.config = SimpleNamespace(inference=True)
         self.net = net
         self.net_preprocessors = net
         self.input_shape = input_shape
@@ -1107,7 +1108,10 @@ def _patch_inference_runtime(monkeypatch, module, model, tmp_path, teacher_overr
 
 
 def _training_conditioning(model, data):
-    return model.prepare_batch(data)
+    from fastgen.utils.basic_utils import attr_override
+
+    with attr_override(model, "config.inference", False):
+        return model.prepare_batch(data)
 
 
 def _assert_default_or_explicit_steps(sample_call, sample_steps):
@@ -1876,6 +1880,8 @@ CASES = [
     InferenceCase("MiniMaxH3/config_sft.py", "video", multimodal=True),
     InferenceCase("MiniMaxH3/config_dmd2.py", "video", multimodal=True),
     InferenceCase("MiniMaxH3/config_sft.py", "video", "contextual_text", multimodal=True),
+    InferenceCase("Kandinsky6/config_dmd2_t2va.py", "video", multimodal=True),
+    InferenceCase("Kandinsky6/config_dmd2_i2va.py", "video", "i2v", multimodal=True),
     # CausVid owns the distilled multi-segment path; causal SFT uses its network sampler.
     InferenceCase("WanT2V/config_causvid.py", "video", extrapolate=True),
     InferenceCase("WanI2V/config_sft_causal_wan22_5b.py", "video", "i2v"),
@@ -2654,7 +2660,7 @@ def test_student_generator_uses_the_globally_resolved_default_steps():
 
     model = object.__new__(_StudentLoopHarness)
     torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(student_sample_type="ode")
+    model.config = SimpleNamespace(student_sample_type="ode", inference=False)
     model.precision_amp_infer = None
     net = RecordingNet()
     noise = torch.ones(2, 1)

@@ -10,7 +10,7 @@ from fastgen.networks.discriminators import (
     Discriminator_SDXL,
     Discriminator_ImageDiT,
     Discriminator_VideoDiT,
-    Discriminator_Audio2D,
+    Discriminator_AudioDiT,
     CompositeDiscriminator,
 )
 
@@ -79,22 +79,26 @@ Discriminator_QwenImage_Config: DictConfig = L(Discriminator_ImageDiT)(
     inner_dim=3072,  # 24 heads x 128 head_dim
 )
 
-# 2B patchify: spatial-2, temporal-1; inner_dim=1920; layer=30
+# 2B patchify: spatial-2, temporal-1; inner_dim=1920 on the token grid; layer=30
 Discriminator_CogVideoX2B_Config: DictConfig = L(Discriminator_VideoDiT)(
     feature_indices=None,
     num_blocks=30,
     disc_type="dit_simple_conv3d",
-    inner_dim=1920 // 4,
+    inner_dim=1920,
+    hidden_channels=240,
 )
 
-# 5B patchify: spatial-2, temporal-1; inner_dim=3072; layer=42
+# 5B patchify: spatial-2, temporal-1; inner_dim=3072 on the token grid; layer=42
 Discriminator_CogVideoX5B_Config: DictConfig = L(Discriminator_VideoDiT)(
     feature_indices=None,
     num_blocks=42,
     disc_type="dit_simple_conv3d",
-    inner_dim=3072 // 4,
+    inner_dim=3072,
+    hidden_channels=384,
 )
 
+# Wan splits each token's channels into its 2x2 patch positions by default, so its discriminators read
+# hidden // 4 channels; with the network's token_grid_features=True, set inner_dim to the full hidden width.
 # 1.3B patchify: spatial-2, temporal-1; inner_dim=1536; layer=30
 Discriminator_Wan_1_3B_Config: DictConfig = L(Discriminator_VideoDiT)(
     feature_indices=None,
@@ -127,8 +131,7 @@ Discriminator_LTX2_Config: DictConfig = L(Discriminator_VideoDiT)(
     inner_dim=4096,
 )
 
-# LTX-2 multimodal: video 3D disc (inner_dim=4096), audio 2D disc (inner_dim=128); layer=48
-# Audio inner_dim=128 because token dim 2048 unpacks to [B, 128, L, 16] (C=2048/M, M=mel_bins=16)
+# LTX-2 multimodal: video 3D disc on its 4096-wide tokens, audio temporal disc on its 2048-wide tokens; layer=48
 Discriminator_LTX2_Multimodal_Config: DictConfig = L(CompositeDiscriminator)(
     modality_discs={
         "video": L(Discriminator_VideoDiT)(
@@ -136,8 +139,25 @@ Discriminator_LTX2_Multimodal_Config: DictConfig = L(CompositeDiscriminator)(
             disc_type="dit_simple_conv3d",
             inner_dim=4096,
         ),
-        "audio": L(Discriminator_Audio2D)(
-            inner_dim=128,
+        "audio": L(Discriminator_AudioDiT)(
+            inner_dim=2048,
+            hidden_channels=256,
+        ),
+    },
+)
+
+# Kandinsky 6 Pro: video 3D disc on its 4096-wide patch tokens, audio temporal disc on its 2048-wide tokens;
+# 60 fused blocks
+Discriminator_Kandinsky6_Multimodal_Config: DictConfig = L(CompositeDiscriminator)(
+    modality_discs={
+        "video": L(Discriminator_VideoDiT)(
+            num_blocks=60,
+            disc_type="dit_simple_conv3d",
+            inner_dim=4096,
+        ),
+        "audio": L(Discriminator_AudioDiT)(
+            num_blocks=60,
+            inner_dim=2048,
             hidden_channels=256,
         ),
     },

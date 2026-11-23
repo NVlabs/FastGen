@@ -55,7 +55,7 @@ from tests.utils import RunIf, run_distributed_test
 from fastgen.utils.basic_utils import clear_gpu_memory
 from fastgen.utils.env import set_env_vars
 from fastgen.utils.tree_utils import to
-from fastgen.networks.network import FastGenModule
+from fastgen.networks.network import FastGenModule, FastGenNetwork
 from fastgen.methods.model import FastGenModel
 
 
@@ -2209,6 +2209,7 @@ def _preprocess_boundary_reshard_impl(rank: int, world_size: int) -> dict:
         state_fields = FastGenModel.state_fields
 
     model = TinyModel(
+        config=SimpleNamespace(inference=False),
         device=device,
         precision=torch.float32,
         precision_amp_enc=None,
@@ -4853,3 +4854,87 @@ def test_checkpointing_reshards_roots_left_unsharded_by_a_forward(tmp_path):
     )
     assert result is not None
     assert result["loaded"]
+
+
+class _PreviewLifecycleNet(FastGenNetwork):
+    """Small real sampler whose FSDP storage is first touched by a preview."""
+
+    def __init__(self):
+        from fastgen.networks.noise_schedule import StudentGridConfig
+
+        super().__init__(net_pred_type="flow", schedule_type="rf", student_grid_cfg=StudentGridConfig(steps=2))
+        self.proj = torch.nn.Linear(4, 4)
+
+    def forward(self, x_t, t, condition=None, fwd_pred_type=None, output_dtype="same"):
+        return self.transform_output(self.proj(x_t), x_t, t, condition, fwd_pred_type, output_dtype)
+
+    def sample(self, noise, **kwargs):
+        del kwargs
+        time = torch.full((len(noise),), 0.5, device=noise.device, dtype=self.noise_scheduler.t_precision)
+        return self(noise, time)
+
+    def init_vae(self):
+        pass
+
+
+def _preview_first_fsdp_impl(rank, world_size, entrypoint):
+    from fastgen.callbacks.wandb import vae_decode_context
+    from fastgen.methods.fine_tuning.sft import SFTModel
+    from fastgen.utils.guidance import GuidanceConfig
+
+    device = torch.device("cuda", rank)
+    mesh = init_device_mesh("cuda", (world_size,))
+    model = object.__new__(SFTModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(inference=False, student_sample_type="ode", guidance_cfg=GuidanceConfig())
+    model.device = device
+    model.precision_amp_infer = model.precision_amp_enc = None
+    model.use_ema = []
+    model.net = _PreviewLifecycleNet().to(device)
+    trainable = entrypoint in ("generator", "sft_generator")
+    component = torch.nn.Linear(4, 4).to(device) if entrypoint == "decode" else model.net
+    component.requires_grad_(trainable)
+    fully_shard(component, mesh=mesh, reshard_after_forward=True)
+    if entrypoint == "decode":
+        model.net.preprocessors["vae"] = component
+    inputs = torch.arange(8, device=device, dtype=torch.float32).reshape(2, 4) / 8
+    time = torch.full((2,), 0.5, device=device, dtype=model.net.noise_scheduler.t_precision)
+
+    def forward():
+        return component(inputs) if entrypoint == "decode" else component(inputs, time)
+
+    if entrypoint == "generator":
+        preview = FastGenModel.generator_fn(model, component, inputs)
+    elif entrypoint == "sft_generator":
+        preview = model.generator_fn(component, inputs)
+    elif entrypoint == "sample":
+        preview = model.sample(component, inputs)
+    else:
+        with vae_decode_context(model) as decoder:
+            preview = decoder(inputs)
+    assert not preview.requires_grad and torch.isfinite(preview).all()
+    component.reshard()
+    # The next training step or frozen teacher/codec call must reuse ordinary
+    # all-gather storage even when the first ever forward was a visualization.
+    with torch.enable_grad() if trainable else torch.no_grad():
+        actual = forward()
+        assert torch.isfinite(actual).all()
+        if trainable:
+            before = [parameter.to_local().detach().clone() for parameter in component.parameters()]
+            actual.square().mean().backward()
+            assert all(parameter.grad is not None for parameter in component.parameters())
+            assert all(torch.isfinite(parameter.grad.to_local()).all() for parameter in component.parameters())
+            assert sum(parameter.grad.to_local().square().sum() for parameter in component.parameters()) > 0
+            torch.optim.SGD(component.parameters(), lr=0.1).step()
+            assert any(
+                not torch.equal(previous, parameter.to_local())
+                for previous, parameter in zip(before, component.parameters())
+            )
+    return {"reused_after_preview": True, "trainable": trainable}
+
+
+@pytest.mark.parametrize("entrypoint", ["generator", "sft_generator", "sample", "decode"])
+@RunIf(min_gpus=2)
+def test_training_preview_first_fsdp_allows_later_forward(entrypoint):
+    result = run_distributed_test(test_fn=_preview_first_fsdp_impl, world_size=2, timeout=180, entrypoint=entrypoint)
+    assert result["reused_after_preview"]

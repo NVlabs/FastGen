@@ -122,7 +122,12 @@ class CausVidModel(CausalStudentSamplingMixin, DMD2Model):
             The concatenated video latents across all segments [B, C, num_segments*T - (num_segments-1)*overlap_frames, H, W].
         """
         logger.debug("Using generator_fn_extrapolation in CausVidModel")
-        with basic_utils.inference_mode(net, precision_amp=self.precision_amp_infer, device_type=noise.device.type):
+        with basic_utils.eval_context(
+            net,
+            precision_amp=self.precision_amp_infer,
+            device_type=noise.device.type,
+            inference_mode=self.config.inference,
+        ):
             if num_segments < 1:
                 raise ValueError("num_segments must be >= 1")
             if overlap_frames > 0:
@@ -245,7 +250,12 @@ class CausVidModel(CausalStudentSamplingMixin, DMD2Model):
 
                 # The VAE round trip re-encodes the overlap as the start of a new clip, under the encoder/decoder AMP
                 # policy rather than the surrounding sampler policy.
-                with basic_utils.inference_mode(vae, precision_amp=self.precision_amp_enc, device_type=device.type):
+                with basic_utils.eval_context(
+                    vae,
+                    precision_amp=self.precision_amp_enc,
+                    device_type=device.type,
+                    inference_mode=self.config.inference,
+                ):
                     overlap_latents = vae.reencode_overlap(segment_latents, overlap_frames)
 
                 # Compose the next segment latents with the re-encoded overlap and fresh noise

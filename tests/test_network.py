@@ -2586,7 +2586,7 @@ def test_flux_time_guidance_casts_anchor_on_model_input_dtype():
 
 
 def test_reference_parity_net_configs_sample_on_the_full_schedule():
-    """The BFL flux/flux2, Qwen-Image and LTX-2 reference samplers query the network at exactly t=1 on
+    """The BFL flux/flux2, Qwen-Image, LTX-2 and Kandinsky 6 samplers query the network at exactly t=1 on
     pure noise, so these net configs run the noise schedule up to ``max_t = 1.0`` (``min_t`` keeps the RF
     default 0.0). Training-time bounds stay explicit in every experiment config via ``sample_t_cfg``."""
     from fastgen.configs import net as net_configs
@@ -2606,6 +2606,7 @@ def test_reference_parity_net_configs_sample_on_the_full_schedule():
         "LTX2I2VConfig",
         "LTX2I2V_3_Config",
         "LTX2I2V_5_Config",
+        "Kandinsky6Config",
     ]
     for name in names:
         assert network_schedule_kwargs(getattr(net_configs, name))["max_t"] == 1.0, name
@@ -3129,6 +3130,21 @@ def test_cogvideox_rejects_temporally_patched_checkpoints(tmp_path):
         CogVideoX(str(tmp_path), load_pretrained=False, snr_shift_scale=1.0)
 
 
+def test_cogvideox_unpatchify_features_keep_token_channels_on_the_token_grid():
+    from fastgen.networks.CogVideoX.network import CogVideoX
+
+    network = object.__new__(CogVideoX)
+    torch.nn.Module.__init__(network)
+    network.transformer = SimpleNamespace(config=SimpleNamespace(patch_size=2))
+    tokens = torch.randn(2, 3 * 2 * 4, 8)  # [B, T * H/2 * W/2, D] for a [B, T, C, 4, 8] latent
+
+    features = network._unpatchify_features(torch.zeros(2, 3, 16, 4, 8), [tokens])
+
+    # All D channels stay channels on the [T, H/2, W/2] token grid.
+    expected = tokens.reshape(2, 3, 2, 4, 8).permute(0, 4, 1, 2, 3)
+    torch.testing.assert_close(features[0], expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("sdpa_no_cudnn", [True, False])
 def test_cogvideox_attention_runs_off_cudnn_sdpa_within_the_enclosing_backends(tmp_path, monkeypatch, sdpa_no_cudnn):
     """cuDNN's reduced-precision SDPA backward is non-finite for CogVideoX-2B, so ``sdpa_no_cudnn`` disables cuDNN for
@@ -3287,20 +3303,21 @@ def test_network_cogvideox():
     assert output.shape == x.shape
     assert logvar.shape == torch.Size([batch_size, 1])
 
+    # Features stay on the token grid: CogVideoX-2B's 1920 channels per 2x2 patch token.
+    expected_feature_shape = (batch_size, 1920, T, H // 2, W // 2)
+
     # return features, without early return
     output = teacher(x, t, condition=condition, return_features_early=False, feature_indices={0})
     assert output[0].shape == x.shape
     assert isinstance(output[1], list) and len(output[1]) == 1
     for feature in output[1]:
-        assert feature.shape == (batch_size, 480, T, H, W)
+        assert feature.shape == expected_feature_shape
 
     # return features, with early return
     output = teacher(x, t, condition=condition, return_features_early=True, feature_indices={0})
     assert isinstance(output, list) and len(output) == 1
     for feature in output:
-        # Feature shape should match the new tensor dimensions (original model channels)
-        expected_channels = 480  # Original CogVideoX channels
-        assert feature.shape == (batch_size, expected_channels, T, H, W)
+        assert feature.shape == expected_feature_shape
 
     # One-step sample() smoke (full guidance path; CogVideoX's per-step
     # ``attrs.evolve`` of guidance_cfg.cfg.scale runs through here; the
@@ -4726,6 +4743,7 @@ def test_wan_feature_output_contract_distinguishes_none_from_empty_set():
     network.transformer.norm_temb = False
     network._keep_original_prec = False
     network._sdpa_no_cudnn_blocks = None
+    network.token_grid_features = False
     network.override_transformer_forward()
     network.eval()
 
@@ -4755,6 +4773,29 @@ def test_wan_feature_output_contract_distinguishes_none_from_empty_set():
             features = output if return_features_early else output[1]
             assert len(features) == 2
             assert torch.equal(features[0], features[1])
+
+
+@pytest.mark.parametrize("token_grid_features", [False, True])
+def test_wan_unpatchify_features_split_patches_unless_token_grid_features(token_grid_features):
+    from fastgen.networks.Wan.network import Wan
+
+    network = object.__new__(Wan)
+    torch.nn.Module.__init__(network)
+    network.transformer = SimpleNamespace(config=SimpleNamespace(patch_size=(1, 2, 2)))
+    network.token_grid_features = token_grid_features
+    tokens = torch.randn(2, 3 * 2 * 4, 8)  # [B, T * H/2 * W/2, D] for a [B, C, 3, 4, 8] latent
+    grid = tokens.reshape(2, 3, 2, 4, 8)  # [B, T, H/2, W/2, D]
+
+    features = network._unpatchify_features(torch.zeros(2, 16, 3, 4, 8), [tokens])[0]
+
+    if token_grid_features:
+        # All D channels stay channels on the [T, H/2, W/2] token grid.
+        torch.testing.assert_close(features, grid.permute(0, 4, 1, 2, 3), atol=0, rtol=0)
+    else:
+        # The default reads D as (2, 2, D/4) patch positions: D/4 channels on the [T, H, W] latent grid, the
+        # third quarter of each token's channels at its patch's bottom-left position.
+        assert features.shape == (2, 2, 3, 4, 8)
+        torch.testing.assert_close(features[:, :, :, 1::2, 0::2], grid[..., 4:6].permute(0, 4, 1, 2, 3), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("per_token", [False, True])
@@ -9306,6 +9347,23 @@ def test_ltx2_forward_rejects_invalid_inputs_before_feature_early_exit():
         network([state], timestep, **early_features)
 
 
+def test_ltx2_unpatchify_features_keep_token_channels_on_real_axes():
+    from fastgen.networks.LTX2.network import LTX2
+
+    network = object.__new__(LTX2)
+    torch.nn.Module.__init__(network)
+    network.transformer_spatial_patch_size = network.transformer_temporal_patch_size = 1
+    video_tokens, audio_tokens = torch.randn(1, 2 * 3 * 4, 32), torch.randn(1, 5, 16)
+
+    joint = network._unpatchify_features(torch.zeros(1, 8, 2, 3, 4), [{"video": video_tokens, "audio": audio_tokens}])
+    # Token channels stay channels: video on its [F, H, W] token grid, audio on its time axis only.
+    expected_video = video_tokens.reshape(1, 2, 3, 4, 32).permute(0, 4, 1, 2, 3)
+    torch.testing.assert_close(joint[0]["video"], expected_video, atol=0, rtol=0)
+    torch.testing.assert_close(joint[0]["audio"], audio_tokens.transpose(1, 2), atol=0, rtol=0)
+    audio_only = network._unpatchify_features(None, [audio_tokens])
+    torch.testing.assert_close(audio_only[0], audio_tokens.transpose(1, 2), atol=0, rtol=0)
+
+
 def test_ltx2_sample_invalid_inputs_fail_in_downstream_contracts():
     from fastgen.networks.LTX2.network import LTX2
 
@@ -12892,7 +12950,7 @@ def test_cosmos3_rope_prefix_invariant_with_cuda_tf32():
 
 
 MINIMAX_H3_TRANSFORMER_FP32 = ["proj_in", "audio_proj_in", "time_embedder", "proj_out", "audio_proj_out", "rope"]
-MINIMAX_H3_VIDEO_VAE_FP32 = ["encoder", "decoder", "quant_conv", "post_quant_conv"]
+MINIMAX_H3_VIDEO_VAE_FP32 = ["encoder", "quant_conv", "norm1", "norm2", "norm_out", "scale1", "scale2"]
 MINIMAX_H3_AUDIO_VAE_FP32 = ["encoder", "decoder", "pre_block", "dec_in_proj", "mean_proj", "logs_proj"]
 
 
@@ -14378,8 +14436,8 @@ def test_minimax_h3_conditioner_honours_dtype():
     assert wrapper.text_encoder.a.weight.dtype == torch.float32
 
 
-def test_minimax_h3_unpatchify_features_round_trips_the_packed_sequence():
-    """The split is the exact inverse of the packing, for both modalities.
+def test_minimax_h3_unpatchify_features_keep_token_channels_on_the_token_grid():
+    """Each modality's rows return to their token grid with all of their channels.
 
     Built without ``__init__`` so no 62 GB conditioner or 50-block transformer is read.
     """
@@ -14433,9 +14491,14 @@ def test_minimax_h3_unpatchify_features_round_trips_the_packed_sequence():
 
     assert len(unpatchified) == 1
     assert set(unpatchified[0]) == {"video", "audio"}
-    # Video comes back on its latent grid, with the patch folded into the channel count.
-    torch.testing.assert_close(unpatchified[0]["video"], video)
-    assert unpatchified[0]["video"].shape == (batch, video_channels, frames, height, width)
+    # Video rows land on their frame-major, row-major token grid with all inner_dim channels.
+    grid = (frames // patch_size[0], height // patch_size[1], width // patch_size[2])
+    expected_video = video_rows.reshape(batch, *grid, inner_dim).permute(0, 4, 1, 2, 3)
+    torch.testing.assert_close(unpatchified[0]["video"], expected_video, atol=0, rtol=0)
+    assert unpatchified[0]["video"].shape == (batch, inner_dim, *grid)
+    # The token at grid cell (1, 0, 1) is the latent patch it was packed from.
+    patch = video[:, :, 1:2, 0:2, 2:4].flatten(1)
+    torch.testing.assert_close(unpatchified[0]["video"][:, :, 1, 0, 1], patch, atol=0, rtol=0)
     # Audio comes back the way the output head is unpacked.
     torch.testing.assert_close(unpatchified[0]["audio"], audio)
     assert unpatchified[0]["audio"].shape == (batch, inner_dim, 2, num_audio_latents)
@@ -15578,3 +15641,1073 @@ def test_wan_expanded_r_timestep_matches_the_per_sample_path(time_cond_type):
         per_sample = run(t, r)
         expanded = run(t[:, None].expand(-1, 8), r[:, None].expand(-1, 8))
     torch.testing.assert_close(expanded, per_sample, rtol=1e-5, atol=1e-5)
+
+
+# Kandinsky 6 contracts use small real transformers and optionally the native source.
+
+
+def _tiny_kandinsky6_config():
+    return dict(
+        in_visual_dim=4,
+        out_visual_dim=4,
+        in_audio_dim=6,
+        out_audio_dim=6,
+        in_text_dim=8,
+        in_text_dim2=6,
+        time_dim=16,
+        model_dim=32,
+        ff_dim=64,
+        model_dim_a=16,
+        time_dim_a=16,
+        ff_dim_a=32,
+        num_text_blocks=1,
+        num_visual_blocks=1,
+        axes_dims=(4, 4, 8),
+        axes_dims_a=(4, 4, 8),
+        visual_cond=True,
+        text_token_padding=True,
+        ca_rope=True,
+        cross_gates=True,
+        fix_modulation=True,
+        visual_token_type_num_embeddings=2,
+        audio_freqs_scaling=0.144,
+        scale_factor=(1.0, 2.0, 2.0),
+    )
+
+
+def _tiny_kandinsky6_network(
+    tmp_path, audio=True, image=False, precision=torch.float32, checkpointing=False, device="cpu", **config
+):
+    from diffusers.models.transformers.transformer_kandinsky6 import Kandinsky6Transformer3DModel
+    from fastgen.networks.Kandinsky6.network import Kandinsky6
+
+    torch.manual_seed(613)
+    transformer = Kandinsky6Transformer3DModel(**(_tiny_kandinsky6_config() | config))
+    transformer.save_pretrained(tmp_path / "transformer")
+    net = Kandinsky6(
+        str(tmp_path),
+        modalities=("video", "audio") if audio else ("video",),
+        image_conditioned=image,
+        gradient_checkpointing=checkpointing,
+        student_grid_cfg=StudentGridConfig(steps=4, grid_type="native", grid_kwargs={"shift": 5.0}),
+    )
+    net.prepare_module(device, precision_model=precision, precision_opt=torch.float32, trainable=True)
+    return net
+
+
+def _kandinsky6_inputs(audio=True, image=False, precision=torch.float32, batch_size=1, device="cpu"):
+    generator = torch.Generator().manual_seed(614)
+    video = torch.randn(batch_size, 4, 3, 4, 4, generator=generator, dtype=precision).to(device).requires_grad_()
+    state = {
+        "video": video,
+        "audio": torch.randn(batch_size, 6, 5, generator=generator, dtype=precision).to(device).requires_grad_(),
+    }
+    text = (
+        torch.randn(batch_size, 3, 8, generator=generator, dtype=precision).to(device),
+        torch.randn(batch_size, 6, generator=generator, dtype=precision).to(device),
+        torch.tensor([[True, True, False]], device=device).expand(batch_size, -1).clone(),
+    )
+    reference = torch.randn(batch_size, 4, 1, 4, 4, generator=generator, dtype=precision).to(device).requires_grad_()
+    condition = {"text": text, "reference_latents": reference} if image else text
+    return state if audio else video, condition
+
+
+@pytest.mark.parametrize("device_type", ["cpu", pytest.param("cuda", marks=RunIf(min_gpus=1))])
+@pytest.mark.parametrize("width", [32, 1536])
+@pytest.mark.parametrize(
+    ("affine", "input_dtype"), [(True, torch.bfloat16), (False, torch.bfloat16), (False, torch.float32)]
+)
+def test_kandinsky6_layernorm_preserves_native_rounding_under_autocast(device_type, width, affine, input_dtype):
+    from fastgen.networks.Kandinsky6.precision import NativeLayerNorm
+
+    if device_type == "cuda" and not torch.cuda.is_bf16_supported():
+        pytest.skip("Kandinsky 6 requires native BF16 execution")
+    generator = torch.Generator().manual_seed(617)
+    reference = torch.nn.LayerNorm(width, elementwise_affine=affine).to(device=device_type, dtype=torch.bfloat16)
+    candidate = NativeLayerNorm(width, elementwise_affine=affine).to(device=device_type, dtype=torch.float32)
+    if affine:
+        with torch.no_grad():
+            reference.weight.copy_((1 + 0.15 * torch.randn(width, generator=generator)).to(device_type))
+            reference.bias.copy_((0.1 * torch.randn(width, generator=generator)).to(device_type))
+        candidate.load_state_dict(reference.state_dict())
+        assert all(parameter.dtype == torch.float32 for parameter in candidate.parameters())
+        for actual, native in zip(candidate.parameters(), reference.parameters()):
+            torch.testing.assert_close(actual, native.float(), atol=0, rtol=0)
+    values = torch.randn(2, 7, width, generator=generator).to(device=device_type, dtype=input_dtype)
+    native_input = values.detach().clone().requires_grad_()
+    actual_input = values.detach().clone().requires_grad_()
+    # Native text-embedding norms execute without autocast. The following
+    # block deliberately normalizes in FP32 after the BF16 text boundary.
+    with torch.autocast(device_type, enabled=False):
+        expected = reference(native_input)
+        expected_next = torch.nn.functional.layer_norm(expected.float(), (width,))
+    with torch.autocast(device_type, dtype=torch.bfloat16):
+        actual = candidate(actual_input)
+        actual_next = torch.nn.functional.layer_norm(actual.float(), (width,))
+    assert actual.dtype == expected.dtype == input_dtype
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(actual_next, expected_next, atol=0, rtol=0)
+    upstream = torch.randn(2, 7, width, generator=generator).to(device_type)
+    actual_inputs = [actual_input, *candidate.parameters()]
+    native_inputs = [native_input, *reference.parameters()]
+    gradients = torch.autograd.grad((actual_next * upstream).sum(), actual_inputs)
+    expected_gradients = torch.autograd.grad((expected_next * upstream).sum(), native_inputs)
+    for index, (actual_gradient, expected_gradient) in enumerate(zip(gradients, expected_gradients)):
+        if index:
+            assert actual_gradient.dtype == torch.float32
+        torch.testing.assert_close(actual_gradient.float(), expected_gradient.float(), atol=0, rtol=0)
+        assert torch.isfinite(actual_gradient).all() and actual_gradient.abs().sum() > 0
+
+
+@pytest.mark.parametrize("audio", [False, True])
+@pytest.mark.parametrize("image", [False, True])
+def test_kandinsky6_tail_conditioning_and_shared_time_contract(tmp_path, audio, image):
+    net = _tiny_kandinsky6_network(tmp_path, audio=audio, image=image)
+    state, condition = _kandinsky6_inputs(audio, image)
+    video = state["video"] if audio else state
+    saved = video.detach().clone()
+    observed = []
+    hook = net.transformer.register_forward_pre_hook(
+        lambda module, args, kwargs: observed.append(kwargs), with_kwargs=True
+    )
+    time = torch.tensor([0.417], dtype=net.noise_scheduler.t_precision)
+    result = net(state, time, condition, fwd_pred_type="flow", output_dtype=None)
+    hook.remove()
+    arguments = observed[0]
+    expected_video = video.permute(0, 2, 3, 4, 1)
+    if image:
+        expected_video = torch.cat((expected_video, condition["reference_latents"].permute(0, 2, 3, 4, 1)), dim=1)
+    packed = arguments["hidden_states"]
+    torch.testing.assert_close(packed[..., :4], expected_video)
+    assert torch.count_nonzero(packed[..., 4:8]) == 0
+    mask = torch.zeros_like(packed[..., -1])
+    if image:
+        mask[:, -1] = 1
+    torch.testing.assert_close(packed[..., -1], mask)
+    torch.testing.assert_close(arguments["timestep"], (time * 1000).float())
+    if image:
+        assert arguments["visual_token_type_ids"].tolist() == [[0, 0, 0, 1]]
+        assert arguments["visual_rope_pos"][0].tolist() == [0, 1, 2, 0]
+    if audio:
+        torch.testing.assert_close(arguments["audio_hidden_states"], state["audio"].transpose(1, 2))
+        assert set(result) == {"video", "audio"}
+        assert result["audio"].shape == state["audio"].shape
+        result_video = result["video"]
+    else:
+        assert arguments.get("audio_hidden_states") is None
+        result_video = result
+    assert result_video.shape == video.shape
+    torch.testing.assert_close(video, saved, atol=0, rtol=0)
+    if image:
+        # K6 generates its first frame; the reference is a separate clean tail token.
+        clean = net(state, time, condition, fwd_pred_type="x0", output_dtype=None)
+        clean_video = clean["video"] if audio else clean
+        assert not torch.equal(clean_video[:, :, :1], condition["reference_latents"])
+
+
+@pytest.mark.parametrize("audio", [False, True])
+def test_kandinsky6_standard_forward_controls(tmp_path, monkeypatch, audio):
+    net = _tiny_kandinsky6_network(tmp_path, audio=audio)
+    state, condition = _kandinsky6_inputs(audio=audio)
+    time = torch.tensor([0.417], dtype=net.noise_scheduler.t_precision)
+    expected = net(state, time, condition)
+    actual = net(state, time, condition, r=None, return_features_early=False, feature_indices=None, return_logvar=False)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    output, features = net(state, time, condition, feature_indices=set())
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert features == []
+
+    def unexpected_forward(*args, **kwargs):
+        raise AssertionError("Unsupported controls must fail before transformer execution")
+
+    monkeypatch.setattr(net.transformer, "forward", unexpected_forward)
+    assert net(state, time, condition, feature_indices=set(), return_features_early=True) == []
+    for kwargs, error in (
+        ({"r": time}, NotImplementedError),
+        ({"feature_indices": {1}}, ValueError),
+        ({"return_features_early": True}, ValueError),
+        ({"return_logvar": True}, NotImplementedError),
+        ({"unknown_control": True}, TypeError),
+    ):
+        with pytest.raises(error):
+            net(state, time, condition, **kwargs)
+
+
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_kandinsky6_joint_outputs_have_cross_modal_gradients(tmp_path, checkpointing):
+    net = _tiny_kandinsky6_network(tmp_path, image=True, checkpointing=checkpointing)
+    state, condition = _kandinsky6_inputs(image=True)
+    time = torch.tensor([0.63], dtype=net.noise_scheduler.t_precision)
+    output = net(state, time, condition, output_dtype=None)
+    for key, other in (("video", "audio"), ("audio", "video")):
+        gradients = torch.autograd.grad(
+            output[key].float().square().mean(),
+            (state[key], state[other], condition["reference_latents"]),
+            retain_graph=True,
+        )
+        assert all(torch.isfinite(gradient).all() and gradient.abs().sum() > 0 for gradient in gradients)
+    sum(value.float().square().mean() for value in output.values()).backward()
+    for head in (net.transformer.out_layer.out_layer, net.transformer.audio_out_layer.out_layer):
+        assert head.weight.grad is not None and head.weight.grad.abs().sum() > 0
+        assert torch.isfinite(head.weight.grad).all()
+
+
+@pytest.mark.parametrize("audio", [False, True])
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_kandinsky6_features_are_fused_block_outputs_without_changing_the_prediction(tmp_path, audio, checkpointing):
+    net = _tiny_kandinsky6_network(tmp_path, audio=audio, image=True, checkpointing=checkpointing, num_visual_blocks=2)
+    state, condition = _kandinsky6_inputs(audio=audio, image=True)
+    time = torch.tensor([0.42], dtype=net.noise_scheduler.t_precision)
+    blocks = []
+    hook = net.transformer.visual_transformer_blocks[1].register_forward_hook(
+        lambda module, args, output: blocks.append(output)
+    )
+    expected = net(state, time, condition, output_dtype=None)
+    output, features = net(state, time, condition, feature_indices={1, 0}, output_dtype=None)
+    early = net(state, time, condition, return_features_early=True, feature_indices={0})
+    hook.remove()
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    assert len(features) == 2 and len(early) == 1
+    video, audio_tokens = blocks[-1] if audio else (blocks[-1][0], None)
+    last = features[1]["video"] if audio else features[1]
+    # Video tokens unpatchify to [B, C, T, H, W] without the reference tail frame.
+    assert last.shape == (1, 32, 3, 2, 2)
+    torch.testing.assert_close(last, video.reshape(1, 4, 2, 2, 32)[:, :3].permute(0, 4, 1, 2, 3), atol=0, rtol=0)
+    first = features[0]["video"] if audio else features[0]
+    torch.testing.assert_close(early[0]["video"] if audio else early[0], first, atol=0, rtol=0)
+    if audio:
+        # Audio tokens, one per time step, keep their channels and only the time axis: [B, C, L].
+        assert features[1]["audio"].shape == (1, 16, 5)
+        torch.testing.assert_close(features[1]["audio"], audio_tokens.transpose(1, 2), atol=0, rtol=0)
+    # The GAN generator loss differentiates the features with respect to the generated state.
+    target = sum(value.float().square().mean() for value in (features[1].values() if audio else [features[1]]))
+    gradients = torch.autograd.grad(target, [state["video"], state["audio"]] if audio else [state])
+    assert all(torch.isfinite(gradient).all() and gradient.abs().sum() > 0 for gradient in gradients)
+
+
+def test_kandinsky6_padding_mask_prevents_padded_text_from_affecting_predictions(tmp_path):
+    net = _tiny_kandinsky6_network(tmp_path)
+    state, condition = _kandinsky6_inputs()
+    changed = (condition[0].clone(), condition[1], condition[2])
+    changed[0][:, -1] = 1000
+    time = torch.tensor([0.41], dtype=net.noise_scheduler.t_precision)
+    expected = net(state, time, condition, output_dtype=None)
+    actual = net(state, time, changed, output_dtype=None)
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], atol=1e-6, rtol=1e-6)
+
+
+@pytest.fixture
+def kandinsky6_native_core(monkeypatch):
+    """Load the untouched optional reference core without its unrelated SR pipeline."""
+    import sys
+    from pathlib import Path
+    from types import ModuleType
+
+    root = os.environ.get("KANDINSKY6_REFERENCE_ROOT")
+    if not root:
+        pytest.skip("Set KANDINSKY6_REFERENCE_ROOT to a pinned official kandinsky-6 checkout")
+    package_root = Path(root) / "kandinsky"
+    if not (package_root / "core/components/dit.py").is_file():
+        pytest.fail("KANDINSKY6_REFERENCE_ROOT lacks the official native DiT")
+    # The package __init__ imports optional super-resolution dependencies. The
+    # core classes below are imported unchanged, including native SDPA and RoPE.
+    package = ModuleType("kandinsky")
+    package.__path__ = [str(package_root)]
+    previous_modules = set(sys.modules)
+    monkeypatch.setitem(sys.modules, "kandinsky", package)
+    try:
+        yield importlib.import_module("kandinsky.core.components.dit")
+    finally:
+        for name in set(sys.modules) - previous_modules:
+            if name.startswith("kandinsky."):
+                del sys.modules[name]
+
+
+@pytest.mark.parametrize("device_type", ["cpu", pytest.param("cuda", marks=RunIf(min_gpus=1))])
+@pytest.mark.parametrize("precision", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("audio", [False, True])
+@pytest.mark.parametrize("image", [False, True])
+def test_kandinsky6_matches_independent_native_denoiser_and_input_gradients(
+    tmp_path, kandinsky6_native_core, record_property, request, precision, audio, image, device_type
+):
+    if device_type == "cuda":
+        if precision == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            pytest.skip("Kandinsky 6 requires native BF16 execution")
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        request.addfinalizer(lambda: setattr(torch.backends.cuda.matmul, "allow_tf32", previous_tf32))
+        torch.backends.cuda.matmul.allow_tf32 = False
+    native_module = kandinsky6_native_core
+    net = _tiny_kandinsky6_network(tmp_path, audio=audio, image=image, precision=precision, device=device_type)
+    assert all(parameter.dtype == torch.float32 for parameter in net.parameters())
+    config = _tiny_kandinsky6_config()
+    scale = config.pop("scale_factor")
+    reference = native_module.DiffusionTransformer3D(**config, is_multimodal=True, attention_engine="sdpa")
+    reference.load_state_dict(
+        {name: value.to(precision) for name, value in net.transformer.state_dict().items()}, strict=True, assign=True
+    )
+    reference.to(device_type)
+    state, condition = _kandinsky6_inputs(audio, image, precision, device=device_type)
+    text = condition["text"] if image else condition
+    video = state["video"] if audio else state
+    video_native = video.detach().clone().requires_grad_()
+    audio_native = state["audio"].detach().clone().requires_grad_() if audio else None
+    ref_native = condition["reference_latents"].detach().clone().requires_grad_() if image else None
+    hidden = video_native.permute(0, 2, 3, 4, 1)
+    if image:
+        hidden = torch.cat((hidden, ref_native.permute(0, 2, 3, 4, 1)), dim=1)
+    mask = torch.zeros_like(hidden[..., :1])
+    if image:
+        mask[:, -1] = 1
+    hidden = torch.cat((hidden, torch.zeros_like(hidden), mask), dim=-1)
+    time = torch.tensor([0.417], device=device_type, dtype=net.noise_scheduler.t_precision)
+    positions = [
+        torch.tensor([0, 1, 2, 0], device=device_type) if image else torch.arange(3, device=device_type),
+        torch.arange(2, device=device_type),
+        torch.arange(2, device=device_type),
+    ]
+    role = torch.tensor([[0, 0, 0, 1]], device=device_type) if image else None
+    expected = reference(
+        x_video=hidden,
+        x_audio=audio_native.transpose(1, 2).contiguous() if audio else None,
+        text_embed=text[0],
+        pooled_text_embed=text[1],
+        time=(time * 1000).float(),
+        visual_rope=reference.visual_rope((len(positions[0]), 2, 2), positions, scale),
+        audio_rope=reference.audio_rope(torch.arange(5, device=device_type)) if audio else None,
+        text_rope=[
+            reference.video_text_rope(torch.arange(3, device=device_type)),
+            reference.audio_text_rope(torch.arange(3, device=device_type)),
+        ],
+        attention_mask=text[2],
+        visual_token_type_ids=role,
+    )
+    native_video, native_audio = expected if audio else (expected, None)
+    expected_values = [native_video[:, :3].permute(0, 4, 1, 2, 3)]
+    if audio:
+        expected_values.append(native_audio.transpose(1, 2))
+    actual = net(state, time, condition, output_dtype=None)
+    actual_values = [actual["video"], actual["audio"]] if audio else [actual]
+    atol, rtol = (4e-3, 1.5e-2) if precision == torch.bfloat16 else (2e-6, 2e-5)
+    for index, (value, expected_value) in enumerate(zip(actual_values, expected_values)):
+        difference = value.float() - expected_value.float()
+        record_property(f"output_{index}_relative_l2", (difference.norm() / expected_value.float().norm()).item())
+        record_property(f"output_{index}_max_abs", difference.abs().max().item())
+        torch.testing.assert_close(value.float(), expected_value.float(), atol=atol, rtol=rtol)
+    actual_inputs = [video] + ([state["audio"]] if audio else []) + ([condition["reference_latents"]] if image else [])
+    native_inputs = [video_native] + ([audio_native] if audio else []) + ([ref_native] if image else [])
+    gradients = torch.autograd.grad(sum(value.float().square().mean() for value in actual_values), actual_inputs)
+    expected_gradients = torch.autograd.grad(
+        sum(value.float().square().mean() for value in expected_values), native_inputs
+    )
+    for index, (gradient, expected_gradient) in enumerate(zip(gradients, expected_gradients)):
+        difference = gradient.float() - expected_gradient.float()
+        record_property(f"gradient_{index}_relative_l2", (difference.norm() / expected_gradient.float().norm()).item())
+        record_property(f"gradient_{index}_max_abs", difference.abs().max().item())
+        assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
+        torch.testing.assert_close(gradient.float(), expected_gradient.float(), atol=atol, rtol=rtol)
+
+
+def test_kandinsky6_meta_reset_preserves_nonpersistent_buffers_and_rng(tmp_path):
+    from fastgen.networks.Kandinsky6.network import Kandinsky6
+    from fastgen.utils.module import materialize_meta_module
+
+    reference = _tiny_kandinsky6_network(tmp_path, precision=torch.bfloat16)
+    with torch.device("meta"):
+        meta = Kandinsky6(str(tmp_path), load_pretrained=False)
+    meta._set_precision(torch.bfloat16, torch.float32)
+    rng_before = torch.get_rng_state().clone()
+    materialize_meta_module(meta, "cpu")
+    torch.testing.assert_close(torch.get_rng_state(), rng_before, atol=0, rtol=0)
+    expected_buffers = dict(reference.named_buffers())
+    actual_buffers = dict(meta.named_buffers())
+    assert actual_buffers.keys() == expected_buffers.keys()
+    for name, actual in actual_buffers.items():
+        expected = expected_buffers[name]
+        assert actual.dtype == expected.dtype
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    identities = {name: id(value) for name, value in actual_buffers.items()}
+    meta.reset_parameters()
+    assert identities == {name: id(value) for name, value in meta.named_buffers()}
+    torch.testing.assert_close(torch.get_rng_state(), rng_before, atol=0, rtol=0)
+    assert meta.state_dict().keys() == reference.state_dict().keys()
+
+
+def test_kandinsky6_fp32_storage_does_not_change_native_bf16_time_arithmetic(tmp_path):
+    from fastgen.networks.Kandinsky6.precision import NativeModulation, NativeTimeEmbeddings
+
+    net = _tiny_kandinsky6_network(tmp_path, precision=torch.bfloat16)
+    modules = [module for module in net.modules() if isinstance(module, (NativeTimeEmbeddings, NativeModulation))]
+    assert modules and all(parameter.dtype == torch.float32 for parameter in net.parameters())
+    for module in modules:
+        if isinstance(module, NativeTimeEmbeddings):
+            value = torch.tensor([417.125], dtype=torch.float32)
+            mlp = module.timestep_embedder
+            dimension = mlp.linear_1.in_features // 2
+            frequencies = torch.exp(-math.log(10000.0) * torch.arange(dimension).float() / dimension)
+            arguments = value[:, None] * frequencies[None]
+            embedding = torch.cat((arguments.cos(), arguments.sin()), dim=-1)
+            hidden = F.linear(embedding, mlp.linear_1.weight.bfloat16().float(), mlp.linear_1.bias.bfloat16().float())
+            expected = F.linear(
+                F.silu(hidden), mlp.linear_2.weight.bfloat16().float(), mlp.linear_2.bias.bfloat16().float()
+            ).bfloat16()
+        else:
+            value = torch.randn(1, module.out_layer.in_features).bfloat16()
+            expected = F.linear(
+                F.silu(value.float()),
+                module.out_layer.weight.bfloat16().float(),
+                module.out_layer.bias.bfloat16().float(),
+            ).bfloat16()
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual = module(value)
+        assert actual.dtype == torch.bfloat16
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        actual.float().square().mean().backward()
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in module.parameters()
+        )
+
+
+@pytest.mark.parametrize("method", ["sft", "dmd2"])
+@pytest.mark.parametrize("image", [False, True])
+def test_kandinsky6_joint_training_updates_both_modalities(tmp_path, method, image):
+    from fastgen.configs.config import SampleTConfig
+    from fastgen.configs.methods.config_dmd2 import ModelConfig as DMD2Config
+    from fastgen.configs.methods.config_sft import ModelConfig as SFTConfig
+    from fastgen.methods.distribution_matching.dmd2 import DMD2Model
+    from fastgen.methods.fine_tuning.sft import SFTModel
+
+    net = _tiny_kandinsky6_network(tmp_path, image=image)
+    state, condition = _kandinsky6_inputs(image=image)
+    model_type, config_type = (SFTModel, SFTConfig) if method == "sft" else (DMD2Model, DMD2Config)
+    model = object.__new__(model_type)
+    torch.nn.Module.__init__(model)
+    model.config = config_type()
+    model.config.sample_t_cfg = SampleTConfig(time_dist_type="shifted", shift=5.0, min_t=0.1, max_t=0.8)
+    model.config.student_sample_type = "ode"
+    model.config.guidance_cfg = GuidanceConfig()
+    model.config.guidance_cfg.cfg.scale = 5.0
+    model.net = net
+    model.device = torch.device("cpu")
+    model.precision = torch.float32
+    model.precision_amp_infer = None
+    model.use_ema = []
+    model.input_shape = {name: list(value.shape[1:]) for name, value in state.items()}
+    text = condition["text"] if image else condition
+    negative_text = (torch.zeros_like(text[0]), torch.zeros_like(text[1]), text[2])
+    negative = {**condition, "text": negative_text} if image else negative_text
+    data = {"idx": [0], "condition": condition, "neg_condition": negative}
+    if method == "sft":
+        model.config.cond_dropout_prob = None
+        data["real"] = {name: value.detach() for name, value in state.items()}
+        phases = [(0, model.net, "dsm_loss")]
+    else:
+        model.config.student_update_freq = 5
+        model.config.gan_loss_weight_gen = 0.0
+        model.config.fake_score_weighting = "native"
+        model.config.backward_simulation = "default"
+        model.teacher = copy.deepcopy(net).requires_grad_(False)
+        model.fake_score = copy.deepcopy(net)
+        with torch.no_grad():
+            model.fake_score.transformer.out_layer.out_layer.bias.add_(0.05)
+            model.fake_score.transformer.audio_out_layer.out_layer.bias.add_(0.05)
+        phases = [(1, model.fake_score, "fake_score_loss"), (5, model.net, "vsd_loss")]
+    for iteration, trainable, suffix in phases:
+        model.zero_grad(set_to_none=True)
+        before = {name: parameter.detach().clone() for name, parameter in trainable.named_parameters()}
+        loss_map, _ = model.single_train_step(data, iteration)
+        assert all(f"{modality}_{suffix}" in loss_map for modality in ("video", "audio"))
+        assert torch.isfinite(loss_map["total_loss"]) and loss_map["total_loss"].requires_grad
+        loss_map["total_loss"].backward()
+        optimizer = torch.optim.Adam(trainable.parameters(), lr=5e-6)
+        for head_name in ("out_layer", "audio_out_layer"):
+            head = getattr(trainable.transformer, head_name).out_layer
+            assert head.weight.grad is not None and head.weight.grad.abs().sum() > 0
+            assert torch.isfinite(head.weight.grad).all()
+        optimizer.step()
+        assert any(not torch.equal(parameter, before[name]) for name, parameter in trainable.named_parameters())
+        if method == "dmd2":
+            assert all(parameter.grad is None for parameter in model.teacher.parameters())
+
+
+@pytest.mark.parametrize("image", [False, True])
+def test_kandinsky6_dmd2_gan_trains_through_both_modalities_teacher_features(tmp_path, image):
+    from fastgen.configs.config import SampleTConfig
+    from fastgen.configs.instantiate import LazyCall as L
+    from fastgen.configs.methods.config_dmd2 import ModelConfig as DMD2Config
+    from fastgen.methods.distribution_matching.dmd2 import DMD2Model
+    from fastgen.networks.discriminators import CompositeDiscriminator, Discriminator_AudioDiT, Discriminator_VideoDiT
+
+    net = _tiny_kandinsky6_network(tmp_path, image=image, num_visual_blocks=2)
+    state, condition = _kandinsky6_inputs(image=image)
+    model = object.__new__(DMD2Model)
+    torch.nn.Module.__init__(model)
+    model.config = DMD2Config(
+        sample_t_cfg=SampleTConfig(time_dist_type="shifted", shift=5.0, min_t=0.1, max_t=0.8),
+        student_sample_type="ode",
+        student_update_freq=5,
+        gan_loss_weight_gen=0.03,
+        gan_use_same_t_noise=True,
+        backward_simulation="default",
+    )
+    model.config.guidance_cfg.cfg.scale = 5.0
+    model.net, model.device, model.precision, model.precision_amp_infer, model.use_ema = (
+        net,
+        torch.device("cpu"),
+        torch.float32,
+        None,
+        [],
+    )
+    model.input_shape = {name: list(value.shape[1:]) for name, value in state.items()}
+    model.teacher = copy.deepcopy(net).requires_grad_(False)
+    model.fake_score = copy.deepcopy(net)
+    # The tiny 32/16-wide tokens unpack to [B, 32, T, H, W] video and [B, 16, L] audio features.
+    model.discriminator = CompositeDiscriminator(
+        modality_discs={
+            "video": L(Discriminator_VideoDiT)(num_blocks=2, disc_type="dit_simple_conv3d", inner_dim=32),
+            "audio": L(Discriminator_AudioDiT)(num_blocks=2, inner_dim=16, hidden_channels=8),
+        },
+        feature_indices={0, 1},
+    )
+    text = condition["text"] if image else condition
+    negative_text = (torch.zeros_like(text[0]), torch.zeros_like(text[1]), text[2])
+    data = {
+        "idx": [0],
+        "condition": condition,
+        "neg_condition": {**condition, "text": negative_text} if image else negative_text,
+        "real": {name: value.detach() for name, value in state.items()},
+    }
+    # The discriminator learns from its loss, and the generator loss reaches the student through the frozen
+    # teacher's features (T2VA leaves the token-type embedding unused).
+    for iteration, trainable, loss_name in ((1, model.discriminator, "gan_loss_disc"), (5, model.net, "gan_loss_gen")):
+        loss_map, _ = model.single_train_step(data, iteration)
+        assert torch.isfinite(loss_map[loss_name]) and loss_map[loss_name].requires_grad
+        parameters = [parameter for parameter in trainable.parameters() if parameter.requires_grad]
+        gradients = [
+            gradient
+            for gradient in torch.autograd.grad(loss_map[loss_name], parameters, allow_unused=True)
+            if gradient is not None
+        ]
+        assert gradients and all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert sum(gradient.abs().sum() for gradient in gradients) > 0
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("image", [False, True])
+def test_kandinsky6_condition_builder_keeps_cfg_reference_and_boolean_padding(tmp_path, cached, image):
+    net = _tiny_kandinsky6_network(tmp_path, image=image, precision=torch.bfloat16)
+    _, condition = _kandinsky6_inputs(image=image)
+    text = condition["text"] if image else condition
+    calls = []
+
+    class TextEncoder(torch.nn.Module):
+        def encode(self, prompts):
+            calls.append(("text", prompts))
+            return text
+
+    class VAE(torch.nn.Module):
+        def encode_video(self, value):
+            calls.append(("image", value))
+            return condition["reference_latents"]
+
+    net.preprocessors["text_encoder"] = TextEncoder()
+    net.preprocessors["vae"] = VAE()
+    data = {"condition_raw": ["positive"], "neg_condition_raw": ["negative"]}
+    if cached:
+        data.update(condition=text, neg_condition=text)
+    if image:
+        data["condition_image" if cached else "condition_image_raw"] = (
+            condition["reference_latents"] if cached else torch.zeros(1, 3, 32, 32)
+        )
+    result = net.build_conditioning(data, precision=torch.float32)
+    assert set(result) == {"condition", "neg_condition"}
+    assert sum(name == "text" for name, _ in calls) == (0 if cached else 2)
+    assert sum(name == "image" for name, _ in calls) == int(image and not cached)
+    for branch in result.values():
+        assert branch["text"][0].dtype == branch["text"][1].dtype == torch.bfloat16
+        assert branch["text"][2].dtype == torch.bool
+        torch.testing.assert_close(branch["text"][2], text[2])
+        if image:
+            assert branch["reference_latents"].dtype == torch.float32
+            torch.testing.assert_close(branch["reference_latents"], condition["reference_latents"])
+    if image:
+        assert result["condition"]["reference_latents"] is result["neg_condition"]["reference_latents"]
+        from fastgen.configs.methods.config_sft import ModelConfig
+        from fastgen.methods.fine_tuning.sft import SFTModel
+
+        model = object.__new__(SFTModel)
+        torch.nn.Module.__init__(model)
+        model.net = net
+        model.device = torch.device("cpu")
+        model.config = ModelConfig(cond_dropout_prob=1.0, cond_keys_no_dropout=["reference_latents"])
+        negative = {**result["neg_condition"], "text": tuple(torch.zeros_like(x) for x in result["condition"]["text"])}
+        mixed, dropped = model._mix_condition(result["condition"], negative)
+        assert dropped.all()
+        assert mixed["reference_latents"] is result["condition"]["reference_latents"]
+        assert not mixed["text"][0].any()
+    with pytest.raises(ValueError, match="rich.*mapping"):
+        net.build_conditioning(result)
+
+
+def test_kandinsky6_shape_inference_uses_decoded_video_duration(tmp_path):
+    net = _tiny_kandinsky6_network(tmp_path)
+    assert net.infer_shape({"video": [16, 31, 60, 108], "audio": None}) == {
+        "video": [16, 31, 60, 108],
+        "audio": [40, 218],
+    }
+    assert net.infer_shape({"video": [16, 1, 60, 108], "audio": None})["audio"] == [40, 2]
+    with pytest.raises(ValueError, match="duration"):
+        net.infer_shape({"video": [16, 31, 60, 108], "audio": [40, 217]})
+    with pytest.raises(ValueError, match="video and audio"):
+        net.infer_shape({"video": [16, 31, 60, 108]})
+
+
+def test_kandinsky6_joint_encoding_substitutes_silence_for_clips_without_audio(tmp_path):
+    net = _tiny_kandinsky6_network(tmp_path)
+    encoded = []
+
+    class VAE(torch.nn.Module):
+        def encode(self, data):
+            encoded.append(data)
+            return data
+
+    net.preprocessors["vae"] = VAE()
+    video, audio = torch.randn(1, 3, 121, 8, 8), torch.randn(1, 2, 222337)
+    net.encode_real({"video": video})
+    net.encode_real({"video": video, "audio": audio})
+    silence = encoded[0]["audio"]
+    assert encoded[0]["video"] is video and encoded[1]["audio"] is audio
+    assert silence.shape == (1, 222338) and not silence.any()
+    # The audio codec pads to whole 1024-sample latents: the silence spans the generated audio.
+    assert (
+        math.ceil(silence.shape[-1] / 1024) == net.infer_shape({"video": [16, 31, 60, 108], "audio": None})["audio"][1]
+    )
+
+
+@pytest.mark.parametrize("scale", [0.0, 1.0, 5.0])
+def test_kandinsky6_sampler_shares_native_shifted_clock_and_bf16_cfg_rounding(tmp_path, scale):
+    net = _tiny_kandinsky6_network(tmp_path, image=True, precision=torch.bfloat16)
+    noise, condition = _kandinsky6_inputs(image=True, precision=torch.bfloat16)
+    condition["offset"] = 0.3
+    negative = {**condition, "offset": -0.7}
+    observed = []
+
+    def velocity(state, time, branch):
+        return {
+            name: (value.float().square() * 0.1 + time[0].float() + branch["offset"]).bfloat16()
+            for name, value in state.items()
+        }
+
+    def forward(self, state, time, condition, **kwargs):
+        observed.append((time.clone(), condition, state["video"][:, :, :1].clone()))
+        return velocity(state, time, condition)
+
+    net.forward = MethodType(forward, net)
+    guidance = GuidanceConfig()
+    guidance.cfg.scale = scale
+    actual = net.sample(noise, condition, negative, sample_steps=3, guidance_cfg=guidance)
+    grid = torch.tensor([1.0, 10 / 11, 5 / 7, 0.0], dtype=torch.float32)
+    expected = {name: value.clone() for name, value in noise.items()}
+    for time, delta in zip(grid[:-1], grid.diff()):
+        prediction = velocity(expected, time[None], condition)
+        if scale != 1:
+            neg_prediction = velocity(expected, time[None], negative)
+            prediction = {
+                name: neg_prediction[name] + scale * (value - neg_prediction[name])
+                for name, value in prediction.items()
+            }
+        expected = {name: value + delta * prediction[name] for name, value in expected.items()}
+    for name in expected:
+        assert actual[name].dtype == torch.bfloat16
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+    branches = 1 if scale == 1 else 2
+    assert len(observed) == 3 * branches
+    torch.testing.assert_close(torch.cat([time for time, _, _ in observed[::branches]]).float(), grid[:-1])
+    assert all(not torch.equal(first, condition["reference_latents"]) for _, _, first in observed)
+
+
+def test_kandinsky6_sharding_covers_both_text_streams_and_joint_blocks(tmp_path, monkeypatch):
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    net = _tiny_kandinsky6_network(tmp_path, checkpointing=True)
+    wrapped = []
+    monkeypatch.setattr("torch.distributed.fsdp.fully_shard", lambda module, **kwargs: wrapped.append((module, kwargs)))
+    policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, cast_forward_inputs=False)
+    net.fully_shard(mp_policy=policy)
+    assert not net.transformer.gradient_checkpointing
+    expected = [
+        *net.transformer.video_text_transformer_blocks,
+        *net.transformer.audio_text_transformer_blocks,
+        *net.transformer.visual_transformer_blocks,
+        net.transformer,
+    ]
+    assert [module for module, _ in wrapped] == expected
+    assert all(kwargs["mp_policy"] is policy for _, kwargs in wrapped)
+
+
+def test_kandinsky6_real_text_encoders_restore_meta_buffers_and_native_precision(monkeypatch):
+    from transformers import CLIPTextConfig, Qwen2_5_VLConfig
+    from fastgen.networks.Kandinsky6 import preprocessors
+    from fastgen.utils.module import materialize_meta_module
+
+    qwen_config = Qwen2_5_VLConfig(
+        text_config=dict(
+            vocab_size=16,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=16,
+            rope_parameters={"rope_type": "default", "mrope_section": [2, 1, 1]},
+        ),
+        vision_config=dict(
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=4,
+            out_hidden_size=32,
+            patch_size=2,
+            temporal_patch_size=1,
+            spatial_merge_size=1,
+            window_size=4,
+            fullatt_block_indexes=[0],
+        ),
+    )
+    clip_config = CLIPTextConfig(
+        vocab_size=16,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        max_position_embeddings=8,
+        eos_token_id=2,
+        pad_token_id=1,
+    )
+
+    def load(component, source, subfolder, revision, dtype):
+        return component(qwen_config if subfolder == "text_encoder" else clip_config)
+
+    monkeypatch.setattr(preprocessors, "load_component", load)
+    monkeypatch.setattr(preprocessors, "hf_load", lambda *args, **kwargs: object())
+    reference = preprocessors.Kandinsky6TextEncoder("unused")
+    reference.prepare_module("cpu", precision_model=torch.bfloat16, trainable=False)
+    assert all(p.dtype == torch.bfloat16 and not p.requires_grad for p in reference.text_encoder.parameters())
+    assert all(p.dtype == torch.float32 and not p.requires_grad for p in reference.text_encoder_2.parameters())
+    assert all(value.dtype == torch.float32 for value in reference.text_encoder.buffers())
+    with torch.device("meta"):
+        meta = preprocessors.Kandinsky6TextEncoder("unused")
+    meta._set_precision(torch.bfloat16)
+    rng = torch.get_rng_state().clone()
+    materialize_meta_module(meta, "cpu")
+    torch.testing.assert_close(torch.get_rng_state(), rng, atol=0, rtol=0)
+    expected_buffers = dict(reference.named_buffers())
+    assert expected_buffers and expected_buffers.keys() == dict(meta.named_buffers()).keys()
+    for name, value in meta.named_buffers():
+        torch.testing.assert_close(value, expected_buffers[name], atol=0, rtol=0)
+    identities = {name: id(value) for name, value in meta.named_buffers()}
+    meta.reset_parameters()
+    assert identities == {name: id(value) for name, value in meta.named_buffers()}
+
+
+def test_kandinsky6_composite_codec_preserves_video_audio_precision_and_scaling(monkeypatch):
+    from fastgen.networks.Kandinsky6 import preprocessors
+
+    observed = []
+
+    class Codec(torch.nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.name = name
+            self.config = SimpleNamespace(scaling_factor=0.5302 if name == "audio_vae" else 0.476986)
+            self.latent_hop_length = 1024
+
+        def encode(self, value, **kwargs):
+            observed.append((self.name, "encode", value.clone(), kwargs))
+            distribution = SimpleNamespace(
+                sample=lambda generator=None: torch.full((1, 1, 1), 2.0, dtype=value.dtype),
+                mode=lambda: torch.ones(1, 1, 1, dtype=value.dtype),
+            )
+            return SimpleNamespace(latent_dist=distribution)
+
+        def decode(self, value, **kwargs):
+            observed.append((self.name, "decode", value.clone(), kwargs))
+            return (value,) if self.name == "audio_vae" else SimpleNamespace(sample=value)
+
+        def forward(self, value, **kwargs):
+            observed.append((self.name, "vocode", value.clone(), kwargs))
+            return (value,)
+
+    monkeypatch.setattr(preprocessors, "load_component", lambda component, source, name, revision, dtype: Codec(name))
+    codec = preprocessors.Kandinsky6VAE("unused")
+    codec.prepare_module("cpu", precision_model=torch.bfloat16, trainable=False)
+    assert codec.video.vae.weight.dtype == torch.float16
+    assert codec.audio.vae.weight.dtype == codec.audio.vocoder.weight.dtype == torch.float32
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        encoded = codec.encode({"video": torch.zeros(1, 3, 1, 8, 8), "audio": torch.ones(1, 2, 1025)})
+    video_call, audio_call = observed
+    assert video_call[2].dtype == torch.float16 and not video_call[3]["opt_tiling"]
+    assert audio_call[2].dtype == torch.float32 and audio_call[2].shape == (1, 2048)
+    torch.testing.assert_close(audio_call[2][:, :1025], torch.ones(1, 1025))
+    assert not audio_call[2][:, 1025:].any()
+    torch.testing.assert_close(encoded["video"], torch.full_like(encoded["video"], 2 * 0.476986))
+    torch.testing.assert_close(encoded["audio"], torch.full_like(encoded["audio"], 0.5302))
+    decoded = codec.decode({"video": torch.ones(1, 4, 1, 2, 2).bfloat16(), "audio": torch.ones(1, 40, 2).bfloat16()})
+    assert decoded["video"].dtype == torch.float16 and decoded["audio"].dtype == torch.float32
+    assert observed[-1][0:2] == ("vocoder", "vocode")
+
+
+@pytest.mark.parametrize(
+    ("frames", "height", "width"),
+    # Aligned spatial/temporal tiles, an unaligned width, unaligned frames, and both unaligned.
+    [(25, 48, 48), (1, 48, 56), (21, 16, 16), (29, 56, 48)],
+)
+def test_kandinsky6_video_vae_tiles_cover_unaligned_extents(frames, height, width):
+    from fastgen.networks.Kandinsky6.vae import AutoencoderKLHunyuanVideo
+
+    torch.manual_seed(618)
+    vae = AutoencoderKLHunyuanVideo(
+        latent_channels=4, block_out_channels=(8, 8, 8, 8), layers_per_block=1, norm_num_groups=4
+    ).eval()
+    # Memory-limited CUDA tiling picks such tiles; their stride need not divide the canvas.
+    tiling = ((1, 17, 32, 32), (8, 16, 16))
+    vae.get_enc_optimal_tiling = vae.get_dec_optimal_tiling = lambda shape: tiling
+    video = torch.randn(1, 3, frames, height, width)
+    with torch.no_grad():
+        latent = vae.encode(video).latent_dist.mode()
+        decoded = vae.decode(latent).sample
+    assert latent.shape == (1, 4, (frames - 1) // 4 + 1, height // 8, width // 8)
+    assert decoded.shape == video.shape and torch.isfinite(decoded).all()
+
+
+def _save_tiny_kandinsky6_audio_checkpoint(tmp_path):
+    from diffusers import MMAudioVAE, MMAudioVocoder
+
+    checkpoint_vae = MMAudioVAE(
+        mel_bins=8,
+        latent_channels=6,
+        hidden_channels=16,
+        channel_multipliers=(1, 2),
+        layers_per_block=1,
+        n_fft=32,
+        hop_length=8,
+        scaling_factor=0.5302,
+    )
+    with torch.no_grad():
+        checkpoint_vae.vae.encoder.conv_in.weight.fill_(2.0)
+        checkpoint_vae.vae.encoder.learnable_gain.fill_(0.125)
+        checkpoint_vae.vae.decoder.learnable_gain.fill_(-0.25)
+    checkpoint_vae.save_pretrained(tmp_path / "audio_vae")
+    MMAudioVocoder(
+        num_mels=8,
+        upsample_initial_channel=32,
+        upsample_rates=(2, 2, 2),
+        upsample_kernel_sizes=(4, 4, 4),
+        resblock_kernel_sizes=(3,),
+        resblock_dilation_sizes=((1,),),
+    ).save_pretrained(tmp_path / "vocoder")
+    return checkpoint_vae
+
+
+@pytest.mark.parametrize("device_type", ["cpu", pytest.param("cuda", marks=RunIf(min_gpus=1))])
+def test_kandinsky6_real_audio_codec_meta_load_and_waveform_roundtrip(tmp_path, device_type):
+    from fastgen.networks.Kandinsky6.preprocessors import Kandinsky6AudioVAE
+    from fastgen.utils.module import materialize_meta_module
+
+    checkpoint_vae = _save_tiny_kandinsky6_audio_checkpoint(tmp_path)
+    reference = Kandinsky6AudioVAE(str(tmp_path))
+    # Native checkpoint loading folds MPConv weight normalization once. Its
+    # epsilon makes repeating this operation after a FastGen reload incorrect.
+    weight = reference.vae.vae.encoder.conv_in.weight
+    expected_weight = torch.full_like(weight, 2.0 / (2.0 + 1e-4) / (8 * 3) ** 0.5)
+    torch.testing.assert_close(weight, expected_weight, atol=1e-7, rtol=1e-6)
+    loaded_state = {name: value.clone() for name, value in reference.state_dict().items()}
+    gains = {"vae.vae.encoder.learnable_gain": 0.125, "vae.vae.decoder.learnable_gain": -0.25}
+    assert not any(parameter.ndim == 0 for parameter in reference.parameters())
+    for name, expected in gains.items():
+        assert reference.get_buffer(name).shape == () and reference.get_buffer(name).item() == expected
+        assert name in loaded_state
+    # The canonical Diffusers checkpoint still accepts the same scalar keys/shapes.
+    checkpoint_vae.load_state_dict(reference.vae.state_dict(), strict=True)
+    reference.prepare_module(device_type, precision_model=torch.bfloat16, trainable=False)
+    for name, value in reference.state_dict().items():
+        torch.testing.assert_close(value.cpu(), loaded_state[name], atol=0, rtol=0)
+    with torch.device("meta"):
+        meta = Kandinsky6AudioVAE(str(tmp_path))
+    meta._set_precision(torch.bfloat16)
+    assert all(value.is_meta for value in meta.parameters())
+    assert all(meta.get_buffer(name).is_meta for name in gains)
+    rng = torch.get_rng_state().clone()
+    cuda_rng = torch.cuda.get_rng_state().clone() if device_type == "cuda" else None
+    materialize_meta_module(meta, device_type)
+    torch.testing.assert_close(torch.get_rng_state(), rng, atol=0, rtol=0)
+    if cuda_rng is not None:
+        torch.testing.assert_close(torch.cuda.get_rng_state(), cuda_rng, atol=0, rtol=0)
+    meta.load_state_dict(reference.state_dict(), strict=True)
+    meta.prepare_module(device_type, precision_model=torch.bfloat16, trainable=False)
+    for name, value in meta.state_dict().items():
+        torch.testing.assert_close(value.cpu(), loaded_state[name], atol=0, rtol=0)
+    assert all(value.dtype == torch.float32 for value in meta.parameters())
+    for name, value in meta.named_buffers():
+        # Mel/window/resampling buffers are persistent and restored by the checkpoint.
+        assert name in reference.state_dict()
+        torch.testing.assert_close(value, reference.get_buffer(name), atol=0, rtol=0)
+    waveform = torch.randn(1, 1, 255, device=device_type) * 0.1
+    with torch.no_grad(), torch.autocast(device_type, dtype=torch.bfloat16):
+        expected_latent = reference(waveform, "encode")
+        latent = meta(waveform, "encode")
+        decoded = meta(latent, "decode")
+    torch.testing.assert_close(latent, expected_latent, atol=0, rtol=0)
+    assert latent.shape == (1, 6, 16) and latent.dtype == torch.float32
+    assert decoded.shape == (1, 1, 256) and decoded.dtype == torch.float32
+    assert torch.isfinite(decoded).all() and decoded.abs().max() <= 1
+
+
+def _kandinsky6_audio_codec_fsdp_meta_impl(rank, world_size, checkpoint_dir):
+    import torch.distributed as dist
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
+    from torch.distributed.fsdp import FSDPModule
+
+    from fastgen.networks.Kandinsky6.preprocessors import Kandinsky6AudioVAE
+    from fastgen.networks.module import FastGenModule
+    from fastgen.utils.distributed.fsdp import create_fsdp_context
+
+    class AudioContainer(FastGenModule):
+        def __init__(self):
+            super().__init__()
+            self.audio = Kandinsky6AudioVAE(checkpoint_dir)
+
+        def forward(self, value, operation):
+            return self.audio(value, operation)
+
+    device = torch.device("cuda", rank)
+    codec = AudioContainer()
+    assert all(parameter.is_meta == (rank != 0) for parameter in codec.parameters())
+    waveform = torch.sin(torch.arange(255, device=device).float()).reshape(1, 1, -1) * 0.1
+    expected = [None]
+    if rank == 0:
+        codec.to(device)
+        with torch.no_grad():
+            latent = codec(waveform, "encode")
+            state = {name: value.cpu() for name, value in codec.state_dict().items()}
+            expected[0] = (state, latent.cpu(), codec(latent, "decode").cpu())
+    dist.broadcast_object_list(expected, src=0)
+    expected_state, expected_latent, expected_decoded = expected[0]
+    context = create_fsdp_context(reduce_dtype=torch.float32, min_num_params=10**9)
+    codec.prepare_module(device, precision_model=torch.bfloat16, trainable=False, fsdp_context=context)
+    assert isinstance(codec, FSDPModule) and isinstance(codec.audio, FSDPModule)
+    assert all(parameter.dtype == torch.float32 and not parameter.is_meta for parameter in codec.parameters())
+    # Every rank materializes rank 0's exact weights and scalar buffers.
+    state = get_model_state_dict(codec, options=StateDictOptions(full_state_dict=True))
+    assert state.keys() == expected_state.keys()
+    for name, value in expected_state.items():
+        torch.testing.assert_close(state[name].cpu(), value, atol=0, rtol=0)
+    with torch.no_grad():
+        latent = codec(waveform, "encode")
+        decoded = codec(latent, "decode")
+    if rank == 0:
+        # The reference ran on this GPU, so sharding must leave the codec bitwise unchanged; other GPUs may
+        # select other kernels (e.g. TF32 convolutions) and round differently.
+        torch.testing.assert_close(latent.cpu(), expected_latent, atol=0, rtol=0)
+        torch.testing.assert_close(decoded.cpu(), expected_decoded, atol=0, rtol=0)
+    gains = {"audio.vae.vae.encoder.learnable_gain": 0.125, "audio.vae.vae.decoder.learnable_gain": -0.25}
+    for name, value in gains.items():
+        assert state[name].shape == () and state[name].dtype == torch.float32 and state[name].item() == value
+    restored = AudioContainer()
+    restored.prepare_module(device, precision_model=torch.bfloat16, trainable=False, fsdp_context=context)
+    with torch.no_grad():
+        for name in gains:
+            restored.get_buffer(name).add_(1)
+    set_model_state_dict(
+        restored,
+        state if rank == 0 else {},
+        options=StateDictOptions(full_state_dict=True, broadcast_from_rank0=True),
+    )
+    with torch.no_grad():
+        torch.testing.assert_close(restored(waveform, "encode"), latent, atol=0, rtol=0)
+        torch.testing.assert_close(restored(latent, "decode"), decoded, atol=0, rtol=0)
+    for name, value in gains.items():
+        assert restored.get_buffer(name).item() == value
+    return {"scalar_buffers": sorted(gains), "meta_sync_and_checkpoint_reload": True}
+
+
+@RunIf(min_gpus=2)
+def test_kandinsky6_audio_codec_fsdp_meta_scalar_buffers(tmp_path):
+    _save_tiny_kandinsky6_audio_checkpoint(tmp_path)
+    result = run_distributed_test(
+        test_fn=_kandinsky6_audio_codec_fsdp_meta_impl,
+        world_size=2,
+        timeout=180,
+        checkpoint_dir=str(tmp_path),
+    )
+    assert result["meta_sync_and_checkpoint_reload"] is True
+    assert len(result["scalar_buffers"]) == 2
+
+
+@pytest.mark.parametrize("device_type", ["cpu", pytest.param("cuda", marks=RunIf(min_gpus=1))])
+def test_kandinsky6_audio_codec_matches_independent_native_checkpoint(
+    tmp_path, kandinsky6_native_core, record_property, request, device_type
+):
+    from diffusers import MMAudioVAE, MMAudioVocoder
+    from fastgen.networks.Kandinsky6.preprocessors import Kandinsky6AudioVAE
+    from kandinsky.core.components.mmaudio.ext.autoencoder.autoencoder import load_bigvgan_v2
+    from kandinsky.core.components.mmaudio.ext.autoencoder.vae import VAE
+    from kandinsky.core.components.mmaudio.ext.mel_converter import get_mel_converter
+
+    torch.manual_seed(616)
+    if device_type == "cuda":
+        previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+        request.addfinalizer(lambda: setattr(torch.backends.cuda.matmul, "allow_tf32", previous_tf32))
+        torch.backends.cuda.matmul.allow_tf32 = True
+    # Wider CUDA attention exercises the native large-head SDPA path.
+    hidden_channels = 128 if device_type == "cuda" else 16
+    native_vae = VAE(data_dim=128, embed_dim=6, hidden_dim=hidden_channels).eval()
+    with torch.no_grad():
+        native_vae.encoder.learnable_gain.fill_(0.125)
+        native_vae.decoder.learnable_gain.fill_(-0.25)
+    # Released canonical weights already have unit-scale convolutions; the
+    # native loader still folds weight normalization again on every fresh load.
+    native_vae.remove_weight_norm()
+    checkpoint_vae = MMAudioVAE(latent_channels=6, hidden_channels=hidden_channels, scaling_factor=0.5302)
+    checkpoint_vae.vae.load_state_dict(native_vae.state_dict(), strict=True)
+    native_mel = get_mel_converter("44k").eval()
+    checkpoint_vae.mel_converter.load_state_dict(native_mel.state_dict(), strict=True)
+    checkpoint_vae.save_pretrained(tmp_path / "audio_vae")
+    MMAudioVocoder(
+        num_mels=128,
+        upsample_initial_channel=32,
+        upsample_rates=(2, 2, 2),
+        upsample_kernel_sizes=(4, 4, 4),
+        resblock_kernel_sizes=(3,),
+        resblock_dilation_sizes=((1,),),
+    ).save_pretrained(tmp_path / "vocoder")
+    native_vocoder = load_bigvgan_v2(str(tmp_path / "vocoder")).eval()
+    native_vae.remove_weight_norm()
+    candidate = Kandinsky6AudioVAE(str(tmp_path))
+    candidate.prepare_module(device_type, precision_model=torch.bfloat16, trainable=False)
+    native_vae.to(device_type)
+    native_mel.to(device_type)
+    native_vocoder.to(device_type)
+    for name, value in native_vae.state_dict().items():
+        torch.testing.assert_close(candidate.vae.vae.state_dict()[name], value, atol=0, rtol=0)
+    waveform = torch.randn(1, 4096, device=device_type) * 0.1
+    latent = torch.randn(1, 6, 17 if device_type == "cuda" else 4, device=device_type)
+    with torch.no_grad(), torch.autocast(device_type, dtype=torch.bfloat16):
+        actual_latent = candidate(waveform, "encode")
+        actual_waveform = candidate(latent, "decode")
+    with torch.no_grad(), torch.autocast(device_type, enabled=False):
+        actual_mel = candidate.vae.decode(latent / 0.5302, return_dict=False)[0]
+        expected_mel = native_vae.decode(latent / 0.5302)
+        expected_latent = native_vae.encode(native_mel(waveform)).mode() * 0.5302
+        expected_waveform = native_vocoder(expected_mel)
+    torch.testing.assert_close(actual_mel, expected_mel, atol=0, rtol=0)
+    torch.testing.assert_close(actual_waveform, expected_waveform, atol=0, rtol=0)
+    for name, actual, expected in (
+        ("encoder", actual_latent, expected_latent),
+        ("decoder_vocoder", actual_waveform, expected_waveform),
+    ):
+        relative_l2 = ((actual - expected).norm() / expected.norm()).item()
+        record_property(f"audio_{name}_relative_l2", relative_l2)
+        assert relative_l2 <= 1e-3
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-4)

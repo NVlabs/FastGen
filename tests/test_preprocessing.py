@@ -50,8 +50,10 @@ def _stub_model(
     dtype=torch.float32,
     device="cpu",
     state_fields=frozenset({"real"}),
+    inference=False,
 ):
     model = MagicMock()
+    model.config.inference = inference
     model.device = torch.device(device)
     model.precision = dtype
     model.precision_amp_enc = None
@@ -563,10 +565,9 @@ def test_prepare_batch_runs_builder_in_both_materialization_modes():
             return {}
 
     raw = torch.randn(1, 3, 8, 8)
-    _stub_model(_CaptureNet()).prepare_batch({"real_raw": raw}, materialize_real=True)
-    _stub_model(_CaptureNet()).prepare_batch(
+    _stub_model(_CaptureNet(), inference=False).prepare_batch({"real_raw": raw}, materialize_real=True)
+    _stub_model(_CaptureNet(), inference=True).prepare_batch(
         {"real_raw": raw},
-        inference_mode=True,
         materialize_real=False,
     )
 
@@ -776,6 +777,26 @@ def test_augment_pipe_rejects_already_augmented_batch():
 def test_prepare_batch_rejects_augmentation_without_the_configured_input():
     with pytest.raises(ValueError, match="requires a non-None `real_raw`"):
         _run(_PassthroughNet(), {}, augment_pipe=AugmentPipe())
+
+
+def test_prepare_batch_disables_autocast_for_augment_pipe_before_encoder_amp():
+    seen = []
+
+    class _CaptureVAE:
+        def encode(self, value):
+            seen.append(("vae", torch.is_autocast_enabled("cpu"), value.dtype))
+            return value.mean(dim=(-1, -2), keepdim=True)
+
+    model = _stub_model(_PassthroughNet(vae=_CaptureVAE()))
+    model.precision_amp_enc = torch.bfloat16
+    augment = AugmentPipe(p=1.0, scale=1.0, brightness=1.0)
+
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model.prepare_batch({"real_raw": torch.ones(2, 3, 8, 8)}, augment_pipe=augment)
+
+    assert seen == [("vae", True, torch.float32)]
+    assert out["real"].dtype == torch.float32
+    assert out["aug_condition"].dtype == torch.float32
 
 
 def _uninitialized_edm(**preprocessors):
