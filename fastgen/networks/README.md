@@ -43,7 +43,7 @@ The following networks load pretrained weights automatically from HuggingFace Hu
 | `Cosmos3` | [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano) |
 | `LTX2` | [`Lightricks/LTX-2`](https://huggingface.co/Lightricks/LTX-2), [`diffusers/LTX-2.3-Diffusers`](https://huggingface.co/diffusers/LTX-2.3-Diffusers), [`Lightricks/LTX-2.5-Diffusers`](https://huggingface.co/Lightricks/LTX-2.5-Diffusers) |
 | `MiniMaxH3` | [`MiniMaxAI/MiniMax-H3`](https://huggingface.co/MiniMaxAI/MiniMax-H3) |
-| `Kandinsky6` | [`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers) |
+| `Kandinsky6` | [`kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Pro-5s-Diffusers), [`kandinskylab/Kandinsky-6.0-Lite-5s-Diffusers`](https://huggingface.co/kandinskylab/Kandinsky-6.0-Lite-5s-Diffusers) |
 
 Set `HF_HOME` for cache location, `LOCAL_FILES_ONLY=true` for offline use.
 

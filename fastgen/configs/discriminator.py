@@ -163,6 +163,22 @@ Discriminator_Kandinsky6_Multimodal_Config: DictConfig = L(CompositeDiscriminato
     },
 )
 
+# Kandinsky 6 Lite: the same heads on its 1792-wide video and 896-wide audio tokens; 32 fused blocks
+Discriminator_Kandinsky6Lite_Multimodal_Config: DictConfig = L(CompositeDiscriminator)(
+    modality_discs={
+        "video": L(Discriminator_VideoDiT)(
+            num_blocks=32,
+            disc_type="dit_simple_conv3d",
+            inner_dim=1792,
+        ),
+        "audio": L(Discriminator_AudioDiT)(
+            num_blocks=32,
+            inner_dim=896,
+            hidden_channels=256,
+        ),
+    },
+)
+
 # Cosmos Predict2.5-2B: patchify spatial-2, temporal-1; inner_dim=2048; layer=28
 Discriminator_CosmosPredict2_2B_Config: DictConfig = L(Discriminator_VideoDiT)(
     feature_indices=None,

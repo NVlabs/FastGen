@@ -2607,6 +2607,7 @@ def test_reference_parity_net_configs_sample_on_the_full_schedule():
         "LTX2I2V_3_Config",
         "LTX2I2V_5_Config",
         "Kandinsky6Config",
+        "Kandinsky6LiteConfig",
     ]
     for name in names:
         assert network_schedule_kwargs(getattr(net_configs, name))["max_t"] == 1.0, name

@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Kandinsky 6 Pro video and synchronized audio/video flow matching.
+"""Kandinsky 6 Lite and Pro video and synchronized audio/video flow matching.
 
-The native Pro preset uses 121 frames at 24 fps, 480x864 pixels, CFG 5 and
-50 Euler steps with shift 5; the pi-Flow (distilled) checkpoints are rejected.
+The native Lite and Pro presets use 121 frames at 24 fps, 480x864 pixels, CFG 5
+and 50 Euler steps with shift 5; the pi-Flow (distilled) checkpoints are rejected.
 Video latents are BCTHW; joint generation adds
 BCS audio latents on the same flow clock. Image conditioning appends a clean
 reference frame at the tail, with temporal position zero and token role one;
@@ -121,7 +121,7 @@ def classify_forward(
 
 
 class Kandinsky6(FastGenNetwork):
-    """Kandinsky 6 Pro for text/image-conditioned video, optionally with synchronized audio."""
+    """Kandinsky 6 Lite or Pro for text/image-conditioned video, optionally with synchronized audio."""
 
     latent_compression_factors = (4, 8, 8)
     audio_sampling_rate = 44100
@@ -141,7 +141,7 @@ class Kandinsky6(FastGenNetwork):
     ):
         """
         Args:
-            model_id_or_local_path: Diffusers repository ID or local path of the Pro checkpoint.
+            model_id_or_local_path: Diffusers repository ID or local path of a flow-matching checkpoint.
             revision: Hub revision of ``model_id_or_local_path``.
             modalities: ``("video",)`` or joint ``("video", "audio")``.
             image_conditioned: Condition on a clean reference frame at the tail (see the module docstring).

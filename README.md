@@ -179,7 +179,7 @@ FastGen is designed to be **agnostic to the network and data** and you can add y
 |------|----------|
 | **Image** | EDM, EDM2, DiT, SiT, SD 1.5, SDXL, FLUX.1, FLUX.2, Qwen-Image |
 | **Video** | Wan2.1, Wan2.2, Wan Vace, LingBot-world, CogVideoX, Cosmos Predict2, Cosmos 3 |
-| **Video+Audio** | LTX-2, LTX-2.3, LTX-2.5, MiniMax H3, Kandinsky 6 Pro |
+| **Video+Audio** | LTX-2, LTX-2.3, LTX-2.5, MiniMax H3, Kandinsky 6 Lite and Pro |
 
 See [fastgen/networks/README.md](fastgen/networks/README.md) for details.
 Not all combinations of methods and networks are currently supported. We provide typical use-cases in our predefined configs in [fastgen/configs/experiments](fastgen/configs/experiments).

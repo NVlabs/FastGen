@@ -299,6 +299,16 @@ Kandinsky6Config: DictConfig = L(Kandinsky6)(
     scheduler_scale=5.0,
 )
 
+# The public 3B Lite checkpoint shares Pro's architecture family and native generation settings.
+Kandinsky6LiteConfig: DictConfig = L(Kandinsky6)(
+    model_id_or_local_path="kandinskylab/Kandinsky-6.0-Lite-5s-Diffusers",
+    revision="8ec017692475fd8e7908d8e75442bba0737649af",
+    modalities=("video", "audio"),
+    image_conditioned=False,
+    fps=24.0,
+    scheduler_scale=5.0,
+)
+
 LTX2I2VConfig: DictConfig = L(LTX2)(
     model_id_or_local_path="Lightricks/LTX-2",
     disable_grad_ckpt=False,
