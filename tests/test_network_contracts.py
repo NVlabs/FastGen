@@ -617,6 +617,7 @@ ODE_ONLY_SAMPLERS = (
     ("fastgen.networks.Flux.network", "Flux"),
     ("fastgen.networks.Flux2.network", "Flux2"),
     ("fastgen.networks.QwenImage.network", "QwenImage"),
+    ("fastgen.networks.Kandinsky6.network", "Kandinsky6"),
     ("fastgen.networks.LTX2.network", "LTX2"),
     ("fastgen.networks.MiniMaxH3.network", "MiniMaxH3"),
     ("fastgen.networks.cosmos_predict2.network", "CosmosPredict2"),

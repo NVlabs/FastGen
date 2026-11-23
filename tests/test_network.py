@@ -16326,6 +16326,32 @@ def test_kandinsky6_sampler_shares_native_shifted_clock_and_bf16_cfg_rounding(tm
     assert all(not torch.equal(first, condition["reference_latents"]) for _, _, first in observed)
 
 
+def test_kandinsky6_sampler_keeps_an_unprepared_networks_state_dtype(tmp_path):
+    """Without a model precision, the high-precision prediction must not promote the state between steps."""
+    from fastgen.networks.Kandinsky6.network import Kandinsky6
+
+    prepared = _tiny_kandinsky6_network(tmp_path)
+    unprepared = Kandinsky6(str(tmp_path), load_pretrained=False, gradient_checkpointing=False)
+    unprepared.load_state_dict(prepared.state_dict())
+    noise, condition = _kandinsky6_inputs()
+    noise = {name: value.detach() for name, value in noise.items()}
+    negative = (-condition[0], condition[1], condition[2])
+
+    with torch.no_grad():
+        actual = unprepared.sample(noise, condition, negative, sample_steps=3)
+        expected = prepared.sample(noise, condition, negative, sample_steps=3)
+
+    for name, value in actual.items():
+        assert value.dtype == torch.float32
+        torch.testing.assert_close(value, expected[name], atol=1e-5, rtol=1e-5)
+
+
+def test_kandinsky6_rejects_pi_flow_checkpoints(tmp_path):
+    """The distilled checkpoints' heads predict pi-Flow policies, ten times the latent channels."""
+    with pytest.raises(ValueError, match="pi-Flow"):
+        _tiny_kandinsky6_network(tmp_path, out_visual_dim=40, out_audio_dim=60)
+
+
 def test_kandinsky6_sharding_covers_both_text_streams_and_joint_blocks(tmp_path, monkeypatch):
     from torch.distributed.fsdp import MixedPrecisionPolicy
 

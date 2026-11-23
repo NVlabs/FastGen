@@ -4,7 +4,8 @@
 """Kandinsky 6 Pro video and synchronized audio/video flow matching.
 
 The native Pro preset uses 121 frames at 24 fps, 480x864 pixels, CFG 5 and
-50 Euler steps with shift 5. Video latents are BCTHW; joint generation adds
+50 Euler steps with shift 5; the pi-Flow (distilled) checkpoints are rejected.
+Video latents are BCTHW; joint generation adds
 BCS audio latents on the same flow clock. Image conditioning appends a clean
 reference frame at the tail, with temporal position zero and token role one;
 it does not replace the generated first frame. This is the reference's
@@ -184,6 +185,13 @@ class Kandinsky6(FastGenNetwork):
                 revision=revision,
             )
             self.transformer = Kandinsky6Transformer3DModel.from_config(config)
+        config = self.transformer.config
+        if (config.out_visual_dim, config.out_audio_dim) != (config.in_visual_dim, config.in_audio_dim):
+            raise ValueError(
+                f"{model_id_or_local_path!r} predicts {config.out_visual_dim} video and {config.out_audio_dim} audio "
+                f"channels for {config.in_visual_dim} and {config.in_audio_dim} latent channels, a pi-Flow policy of a "
+                "distilled checkpoint; Kandinsky6 supports the flow-matching checkpoints"
+            )
         install_native_precision(self.transformer)
         self.transformer.forward = types.MethodType(classify_forward, self.transformer)
         if gradient_checkpointing:
@@ -401,7 +409,6 @@ class Kandinsky6(FastGenNetwork):
         sample_type="ode",
         guidance_cfg=None,
         scheduler_scale=None,
-        **kwargs,
     ):
         """Native Euler sampler: ``sample_steps`` steps on the ``scheduler_scale``-shifted grid, constant scalar CFG."""
         self._validate_sample_kwargs(sample_type, ("rf",), ("ode",))
@@ -427,7 +434,9 @@ class Kandinsky6(FastGenNetwork):
                 negative = self(state, t, neg_condition, output_dtype=self.precision_model)
                 # Match the native pipeline's separate BF16 CFG rounding operations.
                 velocity = tmap(lambda pos, neg: neg + scale * (pos - neg), velocity, negative)
-            state = tmap(lambda value, prediction: value + delta * prediction, state, velocity)
+            # A model-precision prediction keeps the native update; an unprepared network's high-precision one would
+            # otherwise promote the state and the next forward's inputs.
+            state = tmap(lambda value, prediction: (value + delta * prediction).to(value.dtype), state, velocity)
         return state
 
     def fully_shard(self, **kwargs):
