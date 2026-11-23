@@ -10,7 +10,7 @@ import torch
 from torch import Tensor
 
 from fastgen.methods import CMModel
-from fastgen.utils.tree_utils import assert_same
+from fastgen.utils.tree_utils import TensorOrDict, assert_same, get_batch_size, get_device, index, per_modality, to_dict
 from fastgen.utils.distributed.collectives import sync_all, sync_any
 import fastgen.utils.logging_utils as logger
 
@@ -57,23 +57,23 @@ class TCMPrecond(torch.nn.Module):
 
     def forward(
         self,
-        x_t: torch.Tensor,
+        x_t: TensorOrDict,
         t: torch.Tensor,
         condition: Optional[Any] = None,
         **model_kwargs,
-    ) -> torch.Tensor:
+    ) -> TensorOrDict:
         """Forward pass through the two-stage consistency model.
 
         Args:
-            x_t: Noisy input tensor at time t
+            x_t: Noisy input at time t, a tensor or a dict of tensors per modality
             t: Time step tensor
             condition: Optional conditioning inputs
             **model_kwargs: Additional keyword arguments passed to networks
 
         Returns:
-            Model output (x0 prediction)
+            Model output (x0 prediction), structured like ``x_t``
         """
-        device = x_t.device
+        device = get_device(x_t)
 
         # Determine which samples are in second stage (t >= transition_t)
         second_stage_mask = t >= self.transition_t
@@ -99,7 +99,11 @@ class TCMPrecond(torch.nn.Module):
             out_s = self.net_s(x_t, t, condition=condition, **model_kwargs)
 
             # Replace teacher outputs with student outputs for second stage samples
-            out_t[second_stage_mask] = out_s[second_stage_mask]
+            def blend(teacher: Tensor, student: Tensor) -> Tensor:
+                teacher[second_stage_mask] = student[second_stage_mask]
+                return teacher
+
+            out_t = per_modality(blend, out_t, out_s)
 
         return out_t
 
@@ -169,7 +173,7 @@ class TCMModel(CMModel):
 
         # build_model ensures these times are at least transition_t, below which net_tcm's output has no gradient.
         t = self.net.noise_scheduler.sample_t(
-            real_data.shape[0], **self.sample_t_cfg.sample_t_kwargs(), device=self.device
+            get_batch_size(real_data), **self.sample_t_cfg.sample_t_kwargs(), device=self.device
         )
 
         # sample the boundary time step with the `boundary_prob` probability
@@ -189,18 +193,17 @@ class TCMModel(CMModel):
             self.net_tcm, real_data=real_data, t=t, condition=condition, neg_condition=neg_condition
         )
 
-        # get boundary loss
-        assert_same(shape=True, device=self.device, cm_loss=cm_loss, t=t, mask_t=mask_t)
-        loss_boundary = self._mean_or_zero(cm_loss[mask_t])
-        cm_loss = self._mean_or_zero(cm_loss[~mask_t])
-        loss_unweighted = self._mean_or_zero(loss_unweighted[~mask_t])
+        # get boundary loss, per modality for dict data
+        assert_same(shape=t.shape, device=self.device, cm_loss=cm_loss, t=t, mask_t=mask_t)
+        loss_boundary = to_dict(per_modality(self._mean_or_zero, index(cm_loss, mask_t)), suffix="loss_boundary")
+        loss_unweighted = per_modality(self._mean_or_zero, index(loss_unweighted, ~mask_t))
+        cm_loss = to_dict(per_modality(self._mean_or_zero, index(cm_loss, ~mask_t)), suffix="cm_loss")
 
-        loss = cm_loss + self.config.w_boundary * loss_boundary
         loss_map = {
-            "total_loss": loss,
-            "cm_loss": cm_loss,
-            "loss_boundary": loss_boundary,
-            "unweighted_cm_loss": loss_unweighted,
+            "total_loss": sum(cm_loss.values()) + self.config.w_boundary * sum(loss_boundary.values()),
+            **cm_loss,
+            **loss_boundary,
+            **to_dict(loss_unweighted, suffix="unweighted_cm_loss"),
         }
         outputs = self._get_outputs(D_yt, condition=condition, neg_condition=neg_condition)
 

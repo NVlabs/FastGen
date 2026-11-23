@@ -2,7 +2,7 @@
 
 Training methods for fast single-step or few-step generation from diffusion models.
 
-**Multimodal distillation:** DMD2, PDD, and SFT natively support multimodal data (e.g., joint video+audio). When the input is a dict of tensors (e.g., `{"video": ..., "audio": ...}`), losses are computed independently per modality and summed automatically. Per-modality CFG scales can be specified as a dict (e.g., `guidance_cfg.cfg.scale={"video": 3.0, "audio": 7.0}`).
+**Multimodal distillation:** DMD2, PDD, SFT, CM, TCM, and KD natively support multimodal data (e.g., joint video+audio). When the input is a dict of tensors (e.g., `{"video": ..., "audio": ...}`), losses are computed independently per modality and summed automatically. Per-modality CFG scales can be specified as a dict (e.g., `guidance_cfg.cfg.scale={"video": 3.0, "audio": 7.0}`).
 
 ## Methods Overview
 
