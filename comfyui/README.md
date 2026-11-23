@@ -15,7 +15,7 @@ Custom nodes for running FastGen teacher and distilled-student image and video g
 
    > **Note:** `FASTGEN_REPO` must be set every time you start ComfyUI (add it to your shell profile or launch script).
 
-3. **Install FastGen's dependencies** with ComfyUI's Python (3.10–3.12; this installs PyTorch 2.10), unless ComfyUI
+3. **Install FastGen's dependencies** with ComfyUI's Python (3.11–3.12; this installs PyTorch 2.10), unless ComfyUI
    runs in a FastGen environment such as the [Docker container](../CONTRIBUTING.md#development-setup):
 
    ```bash

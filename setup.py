@@ -26,7 +26,7 @@ setup(
         "": ["LICENSE", "*.json"],
         "scripts.inference": ["prompts/*.txt", "examples/*.png", "examples/*.mp4", "examples/camera/*/*.npy"],
     },
-    # NumPy 1.x (required below) supports Python only through 3.12.
-    python_requires=">=3.10,<3.13",
+    # Diffusers 0.42+ requires Python 3.11; NumPy 1.x (required below) supports Python only through 3.12.
+    python_requires=">=3.11,<3.13",
     install_requires=read_requirements(),
 )
